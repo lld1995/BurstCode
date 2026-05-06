@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="64" height="64">
+  <circle cx="48" cy="48" r="36" fill="#F1F5F9"/>
+  <path d="M48 12 A36 36 0 0 1 84 48 L48 48 Z" fill="#10B981"/>
+  <path d="M84 48 A36 36 0 0 1 70 76 L48 48 Z" fill="#FBBF24"/>
+  <path d="M70 76 A36 36 0 0 1 48 84 L48 48 Z" fill="#EF4444"/>
+  <circle cx="48" cy="48" r="14" fill="#FFFFFF"/>
+  <text x="48" y="53" font-size="14" text-anchor="middle" fill="#1E293B" font-family="monospace" font-weight="bold">90%</text>
+</svg>
