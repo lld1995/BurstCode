@@ -14,8 +14,8 @@ out/
 # --- TypeScript ---
 *.tsbuildinfo
 
-# --- QuickCode background explorer output ---
-.quickcode/
+# --- BurstCode background explorer output ---
+.burstcode/
 
 # --- Editor / IDE ---
 .idea/

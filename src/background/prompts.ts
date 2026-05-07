@@ -1,10 +1,10 @@
 /**
  * Prompts used by the BackgroundExplorer. Each prompt asks the LLM to return
  * STRICT JSON so we can mechanically merge the result into our on-disk
- * knowledge base (`.quickcode/` by default) without hand-parsing prose.
+ * knowledge base (`.burstcode/` by default) without hand-parsing prose.
  */
 
-export const BACKGROUND_SYSTEM_PROMPT = `You are QuickCode's background code-comprehension agent.
+export const BACKGROUND_SYSTEM_PROMPT = `You are BurstCode's background code-comprehension agent.
 
 You run during the IDE's idle moments. Your goals, in priority order:
   1. Read the given source file carefully.
@@ -65,7 +65,7 @@ export function buildAnalysisUserMessage(opts: {
    * For TS/JS, the exact relative specifier the generated test file should
    * use to import the module under test (no file extension, forward
    * slashes). Computed by the host so the test resolves once written under
-   * `.quickcode/tests/<rel>.d/`.
+   * `.burstcode/tests/<rel>.d/`.
    */
   importSpecifier?: string;
 }): string {
@@ -73,7 +73,7 @@ export function buildAnalysisUserMessage(opts: {
     ? `\n\nWorkspace outline (for context, do not analyse other files):\n\`\`\`\n${opts.workspaceOutline}\n\`\`\``
     : '';
   const importHint = opts.importSpecifier
-    ? `\n\nIMPORTANT: When generating TypeScript or JavaScript tests, the test file will be saved at \`.quickcode/tests/${opts.relativePath}.d/<your-filename>\`. To import symbols from the file under test you MUST use this specifier exactly:\n\n    import { /* ... */ } from '${opts.importSpecifier}';\n\nDo not invent a different relative path. For Python tests, the test will be run with the workspace root on \`sys.path\`, so use the project's existing module path (e.g. \`from src.foo.bar import ...\`).`
+    ? `\n\nIMPORTANT: When generating TypeScript or JavaScript tests, the test file will be saved at \`.burstcode/tests/${opts.relativePath}.d/<your-filename>\`. To import symbols from the file under test you MUST use this specifier exactly:\n\n    import { /* ... */ } from '${opts.importSpecifier}';\n\nDo not invent a different relative path. For Python tests, the test will be run with the workspace root on \`sys.path\`, so use the project's existing module path (e.g. \`from src.foo.bar import ...\`).`
     : '';
   // Number lines so the model can cite them precisely in bug reports.
   const lines = opts.contents.split(/\r?\n/);
@@ -102,7 +102,7 @@ Analyse this file according to your instructions. Respond with the JSON object o
  * LLM runs WITHOUT tools here; the host just feeds it outline + selected
  * file contents.
  */
-export const BACKGROUND_BRIEF_PROMPT = `You are QuickCode's background project analyst.
+export const BACKGROUND_BRIEF_PROMPT = `You are BurstCode's background project analyst.
 
 You are given a workspace outline and the contents of a few high-signal files
 (package.json / README / entry points). Produce:
@@ -153,7 +153,7 @@ export function buildBriefUserMessage(opts: {
  * tools (read_file / list_dir / grep_search / workspace_outline). It should
  * iteratively pull the files it needs, then emit a final JSON report.
  */
-export const BACKGROUND_TOPIC_SYSTEM_PROMPT = `You are QuickCode's background investigator.
+export const BACKGROUND_TOPIC_SYSTEM_PROMPT = `You are BurstCode's background investigator.
 
 You are given a single investigation topic about this workspace. Use the
 available read-only tools to read the files you need. You may grep, list

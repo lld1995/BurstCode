@@ -39,13 +39,13 @@ const DEFAULT_ENDPOINT_NAME = 'Local';
 /**
  * Read all configured endpoints. Always returns at least one entry, derived in
  * order from:
- *   1. `quickcode.llm.endpoints` (the new structure)
- *   2. `quickcode.llm.profiles`  (legacy: each profile becomes an endpoint and
+ *   1. `burstcode.llm.endpoints` (the new structure)
+ *   2. `burstcode.llm.profiles`  (legacy: each profile becomes an endpoint and
  *      contributes its model to the endpoint's model list)
  *   3. The legacy single-model settings (baseURL/apiKey/model)
  */
 export function readEndpoints(): LLMEndpoint[] {
-  const cfg = vscode.workspace.getConfiguration('quickcode.llm');
+  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
   const out: LLMEndpoint[] = [];
   const byName = new Map<string, LLMEndpoint>();
 
@@ -130,7 +130,7 @@ export function readEndpoints(): LLMEndpoint[] {
 }
 
 export function getActiveEndpointName(): string | undefined {
-  const cfg = vscode.workspace.getConfiguration('quickcode.llm');
+  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
   const v = cfg.get<string>('activeEndpoint');
   if (v && v.trim()) return v.trim();
   // Fallback to the legacy `activeProfile` so existing users keep their pick.
@@ -139,7 +139,7 @@ export function getActiveEndpointName(): string | undefined {
 }
 
 export function getActiveModelName(): string | undefined {
-  const cfg = vscode.workspace.getConfiguration('quickcode.llm');
+  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
   const v = cfg.get<string>('activeModel');
   return v && v.trim() ? v.trim() : undefined;
 }
@@ -152,7 +152,7 @@ export function getActiveEndpoint(): LLMEndpoint {
 
 /** Persist the user's active endpoint+model selection. */
 export async function setActiveSelection(endpointName: string, modelName: string): Promise<void> {
-  const cfg = vscode.workspace.getConfiguration('quickcode.llm');
+  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
   await cfg.update('activeEndpoint', endpointName, vscode.ConfigurationTarget.Global);
   await cfg.update('activeModel', modelName, vscode.ConfigurationTarget.Global);
 }
@@ -161,7 +161,7 @@ export async function setActiveSelection(endpointName: string, modelName: string
 export async function addModelToEndpoint(endpointName: string, model: string): Promise<void> {
   const trimmed = model.trim();
   if (!trimmed) return;
-  const cfg = vscode.workspace.getConfiguration('quickcode.llm');
+  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
   const endpoints = readEndpoints();
   // Materialise the endpoints array so legacy profile-only setups still get
   // a writable endpoints[] entry to attach the new model to.
@@ -181,7 +181,7 @@ export async function addModelToEndpoint(endpointName: string, model: string): P
 }
 
 export async function removeModelFromEndpoint(endpointName: string, model: string): Promise<void> {
-  const cfg = vscode.workspace.getConfiguration('quickcode.llm');
+  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
   const endpoints = readEndpoints();
   const next = endpoints.map((e) => ({
     name: e.name,
@@ -221,8 +221,8 @@ export function readLLMConfig(): LLMConfig {
   const ep = getActiveEndpoint();
   const activeModel = getActiveModelName();
   // Resolve the model: explicit selection > endpoint's first known model >
-  // legacy `quickcode.llm.model` fallback.
-  const fallback = vscode.workspace.getConfiguration('quickcode.llm').get<string>('model') ?? DEFAULT_MODEL;
+  // legacy `burstcode.llm.model` fallback.
+  const fallback = vscode.workspace.getConfiguration('burstcode.llm').get<string>('model') ?? DEFAULT_MODEL;
   const model = activeModel || ep.models[0] || fallback;
   return {
     baseURL: ep.baseURL,

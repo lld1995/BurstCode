@@ -12,20 +12,20 @@ export interface CheckpointInfo {
 
 /**
  * Creates lightweight rollback points by snapshotting the working tree into
- * `refs/quickcode/checkpoints/<timestamp>` using `git stash create` + `git update-ref`.
+ * `refs/burstcode/checkpoints/<timestamp>` using `git stash create` + `git update-ref`.
  *
  * The user's HEAD, index and working tree are NOT modified by `createCheckpoint`.
  * `restoreCheckpoint` replays the snapshot's tree onto the working tree (no commit).
  */
 export class GitCheckpoint {
-  private static readonly REF_PREFIX = 'refs/quickcode/checkpoints/';
+  private static readonly REF_PREFIX = 'refs/burstcode/checkpoints/';
   private repoRootCache: string | null | undefined;
 
   constructor(private readonly logger: Logger) {}
 
   isEnabled(): boolean {
     return (
-      vscode.workspace.getConfiguration('quickcode.git').get<boolean>('autoCheckpoint') ?? true
+      vscode.workspace.getConfiguration('burstcode.git').get<boolean>('autoCheckpoint') ?? true
     );
   }
 
@@ -54,7 +54,7 @@ export class GitCheckpoint {
   }
 
   /**
-   * Snapshot the working tree into `refs/quickcode/checkpoints/<ts>`.
+   * Snapshot the working tree into `refs/burstcode/checkpoints/<ts>`.
    * Returns the new checkpoint info, or undefined if disabled / not a git repo / git failure.
    */
   async createCheckpoint(label: string): Promise<CheckpointInfo | undefined> {
@@ -63,7 +63,7 @@ export class GitCheckpoint {
     if (!root) return undefined;
 
     try {
-      const message = `QuickCode checkpoint: ${label}`.replace(/\r?\n/g, ' ').slice(0, 200);
+      const message = `BurstCode checkpoint: ${label}`.replace(/\r?\n/g, ' ').slice(0, 200);
       let sha = '';
       try {
         sha = (await this.run(root, ['stash', 'create', message])).trim();
@@ -110,7 +110,7 @@ export class GitCheckpoint {
         const subject = rest.join('\t');
         const tsStr = ref.slice(GitCheckpoint.REF_PREFIX.length);
         const createdAt = Number(tsStr);
-        const label = subject.replace(/^QuickCode checkpoint:\s*/, '');
+        const label = subject.replace(/^BurstCode checkpoint:\s*/, '');
         infos.push({
           ref,
           sha,
@@ -132,7 +132,7 @@ export class GitCheckpoint {
   async restoreCheckpoint(ref: string): Promise<boolean> {
     const root = await this.repoRoot();
     if (!root) {
-      vscode.window.showErrorMessage('QuickCode: workspace is not a git repository.');
+      vscode.window.showErrorMessage('BurstCode: workspace is not a git repository.');
       return false;
     }
     try {
@@ -143,7 +143,7 @@ export class GitCheckpoint {
       return true;
     } catch (err) {
       this.logger.error('Git restore failed', String(err));
-      vscode.window.showErrorMessage(`QuickCode: failed to restore checkpoint: ${String(err)}`);
+      vscode.window.showErrorMessage(`BurstCode: failed to restore checkpoint: ${String(err)}`);
       return false;
     }
   }
@@ -152,7 +152,7 @@ export class GitCheckpoint {
   async restoreInteractive(): Promise<void> {
     const list = await this.listCheckpoints();
     if (list.length === 0) {
-      vscode.window.showInformationMessage('QuickCode: no checkpoints found.');
+      vscode.window.showInformationMessage('BurstCode: no checkpoints found.');
       return;
     }
     const items: Array<vscode.QuickPickItem & { ref: string }> = list.map((c) => ({
@@ -162,7 +162,7 @@ export class GitCheckpoint {
       detail: c.label
     }));
     const picked = await vscode.window.showQuickPick(items, {
-      title: 'QuickCode: Restore Git Checkpoint',
+      title: 'BurstCode: Restore Git Checkpoint',
       placeHolder: 'Pick a snapshot to restore into the working tree'
     });
     if (!picked) return;
@@ -174,7 +174,7 @@ export class GitCheckpoint {
     if (confirm !== 'Restore') return;
     const ok = await this.restoreCheckpoint(picked.ref);
     if (ok) {
-      vscode.window.showInformationMessage('QuickCode: checkpoint restored.');
+      vscode.window.showInformationMessage('BurstCode: checkpoint restored.');
     }
   }
 

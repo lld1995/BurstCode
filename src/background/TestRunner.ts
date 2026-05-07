@@ -80,7 +80,7 @@ export async function runGeneratedTest(opts: {
 
   // ----- Go --------------------------------------------------------------
   // Go's test discovery requires the file to live in the same package as the
-  // source under test. Our generated tests live under `.quickcode/tests/` so
+  // source under test. Our generated tests live under `.burstcode/tests/` so
   // `go test` cannot import the source via relative paths. Skip and surface
   // the manual command.
   if (ext === '.go' || lang === 'go') {

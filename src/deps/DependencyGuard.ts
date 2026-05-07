@@ -123,7 +123,7 @@ export class DependencyGuard implements vscode.Disposable {
 
   private async promptInstall(pack: LanguagePack, missing: string[]): Promise<void> {
     const action = await vscode.window.showWarningMessage(
-      `QuickCode 需要 ${pack.label} 的依赖插件：${missing.join(', ')}。安装后可获得静态分析能力。`,
+      `BurstCode 需要 ${pack.label} 的依赖插件：${missing.join(', ')}。安装后可获得静态分析能力。`,
       'Install',
       'Open in Marketplace',
       'Skip'

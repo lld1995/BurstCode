@@ -38,7 +38,7 @@ export class WorkspaceIndex implements vscode.Disposable {
     this.excludeDirs = new Set(defaultOutlineOptions.excludeDirs);
     // Allow user-configured extra excludes to also suppress watcher noise.
     const extra = vscode.workspace
-      .getConfiguration('quickcode.context')
+      .getConfiguration('burstcode.context')
       .get<string[]>('outlineExtraExcludes');
     if (Array.isArray(extra)) extra.forEach((d) => this.excludeDirs.add(d));
 
@@ -63,7 +63,7 @@ export class WorkspaceIndex implements vscode.Disposable {
       ),
       vscode.workspace.onDidChangeWorkspaceFolders(() => this.invalidate('workspace folders changed')),
       vscode.workspace.onDidChangeConfiguration((e) => {
-        if (e.affectsConfiguration('quickcode.context')) this.invalidate('context config changed');
+        if (e.affectsConfiguration('burstcode.context')) this.invalidate('context config changed');
       })
     );
   }
@@ -132,7 +132,7 @@ export class WorkspaceIndex implements vscode.Disposable {
   }
 
   private readOverrides(): Partial<OutlineOptions> {
-    const ctxCfg = vscode.workspace.getConfiguration('quickcode.context');
+    const ctxCfg = vscode.workspace.getConfiguration('burstcode.context');
     const overrides: Partial<OutlineOptions> = {};
     const baseDepth = ctxCfg.get<number>('outlineBaseDepth');
     if (typeof baseDepth === 'number' && baseDepth > 0) overrides.baseDepth = baseDepth;

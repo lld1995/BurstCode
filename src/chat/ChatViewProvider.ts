@@ -23,7 +23,7 @@ import { WorkspaceIndex } from '../context/WorkspaceIndex';
 import { buildSystemPrompt } from '../agent/prompts';
 import { buildLspTools } from '../agent/tools/lsp';
 import { buildLangTools } from '../agent/tools/lang';
-import { buildEditTools } from '../agent/tools/edits';
+import { buildEditTools, AskUserSpec } from '../agent/tools/edits';
 import { buildPlanTool, PlanStep } from '../agent/tools/plan';
 import { buildLessonTools } from '../agent/tools/lessons';
 import { LessonStore, renderLessonsBlock } from '../memory/LessonStore';
@@ -49,12 +49,12 @@ interface OutboundMessage {
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewType = 'quickcode.chatView';
+  static readonly viewType = 'burstcode.chatView';
 
   private view?: vscode.WebviewView;
   private currentSession?: Session;
   private currentRun?: vscode.CancellationTokenSource;
-  private pendingAskUser?: { resolve: (value: string) => void };
+  private pendingAskUser?: { resolve: (value: string) => void; id: string };
   private configSub?: vscode.Disposable;
   private pendingEditsSub?: vscode.Disposable;
   private readonly sessions: SessionStore;
@@ -73,7 +73,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.sessions = new SessionStore(context.workspaceState);
     this.lessons = new LessonStore(context.workspaceState);
     this.configSub = vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('quickcode.llm')) {
+      if (e.affectsConfiguration('burstcode.llm')) {
         this.broadcastModels();
         this.broadcastContextUsage();
       }
@@ -212,12 +212,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async loadSession(id: string): Promise<void> {
     if (this.currentRun) {
-      vscode.window.showWarningMessage('QuickCode: finish or stop the current request before switching sessions.');
+      vscode.window.showWarningMessage('BurstCode: finish or stop the current request before switching sessions.');
       return;
     }
     const s = this.sessions.get(id);
     if (!s) {
-      vscode.window.showWarningMessage('QuickCode: session not found.');
+      vscode.window.showWarningMessage('BurstCode: session not found.');
       this.broadcastSessions();
       return;
     }
@@ -309,7 +309,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.broadcastSessions();
         break;
       case 'open-config':
-        await vscode.commands.executeCommand('workbench.action.openSettings', 'quickcode');
+        await vscode.commands.executeCommand('workbench.action.openSettings', 'burstcode');
         break;
       case 'select-model': {
         const p = (msg.payload ?? {}) as { endpoint?: string; model?: string };
@@ -370,7 +370,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'bg-menu':
         // Forward to the registered command so the BackgroundExplorer ref
         // lives in one place (extension.ts owns it).
-        void vscode.commands.executeCommand('quickcode.background.menu');
+        void vscode.commands.executeCommand('burstcode.background.menu');
         break;
       case 'request-lessons':
         this.broadcastLessons();
@@ -465,16 +465,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    */
   private async rollbackToCheckpoint(ref: string, messageIndex: number): Promise<void> {
     if (!ref || !this.currentSession || !Number.isFinite(messageIndex) || messageIndex < 0) {
-      vscode.window.showWarningMessage('QuickCode: nothing to roll back to.');
+      vscode.window.showWarningMessage('BurstCode: nothing to roll back to.');
       return;
     }
     if (this.currentRun) {
-      vscode.window.showWarningMessage('QuickCode: stop the current request before rolling back.');
+      vscode.window.showWarningMessage('BurstCode: stop the current request before rolling back.');
       return;
     }
     if (this.applier.getPendingState().hunks > 0) {
       const choice = await vscode.window.showWarningMessage(
-        'QuickCode: there are still pending edits. Discard them and roll back?',
+        'BurstCode: there are still pending edits. Discard them and roll back?',
         { modal: true },
         'Discard & Roll Back'
       );
@@ -508,13 +508,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         plan: session.plan ?? []
       }
     });
-    vscode.window.showInformationMessage('QuickCode: rolled back to the previous prompt.');
+    vscode.window.showInformationMessage('BurstCode: rolled back to the previous prompt.');
   }
 
   private async runAgent(userText: string): Promise<void> {
     if (!userText.trim()) return;
     if (this.currentRun) {
-      vscode.window.showWarningMessage('QuickCode: a request is already running.');
+      vscode.window.showWarningMessage('BurstCode: a request is already running.');
       return;
     }
 
@@ -563,13 +563,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const llmCfg = readLLMConfig();
     const client = new OpenAIClient(llmCfg, this.logger);
     const bridge = new LspBridge(
-      vscode.workspace.getConfiguration('quickcode.lsp').get<number>('maxWaitMs') ?? 60000
+      vscode.workspace.getConfiguration('burstcode.lsp').get<number>('maxWaitMs') ?? 60000
     );
 
-    const askUser = (q: string, options?: string[]): Promise<string> => {
+    // Allocate the cancellation source up front so the askUser callback below
+    // can subscribe to it; we activate it on `this.currentRun` further down,
+    // immediately before agent.run() starts streaming.
+    const cts = new vscode.CancellationTokenSource();
+
+    const askUser = (spec: AskUserSpec): Promise<string> => {
       return new Promise<string>((resolve) => {
-        this.pendingAskUser = { resolve };
-        this.post({ type: 'ask-user', payload: { question: q, options } });
+        const id = `ask_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        this.pendingAskUser = { resolve, id };
+        this.post({
+          type: 'ask-user',
+          payload: {
+            id,
+            question: spec.question,
+            inputType: spec.inputType,
+            options: spec.options,
+            allowCustomText: !!spec.allowCustomText,
+            placeholder: spec.placeholder
+          }
+        });
+        // If the run is cancelled before the user answers, unblock the agent
+        // loop so it can wind down cleanly instead of hanging on this promise.
+        const cancelSub = cts.token.onCancellationRequested(() => {
+          if (this.pendingAskUser?.id === id) {
+            this.pendingAskUser = undefined;
+            this.post({ type: 'ask-user-cancel', payload: { id } });
+            resolve('(cancelled by user)');
+          }
+          cancelSub.dispose();
+        });
       });
     };
 
@@ -604,17 +630,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // The outline build started above, in parallel with the git checkpoint.
     const systemPrompt = await systemPromptPromise;
 
-    const agentCfg = vscode.workspace.getConfiguration('quickcode.agent');
+    const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
     const agent = new AgentLoop(client, tools, this.applier, this.logger, {
       contextWindow: llmCfg.contextWindow,
       maxIterations: agentCfg.get<number>('maxIterations') ?? 25,
       requireConfirmBeforeEdit: agentCfg.get<boolean>('requireConfirmBeforeEdit') ?? true,
       autoContinueOnLength: agentCfg.get<boolean>('autoContinueOnLength') ?? true,
       maxAutoContinues: agentCfg.get<number>('maxAutoContinues') ?? 3,
+      maxStuckRepeats: agentCfg.get<number>('maxStuckRepeats') ?? 2,
+      askUser,
       systemPrompt
     });
 
-    const cts = new vscode.CancellationTokenSource();
     this.currentRun = cts;
     this.post({ type: 'run-start' });
 
@@ -647,6 +674,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             break;
           case 'context-compressed':
             this.post({ type: 'context-compressed', payload: event.payload });
+            break;
+          case 'stuck-detected':
+            this.post({ type: 'stuck-detected', payload: event.payload });
             break;
           case 'error':
             this.post({ type: 'error', payload: event.payload });
@@ -791,9 +821,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(0.7); } }
 
   /* ============ Plan ============ */
-  #plan { display: none; padding: 8px 14px; border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); max-height: 28vh; overflow-y: auto; flex-shrink: 0; }
+  /* Pinned above the chat log, collapsible so it never overwhelms the conversation. */
+  #plan { display: none; border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); flex-shrink: 0; }
   #plan.has-steps { display: block; }
-  #plan .plan-title { font-weight: 600; margin-bottom: 6px; opacity: 0.85; font-size: 0.85em; }
+  #plan .plan-title { display: flex; align-items: center; gap: 6px; padding: 6px 14px; font-weight: 600; opacity: 0.85; font-size: 0.85em; cursor: pointer; user-select: none; }
+  #plan .plan-title:hover { background: var(--vscode-list-hoverBackground); opacity: 1; }
+  #plan .plan-title .chev { display: inline-block; width: 10px; flex-shrink: 0; opacity: 0.7; transition: transform 0.12s; }
+  #plan.collapsed .plan-title .chev { transform: rotate(-90deg); }
+  #plan .plan-title .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #plan .plan-body { padding: 0 14px 8px; max-height: 28vh; overflow-y: auto; }
+  #plan.collapsed .plan-body { display: none; }
   #plan ol { margin: 0; padding-left: 4px; list-style: none; }
   #plan li { margin: 2px 0; line-height: 1.45; font-size: 0.9em; }
   #plan li.completed { opacity: 0.55; }
@@ -893,6 +930,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .ask button.decision-reject { background: transparent; color: var(--vscode-foreground); border-color: var(--vscode-panel-border); }
   .ask button.decision-reject:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); }
   .decision-panel { border-color: var(--vscode-charts-orange, #d18616); }
+
+  /* ============ Clarification ask (single / multi / text) ============ */
+  .ask-clarify { border-color: var(--vscode-charts-blue, #4ea1f3); }
+  .ask-clarify .ask-header { display: flex; align-items: flex-start; gap: 8px; }
+  .ask-clarify .ask-mode { flex: 0 0 auto; font-size: 0.72em; padding: 2px 7px; border-radius: 10px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; }
+  .ask-clarify .ask-question { flex: 1 1 auto; font-weight: 500; line-height: 1.35; }
+  .ask-clarify .ask-choices { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+  .ask-clarify .ask-choice { text-align: left; padding: 7px 10px; border-radius: 5px; cursor: pointer; }
+  .ask-clarify .ask-choice-label { font-weight: 500; }
+  .ask-clarify .ask-choice-desc { font-size: 0.85em; opacity: 0.78; margin-top: 2px; line-height: 1.35; }
+  .ask-clarify .ask-check-row { display: flex; align-items: flex-start; gap: 8px; padding: 5px 6px; border-radius: 4px; cursor: pointer; }
+  .ask-clarify .ask-check-row:hover:not(.disabled) { background: var(--vscode-list-hoverBackground); }
+  .ask-clarify .ask-check-row input[type="checkbox"] { margin-top: 3px; }
+  .ask-clarify .ask-check-text { flex: 1 1 auto; min-width: 0; }
+  .ask-clarify .ask-text { width: 100%; margin-top: 8px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 5px 7px; border-radius: 4px; font: inherit; box-sizing: border-box; }
+  .ask-clarify.answered { opacity: 0.78; border-color: var(--vscode-panel-border); }
+  .ask-clarify.cancelled .ask-answer { color: var(--vscode-errorForeground); }
+  .ask-clarify .ask-answer { margin-top: 8px; font-size: 0.88em; opacity: 0.85; font-style: italic; }
 
   /* ============ Pending edits banner (sticky, above composer) ============ */
   #pendingBanner { display: none; padding: 8px 10px; margin: 0 12px 8px; border-radius: 8px; background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-charts-orange, #d18616); flex-shrink: 0; }
@@ -1011,7 +1066,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div class="topbar">
-    <span class="brand"><span class="dot"></span>QuickCode</span>
+    <span class="brand"><span class="dot"></span>BurstCode</span>
     <span class="spacer"></span>
     <button id="newBtn" class="icon-btn" title="New chat" aria-label="New chat">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>
@@ -1032,7 +1087,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div id="plan"></div>
   <div id="log">
     <div class="empty-state">
-      <div class="title">QuickCode</div>
+      <div class="title">BurstCode</div>
       <div class="hint">Ask anything about your codebase, or describe a change to make.</div>
     </div>
   </div>
@@ -1066,7 +1121,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
     </div>
     <div id="composer">
-      <textarea id="input" rows="1" placeholder="Ask QuickCode anything..."></textarea>
+      <textarea id="input" rows="1" placeholder="Ask BurstCode anything..."></textarea>
       <button id="sendBtn" title="Send (Enter)" aria-label="Send" data-mode="send">
         <svg class="icon-send" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg>
         <svg class="icon-stop" viewBox="0 0 16 16" fill="currentColor"><rect x="4.5" y="4.5" width="7" height="7" rx="1.2"/></svg>
@@ -1251,6 +1306,9 @@ function setStatus(state, label) {
   }
 }
 
+// Collapse state persists across plan updates within a session so the user's
+// preference isn't reset every time the model edits the plan.
+let planCollapsed = false;
 function renderPlan(steps) {
   if (!steps || steps.length === 0) {
     planEl.classList.remove('has-steps');
@@ -1258,10 +1316,39 @@ function renderPlan(steps) {
     return;
   }
   planEl.classList.add('has-steps');
+  planEl.classList.toggle('collapsed', planCollapsed);
+  const done = steps.filter((s) => s.status === 'completed').length;
+
   const title = document.createElement('div');
   title.className = 'plan-title';
-  const done = steps.filter((s) => s.status === 'completed').length;
-  title.textContent = 'Plan · ' + done + '/' + steps.length;
+  title.setAttribute('role', 'button');
+  title.setAttribute('tabindex', '0');
+  title.setAttribute('aria-expanded', String(!planCollapsed));
+  title.title = planCollapsed ? 'Expand plan' : 'Collapse plan';
+  const chev = document.createElement('span');
+  chev.className = 'chev';
+  chev.textContent = '▾';
+  const label = document.createElement('span');
+  label.className = 'label';
+  label.textContent = 'Plan · ' + done + '/' + steps.length;
+  title.appendChild(chev);
+  title.appendChild(label);
+  const togglePlan = () => {
+    planCollapsed = !planCollapsed;
+    planEl.classList.toggle('collapsed', planCollapsed);
+    title.setAttribute('aria-expanded', String(!planCollapsed));
+    title.title = planCollapsed ? 'Expand plan' : 'Collapse plan';
+  };
+  title.addEventListener('click', togglePlan);
+  title.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault();
+      togglePlan();
+    }
+  });
+
+  const body = document.createElement('div');
+  body.className = 'plan-body';
   const ol = document.createElement('ol');
   steps.forEach((s) => {
     const li = document.createElement('li');
@@ -1278,9 +1365,11 @@ function renderPlan(steps) {
     li.appendChild(textEl);
     ol.appendChild(li);
   });
+  body.appendChild(ol);
+
   planEl.innerHTML = '';
   planEl.appendChild(title);
-  planEl.appendChild(ol);
+  planEl.appendChild(body);
 }
 
 function clearEmptyState() {
@@ -1402,7 +1491,7 @@ function renderLessons() {
   if (lessonsCache.length === 0 && !lessonsAdding) {
     const e = document.createElement('div');
     e.className = 'empty';
-    e.innerHTML = 'No lessons yet.<br>QuickCode will record one whenever you correct it,<br>or when you state a project-wide rule.';
+    e.innerHTML = 'No lessons yet.<br>BurstCode will record one whenever you correct it,<br>or when you state a project-wide rule.';
     lessonsEl.appendChild(e);
     return;
   }
@@ -1841,7 +1930,7 @@ function showEmptyState() {
   wrap.className = 'empty-state';
   const title = document.createElement('div');
   title.className = 'title';
-  title.textContent = 'QuickCode';
+  title.textContent = 'BurstCode';
   const hint = document.createElement('div');
   hint.className = 'hint';
   hint.textContent = 'Ask anything about your codebase, or describe a change to make.';
@@ -2122,33 +2211,194 @@ window.addEventListener('message', (e) => {
       break;
     }
     case 'ask-user': {
+      const payload = msg.payload || {};
+      const askId = String(payload.id || '');
+      const inputType = payload.inputType === 'multi' || payload.inputType === 'text' ? payload.inputType : 'single';
+      const rawOptions = Array.isArray(payload.options) ? payload.options : [];
+      const allowCustomText = !!payload.allowCustomText || inputType === 'text';
+      const placeholder = String(payload.placeholder || '');
+
       const wrap = document.createElement('div');
-      wrap.className = 'ask';
+      wrap.className = 'ask ask-clarify';
+      wrap.dataset.askId = askId;
+
+      // Header tag: clarifies which input mode the user is dealing with.
+      const header = document.createElement('div');
+      header.className = 'ask-header';
+      const tag = document.createElement('span');
+      tag.className = 'ask-mode';
+      tag.textContent =
+        inputType === 'multi' ? 'Pick any' : inputType === 'text' ? 'Free text' : 'Pick one';
+      header.appendChild(tag);
       const q = document.createElement('div');
-      q.textContent = '❓ ' + msg.payload.question;
-      wrap.appendChild(q);
-      const inp = document.createElement('input');
-      inp.style.cssText = 'width:100%;margin-top:6px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);padding:4px 6px;border-radius:4px;';
-      wrap.appendChild(inp);
-      const opts = document.createElement('div');
-      opts.className = 'options';
-      (msg.payload.options || []).forEach((o) => {
-        const b = document.createElement('button');
-        b.className = 'secondary';
-        b.textContent = o;
-        b.onclick = () => { vscode.postMessage({ type: 'ask-user-response', payload: { answer: o } }); wrap.remove(); };
-        opts.appendChild(b);
-      });
-      const submit = document.createElement('button');
-      submit.textContent = 'Submit';
-      submit.onclick = () => { vscode.postMessage({ type: 'ask-user-response', payload: { answer: inp.value } }); wrap.remove(); };
-      opts.appendChild(submit);
-      wrap.appendChild(opts);
+      q.className = 'ask-question';
+      q.textContent = '❓ ' + String(payload.question || '');
+      header.appendChild(q);
+      wrap.appendChild(header);
+
+      // Map normalized {label, description} entries to the controls.
+      const options = rawOptions.map((o) => {
+        if (typeof o === 'string') return { label: o, description: '' };
+        return { label: String(o && o.label || ''), description: String(o && o.description || '') };
+      }).filter((o) => o.label);
+
+      let textInput = null;
+      const sendAnswer = (answer) => {
+        if (wrap.dataset.done === '1') return;
+        wrap.dataset.done = '1';
+        // Disable controls but keep them visible so the user can see what they answered.
+        wrap.classList.add('answered');
+        const ctrls = wrap.querySelectorAll('button, input, label');
+        ctrls.forEach((el) => { el.setAttribute('disabled', 'true'); el.classList.add('disabled'); });
+        const echo = document.createElement('div');
+        echo.className = 'ask-answer';
+        echo.textContent = '↪ ' + (answer || '(empty)');
+        wrap.appendChild(echo);
+        vscode.postMessage({ type: 'ask-user-response', payload: { id: askId, answer: answer } });
+      };
+
+      if (inputType === 'single') {
+        const list = document.createElement('div');
+        list.className = 'ask-choices';
+        options.forEach((o) => {
+          const btn = document.createElement('button');
+          btn.className = 'secondary ask-choice';
+          const lbl = document.createElement('div');
+          lbl.className = 'ask-choice-label';
+          lbl.textContent = o.label;
+          btn.appendChild(lbl);
+          if (o.description) {
+            const desc = document.createElement('div');
+            desc.className = 'ask-choice-desc';
+            desc.textContent = o.description;
+            btn.appendChild(desc);
+          }
+          btn.onclick = () => sendAnswer(o.label);
+          list.appendChild(btn);
+        });
+        wrap.appendChild(list);
+      } else if (inputType === 'multi') {
+        const list = document.createElement('div');
+        list.className = 'ask-choices ask-choices-multi';
+        const checks = [];
+        options.forEach((o, i) => {
+          const row = document.createElement('label');
+          row.className = 'ask-check-row';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.value = o.label;
+          cb.id = (askId || 'ask') + '_opt_' + i;
+          checks.push(cb);
+          row.appendChild(cb);
+          const txt = document.createElement('div');
+          txt.className = 'ask-check-text';
+          const lbl = document.createElement('div');
+          lbl.className = 'ask-choice-label';
+          lbl.textContent = o.label;
+          txt.appendChild(lbl);
+          if (o.description) {
+            const desc = document.createElement('div');
+            desc.className = 'ask-choice-desc';
+            desc.textContent = o.description;
+            txt.appendChild(desc);
+          }
+          row.appendChild(txt);
+          list.appendChild(row);
+        });
+        wrap.appendChild(list);
+
+        if (allowCustomText) {
+          textInput = document.createElement('input');
+          textInput.type = 'text';
+          textInput.className = 'ask-text';
+          textInput.placeholder = placeholder || 'Optional: add a custom note…';
+          wrap.appendChild(textInput);
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'options';
+        const submit = document.createElement('button');
+        submit.textContent = 'Submit';
+        submit.onclick = () => {
+          const picked = checks.filter((c) => c.checked).map((c) => c.value);
+          let answer = picked.join(', ');
+          if (textInput && textInput.value.trim()) {
+            answer = answer ? answer + ' | ' + textInput.value.trim() : textInput.value.trim();
+          }
+          sendAnswer(answer);
+        };
+        actions.appendChild(submit);
+        wrap.appendChild(actions);
+      } else {
+        // text-only
+        textInput = document.createElement('input');
+        textInput.type = 'text';
+        textInput.className = 'ask-text';
+        textInput.placeholder = placeholder || 'Type your answer…';
+        wrap.appendChild(textInput);
+        const actions = document.createElement('div');
+        actions.className = 'options';
+        const submit = document.createElement('button');
+        submit.textContent = 'Submit';
+        submit.onclick = () => sendAnswer(textInput.value);
+        actions.appendChild(submit);
+        wrap.appendChild(actions);
+        textInput.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' && !ev.shiftKey) {
+            ev.preventDefault();
+            sendAnswer(textInput.value);
+          }
+        });
+      }
+
+      // For single+allowCustomText, also offer a text fallback alongside buttons.
+      if (inputType === 'single' && allowCustomText) {
+        textInput = document.createElement('input');
+        textInput.type = 'text';
+        textInput.className = 'ask-text';
+        textInput.placeholder = placeholder || 'Or type a custom answer…';
+        wrap.appendChild(textInput);
+        const actions = document.createElement('div');
+        actions.className = 'options';
+        const submit = document.createElement('button');
+        submit.textContent = 'Submit text';
+        submit.onclick = () => {
+          const v = textInput.value.trim();
+          if (v) sendAnswer(v);
+        };
+        actions.appendChild(submit);
+        wrap.appendChild(actions);
+        textInput.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' && !ev.shiftKey) {
+            ev.preventDefault();
+            const v = textInput.value.trim();
+            if (v) sendAnswer(v);
+          }
+        });
+      }
+
       log.appendChild(wrap);
-      inp.focus();
+      if (textInput) textInput.focus();
       // Asking the user a question requires their attention; pull the panel
       // back to the bottom even if they had scrolled up.
       forceScrollToBottom();
+      break;
+    }
+    case 'ask-user-cancel': {
+      // Run was cancelled while a question was open; lock the inputs so the
+      // user understands their answer is no longer needed.
+      const id = String((msg.payload && msg.payload.id) || '');
+      const node = id ? log.querySelector('.ask-clarify[data-ask-id="' + id + '"]') : null;
+      if (node && node.dataset.done !== '1') {
+        node.dataset.done = '1';
+        node.classList.add('answered', 'cancelled');
+        const ctrls = node.querySelectorAll('button, input, label');
+        ctrls.forEach((el) => { el.setAttribute('disabled', 'true'); el.classList.add('disabled'); });
+        const note = document.createElement('div');
+        note.className = 'ask-answer';
+        note.textContent = '↪ (cancelled — no answer sent)';
+        node.appendChild(note);
+      }
       break;
     }
     case 'error':
@@ -2216,6 +2466,19 @@ window.addEventListener('message', (e) => {
       note.style.opacity = '0.7';
       note.textContent = '↯ Context auto-compressed: ' + fmtTokens(p.before)
         + ' → ' + fmtTokens(p.after) + ' tokens';
+      log.appendChild(note);
+      scrollToBottom();
+      break;
+    }
+    case 'stuck-detected': {
+      const p = msg.payload || { repeats: 0, calls: '', action: '' };
+      const note = document.createElement('div');
+      note.className = 'decision-flash reject';
+      const verb = p.action === 'ask-user'
+        ? 'asking you to weigh in'
+        : 'nudging the model to try a different approach';
+      note.textContent = '⚠ Detected ' + p.repeats + ' identical tool-call turns ('
+        + (p.calls || 'unknown') + ') — ' + verb + '.';
       log.appendChild(note);
       scrollToBottom();
       break;

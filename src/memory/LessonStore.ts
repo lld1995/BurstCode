@@ -40,7 +40,7 @@ export interface Lesson {
   hits?: number;
 }
 
-const KEY_INDEX = 'quickcode.lessons.v1';
+const KEY_INDEX = 'burstcode.lessons.v1';
 /** Hard cap so the prompt budget stays bounded even after a long-running project. */
 const MAX_LESSONS = 200;
 

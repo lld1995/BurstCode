@@ -17,7 +17,7 @@ export interface SessionMeta {
 export interface SessionCheckpoint {
   /** Index in `Session.messages` of the user message this checkpoint belongs to. */
   messageIndex: number;
-  /** Git ref under refs/quickcode/checkpoints/<ts>. */
+  /** Git ref under refs/burstcode/checkpoints/<ts>. */
   ref: string;
   /** Object name the ref points at. */
   sha: string;
@@ -33,8 +33,8 @@ export interface Session extends SessionMeta {
   checkpoints?: SessionCheckpoint[];
 }
 
-const KEY_INDEX = 'quickcode.sessions.index';
-const KEY_SESSION_PREFIX = 'quickcode.session.';
+const KEY_INDEX = 'burstcode.sessions.index';
+const KEY_SESSION_PREFIX = 'burstcode.session.';
 const MAX_SESSIONS = 100;
 
 /**

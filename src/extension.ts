@@ -20,7 +20,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const logger = new Logger();
   context.subscriptions.push(logger);
 
-  logger.info('QuickCode activating...');
+  logger.info('BurstCode activating...');
 
   const dependencyGuard = new DependencyGuard(logger);
   context.subscriptions.push(dependencyGuard);
@@ -59,11 +59,11 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('quickcode.newChat', () => chatProvider.newChat()),
-    vscode.commands.registerCommand('quickcode.configureModel', () =>
-      vscode.commands.executeCommand('workbench.action.openSettings', 'quickcode.llm')
+    vscode.commands.registerCommand('burstcode.newChat', () => chatProvider.newChat()),
+    vscode.commands.registerCommand('burstcode.configureModel', () =>
+      vscode.commands.executeCommand('workbench.action.openSettings', 'burstcode.llm')
     ),
-    vscode.commands.registerCommand('quickcode.selectModel', async () => {
+    vscode.commands.registerCommand('burstcode.selectModel', async () => {
       const endpoints = readEndpoints();
       type Item = vscode.QuickPickItem & { endpoint: string; model: string };
       const activeEp = getActiveEndpointName();
@@ -98,7 +98,7 @@ export function activate(context: vscode.ExtensionContext): void {
         });
       }
       const picked = await vscode.window.showQuickPick(items, {
-        title: 'QuickCode: Select Active Model',
+        title: 'BurstCode: Select Active Model',
         placeHolder: 'Pick a model, fetch from /v1/models, or add one manually'
       });
       if (!picked) return;
@@ -111,41 +111,41 @@ export function activate(context: vscode.ExtensionContext): void {
             () => fetchEndpointModels(ep)
           );
           if (ids.length === 0) {
-            vscode.window.showWarningMessage(`QuickCode: ${ep.name} returned no models.`);
+            vscode.window.showWarningMessage(`BurstCode: ${ep.name} returned no models.`);
             return;
           }
           const sub = await vscode.window.showQuickPick(ids, {
-            title: `QuickCode: Models on ${ep.name}`,
+            title: `BurstCode: Models on ${ep.name}`,
             placeHolder: 'Pick a model to activate'
           });
           if (sub) {
             await setActiveSelection(ep.name, sub);
-            vscode.window.showInformationMessage(`QuickCode: switched to "${ep.name} / ${sub}".`);
+            vscode.window.showInformationMessage(`BurstCode: switched to "${ep.name} / ${sub}".`);
           }
         } catch (err) {
-          vscode.window.showErrorMessage(`QuickCode: failed to fetch models — ${String((err as Error).message ?? err)}`);
+          vscode.window.showErrorMessage(`BurstCode: failed to fetch models — ${String((err as Error).message ?? err)}`);
         }
       } else if (picked.model === '__add__') {
         const id = await vscode.window.showInputBox({
-          title: `QuickCode: Add model under ${picked.endpoint}`,
+          title: `BurstCode: Add model under ${picked.endpoint}`,
           placeHolder: 'e.g. qwen2.5-coder:7b'
         });
         if (id && id.trim()) {
           await setActiveSelection(picked.endpoint, id.trim());
-          vscode.window.showInformationMessage(`QuickCode: switched to "${picked.endpoint} / ${id.trim()}".`);
+          vscode.window.showInformationMessage(`BurstCode: switched to "${picked.endpoint} / ${id.trim()}".`);
         }
       } else if (picked.model) {
         await setActiveSelection(picked.endpoint, picked.model);
-        vscode.window.showInformationMessage(`QuickCode: switched to "${picked.endpoint} / ${picked.model}".`);
+        vscode.window.showInformationMessage(`BurstCode: switched to "${picked.endpoint} / ${picked.model}".`);
       }
     }),
-    vscode.commands.registerCommand('quickcode.restoreCheckpoint', () =>
+    vscode.commands.registerCommand('burstcode.restoreCheckpoint', () =>
       gitCheckpoint.restoreInteractive()
     ),
-    vscode.commands.registerCommand('quickcode.acceptAllSuggestions', () => hunkApplier.acceptAll()),
-    vscode.commands.registerCommand('quickcode.rejectAllSuggestions', () => hunkApplier.rejectAll()),
-    vscode.commands.registerCommand('quickcode.acceptHunk', (id: string) => hunkApplier.acceptHunk(id)),
-    vscode.commands.registerCommand('quickcode.rejectHunk', (id: string) => hunkApplier.rejectHunk(id))
+    vscode.commands.registerCommand('burstcode.acceptAllSuggestions', () => hunkApplier.acceptAll()),
+    vscode.commands.registerCommand('burstcode.rejectAllSuggestions', () => hunkApplier.rejectAll()),
+    vscode.commands.registerCommand('burstcode.acceptHunk', (id: string) => hunkApplier.acceptHunk(id)),
+    vscode.commands.registerCommand('burstcode.rejectHunk', (id: string) => hunkApplier.rejectHunk(id))
   );
 
   // ---------------------------------------------------------------
@@ -164,26 +164,26 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('quickcode.background.toggle', async () => {
-      const cfg = vscode.workspace.getConfiguration('quickcode.background');
+    vscode.commands.registerCommand('burstcode.background.toggle', async () => {
+      const cfg = vscode.workspace.getConfiguration('burstcode.background');
       const next = !(cfg.get<boolean>('enabled') ?? false);
       await cfg.update('enabled', next, vscode.ConfigurationTarget.Global);
       vscode.window.showInformationMessage(
-        `QuickCode background explorer ${next ? 'enabled' : 'disabled'}.`
+        `BurstCode background explorer ${next ? 'enabled' : 'disabled'}.`
       );
     }),
-    vscode.commands.registerCommand('quickcode.background.runOnce', () =>
+    vscode.commands.registerCommand('burstcode.background.runOnce', () =>
       backgroundExplorer.runOnce()
     ),
-    vscode.commands.registerCommand('quickcode.background.resetState', () =>
+    vscode.commands.registerCommand('burstcode.background.resetState', () =>
       backgroundExplorer.resetState()
     ),
-    vscode.commands.registerCommand('quickcode.background.showActivityLog', () =>
+    vscode.commands.registerCommand('burstcode.background.showActivityLog', () =>
       backgroundExplorer.showOutput()
     ),
     // Single-entry-point menu, fired by clicking the chat-panel pill.
-    vscode.commands.registerCommand('quickcode.background.menu', async () => {
-      const cfg = vscode.workspace.getConfiguration('quickcode.background');
+    vscode.commands.registerCommand('burstcode.background.menu', async () => {
+      const cfg = vscode.workspace.getConfiguration('burstcode.background');
       const isOn = cfg.get<boolean>('enabled') ?? false;
       const status = backgroundExplorer.getStatus();
       const epLabel = cfg.get<string>('endpoint') || '(inherit chat)';
@@ -193,7 +193,7 @@ export function activate(context: vscode.ExtensionContext): void {
         {
           id: 'log',
           label: '$(output) Open activity log',
-          description: 'Reveal the "QuickCode Background" output channel'
+          description: 'Reveal the "BurstCode Background" output channel'
         },
         {
           id: 'model',
@@ -213,7 +213,7 @@ export function activate(context: vscode.ExtensionContext): void {
         {
           id: 'report',
           label: '$(file) Show report (README)',
-          description: 'Open `.quickcode/README.md`'
+          description: 'Open `.burstcode/README.md`'
         },
         {
           id: 'reset',
@@ -222,54 +222,54 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       ];
       const picked = await vscode.window.showQuickPick(items, {
-        title: `QuickCode background \u2014 ${status.phase}`,
+        title: `BurstCode background \u2014 ${status.phase}`,
         placeHolder: status.detail || 'Manage the background explorer'
       });
       if (!picked) return;
       switch (picked.id) {
         case 'log':
-          await vscode.commands.executeCommand('quickcode.background.showActivityLog');
+          await vscode.commands.executeCommand('burstcode.background.showActivityLog');
           break;
         case 'model':
-          await vscode.commands.executeCommand('quickcode.background.selectModel');
+          await vscode.commands.executeCommand('burstcode.background.selectModel');
           break;
         case 'toggle':
-          await vscode.commands.executeCommand('quickcode.background.toggle');
+          await vscode.commands.executeCommand('burstcode.background.toggle');
           break;
         case 'run':
-          await vscode.commands.executeCommand('quickcode.background.runOnce');
+          await vscode.commands.executeCommand('burstcode.background.runOnce');
           break;
         case 'report':
-          await vscode.commands.executeCommand('quickcode.background.showReport');
+          await vscode.commands.executeCommand('burstcode.background.showReport');
           break;
         case 'reset':
-          await vscode.commands.executeCommand('quickcode.background.resetState');
+          await vscode.commands.executeCommand('burstcode.background.resetState');
           break;
       }
     }),
-    vscode.commands.registerCommand('quickcode.background.showReport', async () => {
+    vscode.commands.registerCommand('burstcode.background.showReport', async () => {
       const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       if (!root) {
-        vscode.window.showWarningMessage('QuickCode: open a workspace folder first.');
+        vscode.window.showWarningMessage('BurstCode: open a workspace folder first.');
         return;
       }
       const outDir = vscode.workspace
-        .getConfiguration('quickcode.background')
-        .get<string>('outputDir') || '.quickcode';
+        .getConfiguration('burstcode.background')
+        .get<string>('outputDir') || '.burstcode';
       const readme = vscode.Uri.file(path.join(root, outDir, 'README.md'));
       try {
         const doc = await vscode.workspace.openTextDocument(readme);
         await vscode.window.showTextDocument(doc, { preview: false });
       } catch {
         vscode.window.showInformationMessage(
-          'QuickCode: no background report yet — enable the explorer or run "Run Background Analysis Now".'
+          'BurstCode: no background report yet — enable the explorer or run "Run Background Analysis Now".'
         );
       }
     }),
-    vscode.commands.registerCommand('quickcode.background.selectModel', async () => {
+    vscode.commands.registerCommand('burstcode.background.selectModel', async () => {
       const endpoints = readEndpoints();
       type Item = vscode.QuickPickItem & { endpoint: string; model: string };
-      const cfg = vscode.workspace.getConfiguration('quickcode.background');
+      const cfg = vscode.workspace.getConfiguration('burstcode.background');
       const currentEp = cfg.get<string>('endpoint') ?? '';
       const currentModel = cfg.get<string>('model') ?? '';
       const items: Item[] = [
@@ -299,7 +299,7 @@ export function activate(context: vscode.ExtensionContext): void {
         });
       }
       const picked = await vscode.window.showQuickPick(items, {
-        title: 'QuickCode: Background Explorer Model',
+        title: 'BurstCode: Background Explorer Model',
         placeHolder: 'Pick a model for the background loop (independent of chat)'
       });
       if (!picked) return;
@@ -312,36 +312,36 @@ export function activate(context: vscode.ExtensionContext): void {
             () => fetchEndpointModels(ep)
           );
           if (ids.length === 0) {
-            vscode.window.showWarningMessage(`QuickCode: ${ep.name} returned no models.`);
+            vscode.window.showWarningMessage(`BurstCode: ${ep.name} returned no models.`);
             return;
           }
           const sub = await vscode.window.showQuickPick(ids, {
-            title: `QuickCode: Models on ${ep.name}`,
+            title: `BurstCode: Models on ${ep.name}`,
             placeHolder: 'Pick a model for the background explorer'
           });
           if (sub) {
             await cfg.update('endpoint', ep.name, vscode.ConfigurationTarget.Global);
             await cfg.update('model', sub, vscode.ConfigurationTarget.Global);
-            vscode.window.showInformationMessage(`QuickCode: background explorer using "${ep.name} / ${sub}".`);
+            vscode.window.showInformationMessage(`BurstCode: background explorer using "${ep.name} / ${sub}".`);
           }
         } catch (err) {
-          vscode.window.showErrorMessage(`QuickCode: failed to fetch models — ${String((err as Error).message ?? err)}`);
+          vscode.window.showErrorMessage(`BurstCode: failed to fetch models — ${String((err as Error).message ?? err)}`);
         }
       } else {
         await cfg.update('endpoint', picked.endpoint, vscode.ConfigurationTarget.Global);
         await cfg.update('model', picked.model, vscode.ConfigurationTarget.Global);
         if (picked.endpoint || picked.model) {
           vscode.window.showInformationMessage(
-            `QuickCode: background explorer using "${picked.endpoint || '(chat endpoint)'} / ${picked.model || '(endpoint default)'}".`
+            `BurstCode: background explorer using "${picked.endpoint || '(chat endpoint)'} / ${picked.model || '(endpoint default)'}".`
           );
         } else {
-          vscode.window.showInformationMessage('QuickCode: background explorer will inherit the chat model.');
+          vscode.window.showInformationMessage('BurstCode: background explorer will inherit the chat model.');
         }
       }
     })
   );
 
-  logger.info('QuickCode activated.');
+  logger.info('BurstCode activated.');
 }
 
 export function deactivate(): void {

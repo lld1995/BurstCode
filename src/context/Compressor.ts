@@ -58,6 +58,39 @@ export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig)
     current -= estimateTokens(stringifyContent(removed.content));
   }
 
+  // Final pass: when the tail window itself is what blew the budget (e.g. a
+  // single recent tool reply containing a huge file/grep dump), summarize big
+  // `tool` / `assistant` messages inside the tail too. We preserve the very
+  // last assistant turn and the most recent user message untouched so the
+  // in-flight turn isn't corrupted; everything earlier in the tail is fair
+  // game. Replacing only `content` keeps tool_call_id pairing intact, so
+  // sanitizeToolPairing below still validates.
+  if (current > budget) {
+    const lastUserIdx = (() => {
+      for (let i = result.length - 1; i > systemIdx; i--) {
+        if (result[i].role === 'user') return i;
+      }
+      return -1;
+    })();
+    // Keep last assistant turn (and its tool replies) verbatim: that's
+    // everything after the most recent user message.
+    const protectedFrom = lastUserIdx >= 0 ? lastUserIdx : result.length - 1;
+    for (let i = systemIdx + 1; i < protectedFrom && current > budget; i++) {
+      const msg = result[i];
+      if (!msg) continue;
+      if (msg.role === 'user' || msg.role === 'system') continue;
+      const original = stringifyContent(msg.content);
+      const originalTokens = estimateTokens(original);
+      if (originalTokens < 200) continue;
+      // Aggressive summary (200 chars) since we're already over budget.
+      const summarized = summarizeText(original, 200);
+      const newTokens = estimateTokens(summarized);
+      if (newTokens >= originalTokens) continue;
+      result[i] = { ...msg, content: summarized } as ChatMessage;
+      current -= originalTokens - newTokens;
+    }
+  }
+
   // Removing/summarizing oldest messages may have orphaned a `tool` reply
   // whose owning `assistant(tool_calls)` was dropped (or vice versa). Strip
   // those orphans so the request validates against the OpenAI schema:

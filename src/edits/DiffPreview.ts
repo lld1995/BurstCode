@@ -2,12 +2,12 @@ import * as vscode from 'vscode';
 
 /** Virtual document provider for the "before" snapshot used in diff editor. */
 export class DiffPreview implements vscode.TextDocumentContentProvider, vscode.Disposable {
-  static readonly scheme = 'quickcode-preview';
+  static readonly scheme = 'burstcode-preview';
 
   private readonly emitter = new vscode.EventEmitter<vscode.Uri>();
   readonly onDidChange = this.emitter.event;
 
-  /** key = uri.toString() (the quickcode-preview URI) -> file contents */
+  /** key = uri.toString() (the burstcode-preview URI) -> file contents */
   private readonly snapshots = new Map<string, string>();
   private readonly registration: vscode.Disposable;
 

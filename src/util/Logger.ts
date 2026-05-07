@@ -4,7 +4,7 @@ export class Logger implements vscode.Disposable {
   private readonly channel: vscode.OutputChannel;
 
   constructor() {
-    this.channel = vscode.window.createOutputChannel('QuickCode');
+    this.channel = vscode.window.createOutputChannel('BurstCode');
   }
 
   info(msg: string, ...args: unknown[]): void {

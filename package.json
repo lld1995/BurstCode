@@ -1,16 +1,16 @@
 {
-  "name": "quickcode",
-  "displayName": "QuickCode",
+  "name": "burstcode",
+  "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
   "version": "0.1.0",
-  "publisher": "quickcode",
+  "publisher": "burstcode",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lld1995/QuickCode.git"
+    "url": "https://github.com/lld1995/BurstCode.git"
   },
-  "homepage": "https://github.com/lld1995/QuickCode#readme",
+  "homepage": "https://github.com/lld1995/BurstCode#readme",
   "bugs": {
-    "url": "https://github.com/lld1995/QuickCode/issues"
+    "url": "https://github.com/lld1995/BurstCode/issues"
   },
   "license": "MIT",
   "engines": {
@@ -29,116 +29,116 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "quickcode",
-          "title": "QuickCode",
+          "id": "burstcode",
+          "title": "BurstCode",
           "icon": "media/icon.svg"
         }
       ]
     },
     "views": {
-      "quickcode": [
+      "burstcode": [
         {
-          "id": "quickcode.chatView",
-          "name": "QuickCode Chat",
+          "id": "burstcode.chatView",
+          "name": "BurstCode Chat",
           "type": "webview"
         }
       ]
     },
     "commands": [
       {
-        "command": "quickcode.newChat",
-        "title": "QuickCode: New Chat"
+        "command": "burstcode.newChat",
+        "title": "BurstCode: New Chat"
       },
       {
-        "command": "quickcode.configureModel",
-        "title": "QuickCode: Configure Model"
+        "command": "burstcode.configureModel",
+        "title": "BurstCode: Configure Model"
       },
       {
-        "command": "quickcode.acceptAllSuggestions",
-        "title": "QuickCode: Accept All Pending Suggestions"
+        "command": "burstcode.acceptAllSuggestions",
+        "title": "BurstCode: Accept All Pending Suggestions"
       },
       {
-        "command": "quickcode.rejectAllSuggestions",
-        "title": "QuickCode: Reject All Pending Suggestions"
+        "command": "burstcode.rejectAllSuggestions",
+        "title": "BurstCode: Reject All Pending Suggestions"
       },
       {
-        "command": "quickcode.acceptHunk",
-        "title": "QuickCode: Accept Hunk"
+        "command": "burstcode.acceptHunk",
+        "title": "BurstCode: Accept Hunk"
       },
       {
-        "command": "quickcode.rejectHunk",
-        "title": "QuickCode: Reject Hunk"
+        "command": "burstcode.rejectHunk",
+        "title": "BurstCode: Reject Hunk"
       },
       {
-        "command": "quickcode.selectModel",
-        "title": "QuickCode: Select Active Model"
+        "command": "burstcode.selectModel",
+        "title": "BurstCode: Select Active Model"
       },
       {
-        "command": "quickcode.restoreCheckpoint",
-        "title": "QuickCode: Restore Git Checkpoint"
+        "command": "burstcode.restoreCheckpoint",
+        "title": "BurstCode: Restore Git Checkpoint"
       },
       {
-        "command": "quickcode.background.toggle",
-        "title": "QuickCode: Toggle Background Code Explorer"
+        "command": "burstcode.background.toggle",
+        "title": "BurstCode: Toggle Background Code Explorer"
       },
       {
-        "command": "quickcode.background.runOnce",
-        "title": "QuickCode: Run Background Analysis Now"
+        "command": "burstcode.background.runOnce",
+        "title": "BurstCode: Run Background Analysis Now"
       },
       {
-        "command": "quickcode.background.selectModel",
-        "title": "QuickCode: Select Background Explorer Model"
+        "command": "burstcode.background.selectModel",
+        "title": "BurstCode: Select Background Explorer Model"
       },
       {
-        "command": "quickcode.background.showReport",
-        "title": "QuickCode: Show Background Explorer Report"
+        "command": "burstcode.background.showReport",
+        "title": "BurstCode: Show Background Explorer Report"
       },
       {
-        "command": "quickcode.background.resetState",
-        "title": "QuickCode: Reset Background Explorer State"
+        "command": "burstcode.background.resetState",
+        "title": "BurstCode: Reset Background Explorer State"
       },
       {
-        "command": "quickcode.background.showActivityLog",
-        "title": "QuickCode: Show Background Explorer Activity Log"
+        "command": "burstcode.background.showActivityLog",
+        "title": "BurstCode: Show Background Explorer Activity Log"
       },
       {
-        "command": "quickcode.background.menu",
-        "title": "QuickCode: Background Explorer Menu"
+        "command": "burstcode.background.menu",
+        "title": "BurstCode: Background Explorer Menu"
       }
     ],
     "configuration": {
-      "title": "QuickCode",
+      "title": "BurstCode",
       "properties": {
-        "quickcode.llm.baseURL": {
+        "burstcode.llm.baseURL": {
           "type": "string",
           "default": "http://localhost:11434/v1",
           "description": "OpenAI-compatible base URL (Ollama / LM Studio / vLLM)."
         },
-        "quickcode.llm.apiKey": {
+        "burstcode.llm.apiKey": {
           "type": "string",
           "default": "ollama",
           "description": "API key (some local servers ignore this; leave default for Ollama)."
         },
-        "quickcode.llm.model": {
+        "burstcode.llm.model": {
           "type": "string",
           "default": "qwen2.5-coder:7b",
           "description": "Model name as exposed by your local server."
         },
-        "quickcode.llm.contextWindow": {
+        "burstcode.llm.contextWindow": {
           "type": "number",
           "default": 32768,
           "description": "Total context window of the model in tokens."
         },
-        "quickcode.llm.temperature": {
+        "burstcode.llm.temperature": {
           "type": "number",
           "default": 0.2
         },
-        "quickcode.llm.allowSelfSignedCerts": {
+        "burstcode.llm.allowSelfSignedCerts": {
           "type": "boolean",
           "default": false,
           "description": "Skip TLS certificate verification when talking to the configured baseURL. Enable only for trusted self-hosted endpoints with self-signed certificates."
         },
-        "quickcode.llm.endpoints": {
+        "burstcode.llm.endpoints": {
           "type": "array",
           "default": [],
           "description": "List of OpenAI-compatible endpoints. Each entry is a remote server (baseURL + apiKey). Models for each endpoint can be fetched live via /v1/models from the chat panel's model picker, or supplemented manually in the 'models' field below. The chat panel shows endpoints grouped in the picker.",
@@ -183,20 +183,20 @@
             }
           }
         },
-        "quickcode.llm.activeEndpoint": {
+        "burstcode.llm.activeEndpoint": {
           "type": "string",
           "default": "",
-          "description": "Name of the currently active endpoint from quickcode.llm.endpoints. Set automatically when picking a model in the chat panel."
+          "description": "Name of the currently active endpoint from burstcode.llm.endpoints. Set automatically when picking a model in the chat panel."
         },
-        "quickcode.llm.activeModel": {
+        "burstcode.llm.activeModel": {
           "type": "string",
           "default": "",
           "description": "Currently active model id under the active endpoint. Set automatically when picking a model in the chat panel."
         },
-        "quickcode.llm.profiles": {
+        "burstcode.llm.profiles": {
           "type": "array",
           "default": [],
-          "description": "[Deprecated] Legacy LLM profiles (endpoint+model combined). Still read for backward compatibility — each profile is migrated into a quickcode.llm.endpoints entry on the fly. Prefer quickcode.llm.endpoints for new setups.",
+          "description": "[Deprecated] Legacy LLM profiles (endpoint+model combined). Still read for backward compatibility — each profile is migrated into a burstcode.llm.endpoints entry on the fly. Prefer burstcode.llm.endpoints for new setups.",
           "items": {
             "type": "object",
             "required": [
@@ -228,56 +228,61 @@
             }
           }
         },
-        "quickcode.llm.activeProfile": {
+        "burstcode.llm.activeProfile": {
           "type": "string",
           "default": "",
-          "description": "[Deprecated] Legacy active-profile name. Used only as a fallback when quickcode.llm.activeEndpoint is empty."
+          "description": "[Deprecated] Legacy active-profile name. Used only as a fallback when burstcode.llm.activeEndpoint is empty."
         },
-        "quickcode.git.autoCheckpoint": {
+        "burstcode.git.autoCheckpoint": {
           "type": "boolean",
           "default": true,
-          "description": "Before applying any QuickCode edit, snapshot the working tree to refs/quickcode/checkpoints/<timestamp> so the change can be rolled back later."
+          "description": "Before applying any BurstCode edit, snapshot the working tree to refs/burstcode/checkpoints/<timestamp> so the change can be rolled back later."
         },
-        "quickcode.agent.maxIterations": {
+        "burstcode.agent.maxIterations": {
           "type": "number",
           "default": 25,
           "description": "Maximum tool-calling iterations per user request."
         },
-        "quickcode.agent.requireConfirmBeforeEdit": {
+        "burstcode.agent.requireConfirmBeforeEdit": {
           "type": "boolean",
           "default": true
         },
-        "quickcode.agent.autoContinueOnLength": {
+        "burstcode.agent.autoContinueOnLength": {
           "type": "boolean",
           "default": true,
           "description": "When the LLM stops mid-turn because of the output token limit (finish_reason=length), automatically prompt it to continue instead of ending the turn."
         },
-        "quickcode.agent.maxAutoContinues": {
+        "burstcode.agent.maxAutoContinues": {
           "type": "number",
           "default": 3,
           "description": "Maximum number of consecutive auto-continues before giving up. Resets whenever the model successfully calls a tool."
         },
-        "quickcode.lsp.maxWaitMs": {
+        "burstcode.agent.maxStuckRepeats": {
+          "type": "number",
+          "default": 2,
+          "description": "Number of CONSECUTIVE identical tool-call turns that must be observed before escalating to an interactive prompt. The 1st repeat (2 identical turns) always injects an automatic self-correction nudge; once the counter reaches this value (default: 3 identical turns) the agent asks you to continue, give a hint, or stop."
+        },
+        "burstcode.lsp.maxWaitMs": {
           "type": "number",
           "default": 60000,
           "description": "Maximum time to wait for a language server to be ready."
         },
-        "quickcode.context.outlineBaseDepth": {
+        "burstcode.context.outlineBaseDepth": {
           "type": "number",
           "default": 2,
           "description": "Recursion depth used when generating the workspace outline injected into the agent's system prompt. Higher = more files visible but more tokens spent."
         },
-        "quickcode.context.outlineSrcDepth": {
+        "burstcode.context.outlineSrcDepth": {
           "type": "number",
           "default": 4,
           "description": "Recursion depth applied to source-like directories (src, lib, app, packages, ...) so the model can see deeper into them."
         },
-        "quickcode.context.outlineMaxBytes": {
+        "burstcode.context.outlineMaxBytes": {
           "type": "number",
           "default": 6000,
           "description": "Soft cap (in characters) on the workspace outline embedded in the system prompt. Outlines exceeding this are truncated and the agent is told to drill in via workspace_outline."
         },
-        "quickcode.context.outlineExtraExcludes": {
+        "burstcode.context.outlineExtraExcludes": {
           "type": "array",
           "default": [],
           "items": {
@@ -285,32 +290,32 @@
           },
           "description": "Additional directory basenames to exclude from the workspace outline (in addition to defaults like node_modules, dist, out, .git)."
         },
-        "quickcode.background.enabled": {
+        "burstcode.background.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable the background Code Explorer. When the IDE is idle (no chat run in progress and no recent edits), QuickCode will pick one source file at a time, read it, and write a per-file summary, suspected-bug log, and auto-generated unit tests for uncertain points to the workspace's output directory. Pauses automatically while the user is typing or while a chat request is being processed."
+          "description": "Enable the background Code Explorer. When the IDE is idle (no chat run in progress and no recent edits), BurstCode will pick one source file at a time, read it, and write a per-file summary, suspected-bug log, and auto-generated unit tests for uncertain points to the workspace's output directory. Pauses automatically while the user is typing or while a chat request is being processed."
         },
-        "quickcode.background.idleThresholdMs": {
+        "burstcode.background.idleThresholdMs": {
           "type": "number",
           "default": 10000,
           "description": "Idle gap (ms) after the latest real text edit before a background analysis cycle starts. Cursor/editor/window changes only pause an already-running background job; they do not keep postponing the next cycle."
         },
-        "quickcode.background.minIntervalMs": {
+        "burstcode.background.minIntervalMs": {
           "type": "number",
           "default": 30000,
           "description": "Minimum gap (ms) between successive background cycles, even when the user has been idle the whole time."
         },
-        "quickcode.background.filesPerCycle": {
+        "burstcode.background.filesPerCycle": {
           "type": "number",
           "default": 1,
           "description": "How many files to analyse per cycle. Each file = one LLM call."
         },
-        "quickcode.background.maxConcurrentTopics": {
+        "burstcode.background.maxConcurrentTopics": {
           "type": "number",
           "default": 10,
           "description": "How many investigation topics to run in parallel within a single cycle. Each topic uses its own AgentLoop and therefore its own LLM streams. Increase to use the full cycle window when your endpoint allows multiple concurrent requests; lower to 1 for strictly sequential execution."
         },
-        "quickcode.background.includeExtensions": {
+        "burstcode.background.includeExtensions": {
           "type": "array",
           "items": { "type": "string" },
           "default": [
@@ -321,47 +326,47 @@
           ],
           "description": "File extensions (no leading dot) the background explorer is allowed to read and analyse."
         },
-        "quickcode.background.maxFileBytes": {
+        "burstcode.background.maxFileBytes": {
           "type": "number",
           "default": 120000,
           "description": "Skip files larger than this many bytes. Keeps each LLM call from blowing past the model's context window."
         },
-        "quickcode.background.outputDir": {
+        "burstcode.background.outputDir": {
           "type": "string",
-          "default": ".quickcode",
+          "default": ".burstcode",
           "description": "Workspace-relative directory where the explorer writes docs/, bugs.md, tests/, and state.json. Created on first run; safe to delete."
         },
-        "quickcode.background.endpoint": {
+        "burstcode.background.endpoint": {
           "type": "string",
           "default": "",
-          "description": "Endpoint name (from quickcode.llm.endpoints) the background explorer should use. Empty = inherit the chat panel's currently active endpoint."
+          "description": "Endpoint name (from burstcode.llm.endpoints) the background explorer should use. Empty = inherit the chat panel's currently active endpoint."
         },
-        "quickcode.background.model": {
+        "burstcode.background.model": {
           "type": "string",
           "default": "",
           "description": "Model id the background explorer should use under its endpoint. Empty = the endpoint's first known model, falling back to chat's active model. Lets you pair the background loop with a smaller / cheaper model than the one you chat with."
         },
-        "quickcode.background.temperature": {
+        "burstcode.background.temperature": {
           "type": "number",
           "default": 0.2,
           "description": "Sampling temperature for background analysis calls."
         },
-        "quickcode.background.contextWindow": {
+        "burstcode.background.contextWindow": {
           "type": "number",
           "default": 0,
           "description": "Override the context window (tokens) used to size background prompts. 0 = inherit from the resolved endpoint."
         },
-        "quickcode.background.perFileTimeoutMs": {
+        "burstcode.background.perFileTimeoutMs": {
           "type": "number",
           "default": 180000,
           "description": "Cancel a single-file analysis if it has not finished within this many milliseconds."
         },
-        "quickcode.background.runGeneratedTests": {
+        "burstcode.background.runGeneratedTests": {
           "type": "boolean",
           "default": false,
           "description": "When enabled, the background explorer will spawn the appropriate test runner (vitest/jest for TS/JS via npx, pytest for Python) on each generated unit test file and record pass/fail/skip results to verifications.md and a per-test .result.md. Off by default — running auto-generated code touches your shell and dependencies; review the test files first before enabling on untrusted projects."
         },
-        "quickcode.background.testRunTimeoutMs": {
+        "burstcode.background.testRunTimeoutMs": {
           "type": "number",
           "default": 60000,
           "description": "Per-test execution timeout (ms). The runner is killed and recorded as 'error: timed out' if it exceeds this duration."

@@ -6,6 +6,7 @@ import { compressMessages, defaultCompressorConfig } from '../context/Compressor
 import { estimateMessagesTokens } from '../llm/tokenizer';
 import { Logger } from '../util/Logger';
 import { HunkApplier } from '../edits/HunkApplier';
+import { AskUserFn } from './tools/edits';
 
 export interface AgentEvent {
   type:
@@ -18,6 +19,7 @@ export interface AgentEvent {
     | 'auto-continue'
     | 'context-usage'
     | 'context-compressed'
+    | 'stuck-detected'
     | 'done'
     | 'error';
   payload?: unknown;
@@ -27,6 +29,50 @@ export interface AgentEvent {
 const AUTO_COMPRESS_TRIGGER_RATIO = 0.9;
 /** Target post-compression budget (input ratio) so we free at least half of the in-use space. */
 const AUTO_COMPRESS_TARGET_RATIO = 0.4;
+
+/**
+ * After how many CONSECUTIVE turns of identical tool-call batches we consider
+ * the agent stuck. The 1st repeat triggers an automatic self-correction nudge;
+ * the 2nd repeat (i.e. 3 identical turns in a row) escalates to askUser.
+ */
+const DEFAULT_MAX_STUCK_REPEATS = 2;
+
+/**
+ * Canonicalize a tool-call batch into a stable string so two turns that
+ * dispatch the same set of (name, args) pairs hash equal even if the model
+ * happens to emit them in a different order, or with semantically-equivalent
+ * but textually-different JSON (e.g. key reordering).
+ */
+function toolCallSetSignature(
+  calls: Array<{ name: string; arguments: string }>
+): string {
+  const items = calls.map((c) => {
+    let parsed: unknown = c.arguments;
+    try {
+      parsed = c.arguments ? JSON.parse(c.arguments) : {};
+    } catch {
+      // Leave the raw string in place; non-JSON args still hash deterministically.
+    }
+    return JSON.stringify([c.name, canonicalize(parsed)]);
+  });
+  items.sort();
+  return items.join('|');
+}
+
+function canonicalize(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonicalize);
+  if (v && typeof v === 'object') {
+    const obj = v as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(obj).sort()) out[k] = canonicalize(obj[k]);
+    return out;
+  }
+  return v;
+}
+
+function describeCalls(calls: Array<{ name: string; arguments: string }>): string {
+  return calls.map((c) => c.name).join(', ');
+}
 
 export interface AgentOptions {
   contextWindow: number;
@@ -42,6 +88,18 @@ export interface AgentOptions {
    * falls back to the static prompt used in tests / headless environments.
    */
   systemPrompt?: string;
+  /**
+   * Callback used to escalate to the user when the agent appears stuck (i.e.
+   * the model keeps issuing identical tool-call batches). When omitted the
+   * loop just terminates with reason 'stuck' instead of asking.
+   */
+  askUser?: AskUserFn;
+  /**
+   * Number of CONSECUTIVE identical tool-call batches that must be observed
+   * before escalating to askUser. The 1st repeat always triggers an automatic
+   * self-correction nudge; askUser fires once `consecutiveRepeats >= this`.
+   */
+  maxStuckRepeats?: number;
 }
 
 export class AgentLoop {
@@ -82,6 +140,14 @@ export class AgentLoop {
     }
 
     let consecutiveAutoContinues = 0;
+
+    // Stuck-detection state: signature of the previous turn's tool-call batch
+    // and the number of consecutive turns we've seen the SAME signature. Reset
+    // whenever the model emits a different batch (i.e. makes progress) or the
+    // user resolves an askUser escalation.
+    let lastToolCallSignature: string | null = null;
+    let consecutiveRepeats = 0;
+    const maxStuckRepeats = this.options.maxStuckRepeats ?? DEFAULT_MAX_STUCK_REPEATS;
 
     for (let iter = 0; iter < this.options.maxIterations; iter++) {
       if (cancellation.isCancellationRequested) {
@@ -348,6 +414,93 @@ export class AgentLoop {
       // propose_edit is non-blocking: the model gets a "queued" tool reply and
       // we just keep iterating. The user can accept/reject the queued edits
       // at any time — even after this run finishes — via the chat banner.
+
+      // ---------------- Stuck detection ----------------
+      // If the model keeps issuing the SAME tool-call batch (same names +
+      // canonicalized args) turn after turn, it's almost always looping. We
+      // apply two layers of escalation:
+      //   1. 1st repeat (2 identical turns in a row): inject a self-correction
+      //      user message and let the model try once more.
+      //   2. >= `maxStuckRepeats` (default: 3 identical turns): escalate to
+      //      askUser so the human can give a hint, continue, or abort. When
+      //      no askUser is wired up we bail out with reason 'stuck' rather
+      //      than burn the rest of `maxIterations`.
+      const sig = toolCallSetSignature(toolCalls);
+      if (sig === lastToolCallSignature) {
+        consecutiveRepeats++;
+        const callsDesc = describeCalls(toolCalls);
+        if (consecutiveRepeats >= maxStuckRepeats) {
+          // Layer 2: ask the user.
+          this.logger.warn(
+            `Stuck detected: ${consecutiveRepeats + 1} identical tool-call turns (${callsDesc}); escalating to askUser.`
+          );
+          yield {
+            type: 'stuck-detected',
+            payload: {
+              repeats: consecutiveRepeats + 1,
+              calls: callsDesc,
+              action: 'ask-user'
+            }
+          };
+          if (!this.options.askUser) {
+            yield { type: 'done', payload: { reason: 'stuck' } };
+            return;
+          }
+          let answer = '';
+          try {
+            answer = await this.options.askUser({
+              question:
+                `The agent appears to be stuck — it has called ${callsDesc} ${consecutiveRepeats + 1} times in a row with identical arguments. How would you like to proceed?`,
+              inputType: 'single',
+              options: [
+                { label: 'Continue', description: 'Let the agent try a few more iterations on its own.' },
+                { label: 'Stop', description: 'Abort this run.' }
+              ],
+              allowCustomText: true,
+              placeholder: 'Or type a hint / new instruction…'
+            });
+          } catch (err) {
+            this.logger.warn('askUser threw during stuck escalation', String(err));
+          }
+          const trimmed = answer.trim();
+          const lower = trimmed.toLowerCase();
+          if (!trimmed || lower === 'stop' || trimmed === '(cancelled by user)') {
+            yield { type: 'done', payload: { reason: 'aborted-stuck' } };
+            return;
+          }
+          if (lower !== 'continue') {
+            // Treat any custom text as a new user instruction.
+            messages.push({ role: 'user', content: trimmed });
+          }
+          // Reset detection state so the agent gets a fresh slate after the
+          // user has weighed in.
+          lastToolCallSignature = null;
+          consecutiveRepeats = 0;
+          continue;
+        }
+        // Layer 1: automatic self-correction nudge.
+        this.logger.info(
+          `Stuck detected: ${consecutiveRepeats + 1} identical tool-call turns (${callsDesc}); injecting self-correction.`
+        );
+        messages.push({
+          role: 'user',
+          content:
+            `[stuck-detector] You just issued the same tool call(s) (${callsDesc}) with identical arguments as the previous turn — the result has not changed. ` +
+            `Stop repeating yourself: either try a different approach (different arguments, a different tool, or read a different file), or give your final answer to the user. ` +
+            `Do NOT issue the same tool call with the same arguments again.`
+        });
+        yield {
+          type: 'stuck-detected',
+          payload: {
+            repeats: consecutiveRepeats + 1,
+            calls: callsDesc,
+            action: 'self-correct'
+          }
+        };
+      } else {
+        consecutiveRepeats = 0;
+      }
+      lastToolCallSignature = sig;
     }
 
     yield { type: 'done', payload: { reason: 'max_iterations' } };

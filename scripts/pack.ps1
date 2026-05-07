@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  One-click VSIX builder for QuickCode.
+  One-click VSIX builder for BurstCode.
 
 .DESCRIPTION
   - Sets a local HTTP/HTTPS proxy (default 127.0.0.1:7890) so npm/vsce can

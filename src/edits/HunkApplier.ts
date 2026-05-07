@@ -222,7 +222,7 @@ export class HunkApplier implements vscode.Disposable {
             'vscode.diff',
             entry.proposedUri,
             entry.uri,
-            `QuickCode • ${path.basename(entry.uri.fsPath)} (Proposed ↔ Current)`
+            `BurstCode • ${path.basename(entry.uri.fsPath)} (Proposed ↔ Current)`
           );
         }
       }
@@ -239,7 +239,7 @@ export class HunkApplier implements vscode.Disposable {
       'vscode.diff',
       first.proposedUri,
       first.uri,
-      `QuickCode • ${path.basename(first.uri.fsPath)} (Proposed ↔ Current)`
+      `BurstCode • ${path.basename(first.uri.fsPath)} (Proposed ↔ Current)`
     );
   }
 
@@ -343,7 +343,7 @@ export class HunkApplier implements vscode.Disposable {
           this.logger.info('Created file', { uri: file.uri.toString(), hunks: accepted.length });
         } catch (err) {
           vscode.window.showErrorMessage(
-            `QuickCode: failed to create ${path.basename(file.uri.fsPath)}: ${String(err)}`
+            `BurstCode: failed to create ${path.basename(file.uri.fsPath)}: ${String(err)}`
           );
         }
       } else {
@@ -363,7 +363,7 @@ export class HunkApplier implements vscode.Disposable {
           this.logger.info('Applied edits', { uri: file.uri.toString(), hunks: accepted.length });
         } else {
           vscode.window.showErrorMessage(
-            `QuickCode: failed to apply edits to ${path.basename(file.uri.fsPath)}.`
+            `BurstCode: failed to apply edits to ${path.basename(file.uri.fsPath)}.`
           );
         }
       }
@@ -428,7 +428,7 @@ export class HunkApplier implements vscode.Disposable {
 
   /** Get pending hunks for a file URI (used by CodeLens provider). */
   getPendingForUri(uri: vscode.Uri): PendingHunk[] {
-    // The diff editor opens both `proposedUri` (quickcode-preview) and the source `uri`.
+    // The diff editor opens both `proposedUri` (burstcode-preview) and the source `uri`.
     if (uri.scheme === DiffPreview.scheme) {
       const sourceUri = uri.with({ scheme: 'file', path: uri.path.replace(/\.proposed$/, '') });
       return this.pending.get(sourceUri.toString())?.hunks ?? [];
@@ -488,12 +488,12 @@ class HunkCodeLensProvider implements vscode.CodeLensProvider {
         return [
           new vscode.CodeLens(range, {
             title: '✓ Accept Hunk',
-            command: 'quickcode.acceptHunk',
+            command: 'burstcode.acceptHunk',
             arguments: [h.id]
           }),
           new vscode.CodeLens(range, {
             title: '✕ Reject Hunk',
-            command: 'quickcode.rejectHunk',
+            command: 'burstcode.rejectHunk',
             arguments: [h.id]
           })
         ];
