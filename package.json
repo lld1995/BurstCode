@@ -13,6 +13,7 @@
     "url": "https://github.com/lld1995/BurstCode/issues"
   },
   "license": "MIT",
+  "icon": "media/logo.png",
   "engines": {
     "vscode": "^1.85.0"
   },
