@@ -108,7 +108,7 @@ function readConfig(): BackgroundConfig {
       ? (cfg.get<number>('temperature') as number)
       : NaN,
     contextWindow: cfg.get<number>('contextWindow') ?? 0,
-    perFileTimeoutMs: Math.max(15_000, cfg.get<number>('perFileTimeoutMs') ?? 180_000),
+    perFileTimeoutMs: Math.max(15_000, cfg.get<number>('perFileTimeoutMs') ?? 300_000),
     runGeneratedTests: cfg.get<boolean>('runGeneratedTests') ?? false,
     testRunTimeoutMs: Math.max(5_000, cfg.get<number>('testRunTimeoutMs') ?? 60_000)
   };

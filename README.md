@@ -1,75 +1,52 @@
 <div align="center">
 
-<img src="media/readme/hero.svg" alt="BurstCode" width="160" height="160" />
+<img src="media/readme/hero.svg" alt="BurstCode" width="120" height="120" />
 
 # BurstCode
 
-**由本地 OpenAI 兼容 LLM 驱动的 Windsurf 风格自主编码 Agent**
+*A local-first AI coding companion for VS Code.*
 
-在你自己的机器上跑、用你自己的模型、改你自己的代码 —— 一个完全可离线的 VS Code AI 编程助手。
+由你自己的本地模型驱动 · 代码不出本机 · 兼容任何 OpenAI 协议端点
 
-[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.85.0-007ACC?logo=visualstudiocode)](https://code.visualstudio.com/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](#-许可证)
-[![Local First](https://img.shields.io/badge/Local%20First-%E2%9C%93-10B981)](#-为什么选-burstcode)
-[![Ollama](https://img.shields.io/badge/Ollama-supported-7C3AED)](#-支持的后端)
-[![LM Studio](https://img.shields.io/badge/LM%20Studio-supported-F59E0B)](#-支持的后端)
-[![vLLM](https://img.shields.io/badge/vLLM-supported-EC4899)](#-支持的后端)
+[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.85-1f1f1f?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
+[![License](https://img.shields.io/badge/MIT-1f1f1f.svg)](LICENSE)
+[![Local First](https://img.shields.io/badge/Local%20First-1f1f1f)](#)
+[![Ollama](https://img.shields.io/badge/Ollama-1f1f1f)](https://ollama.com)
+[![LM Studio](https://img.shields.io/badge/LM%20Studio-1f1f1f)](https://lmstudio.ai)
+[![vLLM](https://img.shields.io/badge/vLLM-1f1f1f)](https://github.com/vllm-project/vllm)
 
 </div>
 
----
+<br />
 
-## 📖 目录
+<div align="center">
 
-- [✨ 为什么选 BurstCode](#-为什么选-burstcode)
-- [🎯 核心特性](#-核心特性)
-- [🚀 快速开始](#-快速开始)
-- [⚙️ 配置](#️-配置)
-- [💬 使用](#-使用)
-- [🛠 命令面板](#-命令面板)
-- [🧰 内建工具](#-内建工具)
-- [🏗 架构总览](#-架构总览)
-- [🧪 开发](#-开发)
-- [📜 许可证](#-许可证)
+BurstCode 只做两件事，并把它们做到极致。
 
----
+</div>
 
-## ✨ 为什么选 BurstCode
+<br />
 
-<table>
+<table width="100%">
 <tr>
-<td width="80" align="center" valign="top"><img src="media/readme/local-llm.svg" alt="local" width="64" height="64" /></td>
-<td>
+<td width="50%" valign="top">
 
-**完全本地优先**
-代码、提示词、补全结果统统不出本机。只要你的服务暴露 OpenAI 兼容协议（Ollama / LM Studio / vLLM / llama.cpp / TGI / 自建网关），即可对接。
+### ① &nbsp; AI Coding
+
+主动、对话式的编程伙伴。
+聊一句需求，它**自己规划、自己写、卡住会问你、被你纠正后会记住**。
+
+→ [详细使用与配置](#ai-coding)
 
 </td>
-</tr>
-<tr>
-<td align="center" valign="top"><img src="media/readme/agent.svg" alt="agent" width="64" height="64" /></td>
-<td>
+<td width="50%" valign="top">
 
-**真正的 Agent 循环**
-不是简单的"补全一段就停"。模型自带读文件、搜代码、跑 LSP、提交编辑、问用户等工具，会自己迭代直到任务完成（受 `burstcode.agent.maxIterations` 限制）。
+### ② &nbsp; Background Intelligence
 
-</td>
-</tr>
-<tr>
-<td align="center" valign="top"><img src="media/readme/checkpoint.svg" alt="checkpoint" width="64" height="64" /></td>
-<td>
+后台静默工作。键盘空闲时自动阅读你的工程，
+产出文档、生成测试、标记疑似 Bug。
 
-**Git Checkpoint 兜底**
-每次 Agent 写盘前自动打一个 `refs/burstcode/checkpoints/<时间戳>` 快照，回滚一键搞定，再大胆的改也不慌。
-
-</td>
-</tr>
-<tr>
-<td align="center" valign="top"><img src="media/readme/background.svg" alt="background" width="64" height="64" /></td>
-<td>
-
-**后台代码探索器**
-IDE 闲置时自动选取一个文件，读懂它，并把摘要、可疑 Bug、自动生成的单元测试写进 `.burstcode/` 目录。等你回到键盘时已经有一份"昨晚发生了什么"报告。
+→ [详细使用与配置](#background-intelligence)
 
 </td>
 </tr>
@@ -77,126 +54,112 @@ IDE 闲置时自动选取一个文件，读懂它，并把摘要、可疑 Bug、
 
 ---
 
-## 🎯 核心特性
+# 安装与首次配置
 
-### <img src="media/readme/diff.svg" alt="" width="28" height="28" align="center" /> &nbsp;Hunk 级别的可审阅编辑
+## 第 1 步 · 跑一个本地模型
 
-Agent 不会偷偷改你的文件。每次修改都通过 `propose_edit` 生成 diff 预览，你可以**逐 hunk 接受 / 拒绝**，也可以一键全收 / 全拒。
+BurstCode 不附带模型，挑一个 OpenAI 协议兼容的服务跑起来即可。
 
-- 命令：`BurstCode: Accept Hunk` / `BurstCode: Reject Hunk`
-- 命令：`BurstCode: Accept All Pending Suggestions` / `Reject All`
-
-### <img src="media/readme/lsp.svg" alt="" width="28" height="28" align="center" /> &nbsp;深度 LSP 集成
-
-Agent 调用的不是 grep，而是你已装的语言服务器：
-
-| 工具 | 用途 |
-|---|---|
-| `find_definition` | 跳转到定义（跨 import / re-export） |
-| `find_references` / `find_references_by_name` | 查找引用（按位置或仅按名字） |
-| `find_implementations` | 找接口 / 抽象方法的实现 |
-| `document_symbols` | 文件大纲（先大纲再读源码） |
-| `workspace_symbols` | 全工作区按名搜索符号 |
-| `hover_info` | 类型 / 签名 / 文档 |
-| `get_function_range` | 抓取一个函数的完整代码块 |
-
-支持任何已装的 VS Code 语言扩展：TypeScript、Python、Go、Rust、Java、C/C++、C#、Ruby、PHP、Swift、Scala、Kotlin、Lua、Dart……
-
-### <img src="media/readme/endpoints.svg" alt="" width="28" height="28" align="center" /> &nbsp;多端点 / 多模型
-
-在 `burstcode.llm.endpoints` 里登记任意多个 OpenAI 兼容服务，每个端点可以独立设置 `baseURL`、`apiKey`、`contextWindow`、`temperature`、TLS 校验……Chat 面板的模型选择器会按端点分组展示，并支持从 `/v1/models` 在线拉取列表。
-
-### <img src="media/readme/context.svg" alt="" width="28" height="28" align="center" /> &nbsp;智能上下文管理
-
-- 自动计算 token 占用，Chat 面板有实时上下文使用率仪表
-- 占用 ≥ 90% 时**自动压缩**历史，把工作记忆压回 ≤ 40%
-- 模型因输出 token 上限被截断时，可配置 `autoContinueOnLength` 自动续写
-
-### <img src="media/readme/outline.svg" alt="" width="28" height="28" align="center" /> &nbsp;预热的工作区索引
-
-扩展激活时就一次性走完工作区，构建文件索引和大纲，并嵌入到系统提示中。模型从第一句话起就**知道项目长什么样**，不必每次靠工具反复探路。索引会随 `onDidCreate / onDidDelete / onDidRename` 自动刷新。
-
-### <img src="media/readme/tests.svg" alt="" width="28" height="28" align="center" /> &nbsp;自动单测生成（可选执行）
-
-后台探索器会针对它"看不准"的逻辑给单文件生成单元测试，写进 `.burstcode/tests/`。开启 `burstcode.background.runGeneratedTests` 后，TS/JS 走 vitest/jest，Python 走 pytest，每个测试的通过 / 失败 / 跳过 / 超时结果都会写进 `verifications.md`。
-
----
-
-## 🚀 快速开始
-
-<img src="media/readme/install.svg" alt="install" width="48" height="48" align="left" />
-
-### 1. 准备一个本地 LLM 服务
-
-挑一个：
+<details open>
+<summary><b>方式 A：Ollama（最省事，推荐新手）</b></summary>
 
 ```bash
-# Ollama（最省事）
-ollama pull qwen2.5-coder:7b
-ollama serve            # 默认监听 http://localhost:11434
+# 1. 装 Ollama → https://ollama.com/download
+# 2. 拉一个编程模型
+ollama pull qwen2.5-coder:7b      # 7B，16GB 内存够用
+# 或：
+ollama pull qwen2.5-coder:14b     # 14B，效果更好，要 32GB
 
-# LM Studio
-# 启动 LM Studio → Local Server → Start Server (默认 http://localhost:1234/v1)
-
-# vLLM
-python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-Coder-7B-Instruct
+# 3. 启动服务（默认监听 http://localhost:11434）
+ollama serve
 ```
 
-### 2. 安装扩展
+</details>
 
-从打包好的 vsix：
+<details>
+<summary><b>方式 B：LM Studio（图形界面，零命令行）</b></summary>
+
+1. 装 LM Studio → https://lmstudio.ai
+2. 在 *Discover* 页搜一个编程模型下载（如 `Qwen2.5-Coder-7B-Instruct-GGUF`）
+3. 切到 *Local Server* 页 → **Start Server**
+4. 默认端点：`http://localhost:1234/v1`
+
+</details>
+
+<details>
+<summary><b>方式 C：vLLM（生产级，需要 GPU）</b></summary>
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen2.5-Coder-7B-Instruct \
+  --served-model-name qwen2.5-coder \
+  --port 8000
+# 端点：http://localhost:8000/v1
+```
+
+</details>
+
+> 任何说 `/v1/chat/completions` 协议的服务都行：llama.cpp、TGI、OpenRouter、Azure OpenAI、自建网关……
+
+## 第 2 步 · 安装扩展
 
 ```powershell
-code --install-extension burstcode-0.1.0.vsix
+code --install-extension burstcode-0.1.3.vsix
 ```
 
-或在仓库内自己打包：
+或者在仓库根目录自己打一份：
 
 ```powershell
 npm install
 npm run package
-npm run vsix
+npm run vsix          # 产出 burstcode-0.1.3.vsix
 ```
 
-### 3. 打开侧边栏开始聊
+装好后 VS Code 活动栏会多出一个 ⚡ 图标。
 
-点击活动栏的 ⚡ 图标 → 进入 **BurstCode Chat**。
-首次运行如果还没选模型，会引导你打开 `burstcode.llm.*` 设置或运行 `BurstCode: Select Active Model`。
+## 第 3 步 · 注册端点
 
-<img src="media/readme/rocket.svg" alt="" width="32" height="32" align="left" /> 试一句： **"读 src/extension.ts 然后画一张组件依赖图给我。"**
+打开 VS Code 设置（`Ctrl+,`），搜 `burstcode.llm.endpoints`，点 *Edit in settings.json*。
 
----
+### 极简版（推荐）—— 只填端点，模型让它自己拉
 
-## ⚙️ 配置
-
-<img src="media/readme/config.svg" alt="" width="48" height="48" align="left" />
-
-打开 VS Code 设置 → 搜 `burstcode`。下面是关键项。
-
-### 🔌 LLM 端点
-
-| 设置项 | 默认值 | 说明 |
-|---|---|---|
-| `burstcode.llm.baseURL` | `http://localhost:11434/v1` | 单端点快速模式：OpenAI 兼容 base URL |
-| `burstcode.llm.apiKey` | `ollama` | API key（多数本地服务忽略） |
-| `burstcode.llm.model` | `qwen2.5-coder:7b` | 模型 id |
-| `burstcode.llm.contextWindow` | `32768` | 模型总上下文窗口（tokens） |
-| `burstcode.llm.temperature` | `0.2` | 采样温度 |
-| `burstcode.llm.allowSelfSignedCerts` | `false` | 跳过 TLS 校验（仅自签名内网服务用） |
-| `burstcode.llm.endpoints` | `[]` | **推荐**：多端点列表（见下） |
-| `burstcode.llm.activeEndpoint` / `activeModel` | — | 当前激活的端点名 + 模型 id（由模型选择器自动写入） |
-
-多端点示例：
+只要你的服务支持 `/v1/models`（Ollama / LM Studio / vLLM / OpenRouter 都支持），
+连模型清单都不用写：
 
 ```jsonc
 "burstcode.llm.endpoints": [
   {
-    "name": "本地 Ollama",
+    "name": "Local Ollama",
     "baseURL": "http://localhost:11434/v1",
-    "models": ["qwen2.5-coder:7b", "deepseek-coder-v2:16b"]
+    "apiKey": "ollama"
+  }
+]
+```
+
+保存后：
+
+- **方式 1（Chat 面板内）**：点底部的模型选择器 → 端点旁的 ↻ **Refresh** 按钮 →
+  在线拉取该端点的所有模型 → 点一个即激活
+- **方式 2（命令面板）**：`Ctrl+Shift+P` → **`BurstCode: Select Active Model`** →
+  选 *☁ Fetch models from this endpoint* → 选一个
+
+不想联网拉？也可以选 *➕ Add custom model id...* 手动填一个 id（如 `qwen2.5-coder:7b`）。
+
+### 完整版 —— 预填模型清单 + 多端点
+
+如果你希望把常用模型预先列好，或要管理多个端点：
+
+```jsonc
+"burstcode.llm.endpoints": [
+  {
+    "name": "Local Ollama",
+    "baseURL": "http://localhost:11434/v1",
+    "apiKey": "ollama",
+    "models": ["qwen2.5-coder:7b", "qwen2.5-coder:14b"],
+    "contextWindow": 32768
   },
   {
-    "name": "公司 vLLM",
+    "name": "Office vLLM",
     "baseURL": "https://llm.intra/v1",
     "apiKey": "${INTRA_KEY}",
     "contextWindow": 65536,
@@ -205,219 +168,490 @@ npm run vsix
 ]
 ```
 
-### 🤖 Agent 行为
+模型选择器会按端点分组，每个端点都能随时点 ↻ Refresh 在线刷新清单。完成 ✅。
 
-| 设置项 | 默认值 | 说明 |
-|---|---|---|
-| `burstcode.agent.maxIterations` | `25` | 单次请求内最多工具迭代轮数 |
-| `burstcode.agent.requireConfirmBeforeEdit` | `true` | 写盘前是否要求人工确认 |
-| `burstcode.agent.autoContinueOnLength` | `true` | 因输出 token 上限被截断时自动续写 |
-| `burstcode.agent.maxAutoContinues` | `3` | 连续自动续写上限 |
+## 第 4 步 · 打开 Chat，试一句
 
-### 🛡 Git Checkpoint
+点活动栏 ⚡ 图标 → *BurstCode Chat* → 输入框：
 
-| 设置项 | 默认值 | 说明 |
-|---|---|---|
-| `burstcode.git.autoCheckpoint` | `true` | 写盘前快照到 `refs/burstcode/checkpoints/<时间戳>` |
+> *"读一下 `src/extension.ts`，画一张组件依赖图给我。"*
 
-### 🗂 工作区上下文
+如果它开始读文件、列大纲、回你一段架构说明，配置就成功了。
 
-| 设置项 | 默认值 | 说明 |
-|---|---|---|
-| `burstcode.context.outlineBaseDepth` | `2` | 嵌入系统提示的工作区大纲递归深度 |
-| `burstcode.context.outlineSrcDepth` | `4` | 源代码目录（src/lib/app/packages…）单独深度 |
-| `burstcode.context.outlineMaxBytes` | `6000` | 大纲软上限（字符），超出会截断 |
-| `burstcode.context.outlineExtraExcludes` | `[]` | 额外排除的目录名 |
+## 第 5 步（可选）· 打开后台静默分析
 
-### 🌙 后台代码探索器
+后台代码探索器**默认是关的** —— 装完不会偷偷跑模型。
+想让它在你不打字的时候帮你**读代码、找 bug、生成测试、写文档**，三选一打开：
 
-| 设置项 | 默认值 | 说明 |
-|---|---|---|
-| `burstcode.background.enabled` | `false` | 总开关 |
-| `burstcode.background.idleThresholdMs` | `10000` | 用户停止编辑多久后开始一轮 |
-| `burstcode.background.minIntervalMs` | `30000` | 两轮之间最小间隔 |
-| `burstcode.background.filesPerCycle` | `1` | 每轮分析文件数 |
-| `burstcode.background.maxConcurrentTopics` | `10` | 单轮内并发调查主题数 |
-| `burstcode.background.includeExtensions` | `ts,tsx,py,go,rs,…` | 允许的源文件扩展名 |
-| `burstcode.background.maxFileBytes` | `120000` | 跳过超过此字节数的文件 |
-| `burstcode.background.outputDir` | `.burstcode` | 报告输出目录 |
-| `burstcode.background.endpoint` / `model` | `""` | 后台专用端点 / 模型（空 = 继承 Chat） |
-| `burstcode.background.runGeneratedTests` | `false` | 自动执行生成的单测 |
+```jsonc
+// settings.json
+"burstcode.background.enabled": true
+```
 
-> 后台探索器会在用户键入或 Chat 任务运行时自动暂停。
+或者命令面板：`BurstCode: Toggle Background Code Explorer`
+或者 Chat 面板右下角点状态药丸 → *Enable Background Explorer*。
+
+> 💡 强烈建议给后台**单独配一个更小、更便宜的模型**（省电省显存）——
+> 详见 [② Background Intelligence](#background-intelligence) 的"**三种配法**"。
+
+<br />
+
+## 接下来：选一个深入读
+
+<table width="100%">
+<tr>
+<td width="50%" valign="top" align="center">
+
+### → [① AI Coding 详解](#ai-coding)
+
+基本用法 · 自动 Plan · 阻塞提问 · 自我进化
+命令速查 · 关键配置项
+
+</td>
+<td width="50%" valign="top" align="center">
+
+### → [② Background Intelligence 详解](#background-intelligence)
+
+启用与禁用 · 端点 / 模型独立配置（3 种模式）
+内部机制 · 完整配置项
+
+</td>
+</tr>
+</table>
+
+<br />
 
 ---
 
-## 💬 使用
+<br />
 
-打开活动栏的 **BurstCode** 视图，输入需求即可。一些用得上的提示：
+<a id="ai-coding"></a>
 
-- **明确文件**：`@src/agent/AgentLoop.ts` 当前不支持 `<...>`，加上吧
-- **指定语言**：`用中文回答` / `keep replies in English`
-- **暂停 / 继续**：在 Chat 面板底部，长任务可随时取消
-- **新会话**：命令 `BurstCode: New Chat`
-- **回滚**：`BurstCode: Restore Git Checkpoint`，从快照列表里挑一个时间点
-- **后台菜单**：点 Chat 面板右下的状态药丸 → 启用 / 立即跑一轮 / 看活动日志 / 看报告
+# ① &nbsp; AI Coding —— 详解
 
----
+> **核心定位**：你只管说需求，它自己拆任务、自己跑工具、卡住会问你、做错被你骂之后还会**永久记住**。
 
-## 🛠 命令面板
+## 基本用法
 
-<img src="media/readme/command.svg" alt="" width="48" height="48" align="left" />
+**1. 自然语言描述需求**（中英文都行）：
 
-| 命令 ID | 标题 |
+```
+帮我把 src/agent/AgentLoop.ts 里硬编码的 25 轮迭代上限改成可配置的，
+读一下 package.json 的 contributes.configuration 加上对应的设置项，
+最后跑一下 lint。
+```
+
+**2. 它自己干活**：读文件 → 跳定义 → 查引用 → grep → 生成 diff。
+你只需要在每次写盘前 **接受 / 拒绝** 它的修改。
+
+**3. 不满意一键回滚**：每次写盘前都打 Git 快照（`refs/burstcode/checkpoints/<时间戳>`），
+运行 **`BurstCode: Restore Git Checkpoint`** 选时间点回去。
+
+<br />
+
+## 三个让它"像人"的高级特性
+
+### 🎯 自动 Plan —— 复杂任务自己拆步骤
+
+任务一旦不平凡（多文件 / 多步骤 / 长调查），它会主动调用 `update_plan` 工具，
+在 Chat 面板上方画出一个**实时勾选的清单**：
+
+```
+✅ 1. 读 AgentLoop.ts，定位 maxIterations 常量
+🔄 2. 在 package.json 添加 burstcode.agent.maxIterations 设置项     ← 进行中
+⬜ 3. 修改 AgentLoop 构造函数从配置读取
+⬜ 4. 跑 lint 验证
+```
+
+- 同一时间最多有 **1 个 in_progress** 步骤（强约束，模型违反会被拒绝）
+- 完成步骤实时 ✅，你随时知道它在哪一步
+- Plan 会持久化到当前会话，刷新也不丢
+
+> 简单一句话的请求（"重命名这个变量"）不会触发 Plan —— 系统提示明确要求只在非平凡任务时调用。
+
+<br />
+
+### ❓ 阻塞式提问 —— 不确定就停下来问你
+
+模糊的需求不会被偷偷"猜测"。一旦发现两条以上合理路径、文件名匹配多个、
+或者关键参数缺失，模型会调用 `ask_user` **暂停整个 Agent 循环**，在 Chat 面板弹出三种交互之一：
+
+| 类型 | UI | 例子 |
+|---|---|---|
+| `single` | 单选 | *"找到 3 个 `UserService.ts`，你指的是哪个？"* |
+| `multi` | 多选 | *"以下重构哪些要应用？"* |
+| `text` | 文本框 | *"新接口想叫什么名字？"* |
+
+`single`/`multi` 还可以带 `allowCustomText` 在选项下方再开一个自由输入框，让你回答 *"都不是，理由如下..."*。
+
+**Stuck 自动升级**：如果模型连续 3 轮以同样的参数调同一个工具（明显死循环），
+Agent 会主动用 `ask_user` 把球踢回给你：
+
+> *"The agent appears to be stuck — it has called read_file('foo.ts', 1, 200) 3 times in a row. How would you like to proceed?"*
+> → [继续] [停止] [自定义提示...]
+
+不会再有那种"它一直跑、token 烧完、什么也没干成"的窘境。
+
+<br />
+
+### 🧠 自我进化 —— 被你纠正一次就永久记住
+
+这是 BurstCode 最特别的能力。每次你说：
+
+- *"不对，应该用 X 而不是 Y"*
+- *"重要规则：这个项目所有文件都要 ..."*
+- *"以后别在 `Foo.ts` 里加 `console.log`"*
+
+模型会调用 `record_lesson` 把这条规则**永久写进本地 Memento 存储**，并打上 scope 标签：
+
+```
+[l_lf3a8_qx2k1]  file=src/agent/AgentLoop.ts symbol=run :: 取消 token 必须放最后一个参数
+[l_lf3b2_8mzpx]  IMPORTANT global :: 所有用户可见字符串都用 i18n.t() 包起来
+[l_lf3c9_w7tdm]  tags=performance :: 不要在循环里 await，先批量再 Promise.all
+```
+
+下一次（**包括重启 IDE 之后**）你再开 Chat，这些 lessons 会被注入到系统提示里：
+
+- 标了 `important: true` 的规则进 **CRITICAL RULES** 区，永不被截断
+- 普通 lessons 进 **SCOPED LESSONS** 区，按 4000 字符预算软截断
+- 上限 200 条，超出时优先淘汰非 important 的旧条目
+
+发现某条规则过时？说一句 *"那条规则不对了，删掉"*，模型会调 `forget_lesson(id)` 主动删除。
+也可以让它一步到位用 `record_lesson(supersedes=[...])` 替换旧规则。
+
+> 它不是"短期记忆"，是真正的**跨会话长期记忆**，存在 VS Code 的 globalState 里。
+
+<br />
+
+## 你能感受到的其他差异
+
+| | |
 |---|---|
-| `burstcode.newChat` | New Chat |
-| `burstcode.configureModel` | Configure Model（打开设置） |
-| `burstcode.selectModel` | Select Active Model（按端点选模型，可在线 fetch） |
-| `burstcode.restoreCheckpoint` | Restore Git Checkpoint |
-| `burstcode.acceptAllSuggestions` / `rejectAllSuggestions` | 全收 / 全拒未决 hunk |
-| `burstcode.acceptHunk` / `rejectHunk` | 单个 hunk 接 / 拒 |
-| `burstcode.background.toggle` | 启停后台探索器 |
-| `burstcode.background.runOnce` | 立即跑一轮后台分析 |
-| `burstcode.background.selectModel` | 单独为后台选模型 |
-| `burstcode.background.showReport` | 打开 `.burstcode/README.md` |
-| `burstcode.background.showActivityLog` | 打开后台 Output 通道 |
-| `burstcode.background.resetState` | 清空文件 hash，让所有文件重新分析 |
-| `burstcode.background.menu` | 后台菜单（药丸点击的入口） |
+| **真正的工具循环** | 自己迭代直到任务完成（受 `agent.maxIterations` 限制，默认 25） |
+| **Hunk 级审阅** | 每个修改都是独立 hunk，可逐个接 / 拒，也可一键全收 |
+| **深度 LSP 集成** | 用你已装的语言服务器，不是 grep —— 跨 import / re-export 都跳得对 |
+| **预热的工作区索引** | 启动时一次性把工程结构嵌入系统提示，模型从第一句话起就知道项目长什么样 |
+| **上下文用量仪表** | Chat 面板顶部实时显示 token 占用，≥ 90% 自动压缩历史 |
+| **自动续写** | 因输出 token 上限被截断时自动续写（最多 3 轮，可关） |
+| **多端点切换** | 模型选择器按端点分组，本地 Ollama / 公司 vLLM / 远程网关随意切 |
+
+<br />
+
+## AI Coding 命令速查
+
+| 命令 | 用途 |
+|---|---|
+| `BurstCode: New Chat` | 开新会话（旧会话自动入历史） |
+| `BurstCode: Select Active Model` | 切换端点 + 模型 |
+| `BurstCode: Configure Model` | 跳到设置项 |
+| `BurstCode: Accept Hunk` / `Reject Hunk` | 单个 hunk 接 / 拒 |
+| `BurstCode: Accept All Pending Suggestions` | 一键全收 |
+| `BurstCode: Reject All Pending Suggestions` | 一键全拒 |
+| `BurstCode: Restore Git Checkpoint` | 列出快照、回滚 |
+
+<br />
+
+## 关键配置项
+
+```jsonc
+// 写盘前是否需要人工确认（强烈建议保持 true）
+"burstcode.agent.requireConfirmBeforeEdit": true,
+
+// 单次请求最多迭代轮数。复杂重构可调到 50；调研类可调到 100
+"burstcode.agent.maxIterations": 25,
+
+// 输出被截断时自动续写
+"burstcode.agent.autoContinueOnLength": true,
+"burstcode.agent.maxAutoContinues": 3,
+
+// 写盘前自动打 Git 快照
+"burstcode.git.autoCheckpoint": true
+```
+
+<br />
 
 ---
 
-## 🧰 内建工具
+<br />
 
-Agent 自动可用的工具，按用途分组：
+<a id="background-intelligence"></a>
 
-### 文件 / 工作区
-- `read_file` — 读文件指定行段，1-indexed
-- `workspace_outline` — 文件树概览，支持子路径与深度
-- `list_dir` — 列目录
-- `grep_search` — 工作区文本检索
+# ② &nbsp; Background Intelligence —— 详解
 
-### LSP（前面已列出）
-`find_definition` · `find_references` · `find_references_by_name` · `find_implementations` · `document_symbols` · `workspace_symbols` · `hover_info` · `get_function_range`
+> **核心定位**：你去吃饭、开会、睡觉，BurstCode 不闲着 —— 它替你读代码。
+>
+> 等你回到键盘，工程根目录多了一份 *昨晚发生了什么* 的报告。
 
-### 编辑 / 交互
-- `propose_edit` — 提交一段 diff，等用户接 / 拒
-- `ask_user` — 需求模糊时反问用户
+## 它会自动产出什么
 
-### 计划 / 记忆
-- `update_plan` — 复杂任务发布多步计划，状态在 Chat UI 实时可见
-- `record_lesson` / `forget_lesson` — 把跨会话的"教训"写进持久记忆
+所有产物都写到工作区根目录的 `.burstcode/` 文件夹（已自动 gitignore）：
 
-### 语言专用（按需启用）
-- `eslint_fix` — 对当前编辑器跑 ESLint --fix
-- `dotnet_build` — 编译 .NET 项目
-- `avalonia_preview` — 打开 Avalonia XAML 预览
+```
+.burstcode/
+├── README.md             ← 总览：跑了多少轮、找到几个 bug、生成几个测试
+├── project-brief.md      ← 工程级理解：项目在干嘛、关键模块、调查清单
+├── docs/
+│   └── src/foo/Bar.ts.md ← 每个源文件一份：摘要、设计要点、热点、调用关系
+├── topics/
+│   └── auth-flow.md      ← 跨文件主题报告：登录链路、状态管理、错误传播…
+├── bugs.md               ← 滚动追加的疑似 Bug 列表（带文件 + 行号 + 推理）
+├── tests/
+│   └── src/foo/Bar.ts.d/ ← 自动生成的单测，TS/JS 用 vitest，Python 用 pytest…
+│       └── *.result.md   ← 自动执行后的结果（开关：runGeneratedTests）
+├── verifications.md      ← 每次测试运行的滚动日志（pass/fail/skip）
+└── activity.log          ← 完整时间戳活动日志
+```
 
-> 完整的 schema 和描述见 [`src/agent/tools/`](src/agent/tools/)。
+## 启用与禁用
+
+后台默认是**关闭**的（避免装完就偷偷跑模型）。三种方式启停：
+
+| 方式 | 启 | 停 |
+|---|---|---|
+| **设置项** | `"burstcode.background.enabled": true` | 改成 `false` |
+| **命令面板** | `BurstCode: Toggle Background Code Explorer` | 同一条命令再点一次 |
+| **Chat 面板** | 右下角状态药丸 → *Enable Background Explorer* | 药丸 → *Disable* |
+
+启用后状态药丸会显示当前阶段：*idle-waiting* / *running* / *paused-by-chat* / *paused-by-typing*。
+点药丸还能直接进 **Background Explorer Menu**，所有控制项一站式。
+
+> 临时跑一次（不等空闲）：`BurstCode: Run Background Analysis Now`。
+
+<br />
+
+## 后台用哪个模型？三种配法
+
+后台跑的轮次远多于 Chat —— 强烈建议给它**单独配一个更小、更便宜的模型**。
+按"耦合度"从低到高三种模式：
+
+### 模式 A · 完全继承 Chat（零配置）
+
+什么都不写，后台就用你 Chat 当前激活的端点 + 模型。
+
+```jsonc
+// settings.json 不写任何 burstcode.background.endpoint / baseURL / model 即可
+```
+
+适合：刚装完想试试，或本地只跑一个模型。
+
+### 模式 B · 复用已有端点，换个小模型（推荐）
+
+引用 `burstcode.llm.endpoints` 里某个端点的 `name`，再单独指定一个该端点上更轻的模型：
+
+```jsonc
+"burstcode.background.endpoint": "Local Ollama",     // 引用 llm.endpoints[*].name
+"burstcode.background.model":    "qwen2.5-coder:1.5b" // 比 Chat 用的更小
+```
+
+适合：服务还是同一个 Ollama / vLLM，但希望 Chat 用 14B 大模型保质量、后台用 1.5B 小模型省电。
+
+### 模式 C · 完全独立的服务（最高隔离）
+
+把后台彻底和 Chat 解耦 —— 例如另一台旧电脑上的 Ollama，或者一个共享小模型网关：
+
+```jsonc
+"burstcode.background.baseURL":   "http://192.168.1.50:11434/v1",
+"burstcode.background.apiKey":    "ollama",
+"burstcode.background.model":     "qwen2.5-coder:3b",
+"burstcode.background.contextWindow": 8192,
+"burstcode.background.temperature":   0.2,
+"burstcode.background.allowSelfSignedCerts": false
+```
+
+> 一旦设了 `baseURL`，就**完全无视** `endpoint` 字段，所有连接参数走 background.* 自己的。
+
+适合：希望后台跑在另一台机器、另一张 GPU、或公司专门的"长任务"网关上。
+
+### 配完后切模型
+
+不想改 JSON？运行 **`BurstCode: Select Background Explorer Model`** 直接弹 QuickPick 切。
+
+<br />
+
+## 顺便跑测试（可选，默认关）
+
+```jsonc
+"burstcode.background.runGeneratedTests": true,
+"burstcode.background.testRunTimeoutMs": 60000
+```
+
+开启后：
+
+- TS/JS：自动调 `npx vitest` 或 `npx jest`
+- Python：自动调 `pytest`（首次会在 `.burstcode/tests/conftest.py` 注入 sys.path）
+- 每次测试的 *通过 / 失败 / 跳过 / 超时* 都写进 `verifications.md` 和对应的 `*.result.md`
+
+> ⚠️ 它会真的执行生成的代码 —— 在不信任的工程上启用前请先人工 review `tests/` 里的内容。
+
+<br />
+
+## 内部机制
+
+理解它在干嘛，调起来更顺手。
+
+### 一轮 cycle 长什么样
+
+```
+   ┌─ 用户停止键入 ≥ idleThresholdMs (默认 10s)
+   │   且距离上一轮 ≥ minIntervalMs (默认 30s)
+   ▼
+1. 规划阶段（Planner）
+   读工作区大纲 + 关键文件
+   ├─ 写 .burstcode/project-brief.md   （工程级理解）
+   └─ 生成 N 个调查 topic 进入 backlog （登录链路、错误传播…）
+   ▼
+2. 调查阶段（Topic Agent，最多 maxConcurrentTopics 并发）
+   每个 topic 跑一个独立 AgentLoop（只读工具：read_file/list_dir/grep_search/outline）
+   ├─ 写 topics/<id>.md         （主题报告）
+   ├─ append bugs.md            （疑似 bug）
+   └─ 写 tests/<topic>/*.test.* （针对模型"看不准"点的单测）
+   ▼
+3. 文件阶段（File Agent，增量）
+   挑 filesPerCycle 个 hash 变了的源文件
+   ├─ 写 docs/<source-path>.md  （摘要 + 热点 + 调用关系）
+   ├─ append bugs.md
+   └─ 写 tests/<source>.d/*
+   ▼
+4. 验证阶段（仅 runGeneratedTests=true）
+   逐个 spawn vitest / jest / pytest
+   ├─ 写 tests/**/*.result.md
+   └─ append verifications.md
+   ▼
+5. 收尾：state.json 落盘（hash + counters），更新 .burstcode/README.md
+```
+
+### 暂停规则（绝不抢资源）
+
+| 触发 | 行为 |
+|---|---|
+| 你开始打字 | 当前 cycle 立即暂停，状态变 *paused-by-typing* |
+| Chat 开始一次请求 | 当前 cycle 立即暂停，状态变 *paused-by-chat* |
+| 单文件 / Planner 超时（`perFileTimeoutMs`，默认 5 min） | 该任务取消，cycle 继续下一个 |
+| Topic 调查超时（`perFileTimeoutMs × 4`，默认 20 min） | 该 topic 取消，并发的其它 topic 继续 |
+| 总开关被关 | 当前 cycle 取消，所有 LLM 流终止 |
+
+### 增量与去重
+
+- 每个文件按 SHA-1 算 hash，存进 `.burstcode/state.json`
+- 下一轮跳过 hash 没变的文件 —— **只看新东西**
+- 想全部重跑？运行 `BurstCode: Reset Background Explorer State`，清空 hash 即可
+- 删除整个 `.burstcode/` 文件夹也安全，下一轮会自动重建
+
+### 一些硬约束
+
+- 单轮文件数 = `filesPerCycle`（默认 1）—— 慢工出细活，不堆请求
+- 单轮并发 topic = `maxConcurrentTopics`（默认 10）—— 端点扛得住就开大
+- 单文件硬上限 = `maxFileBytes`（默认 120 KB）—— 超过直接跳，避免炸上下文
+- 只看 `includeExtensions` 列出的扩展名 —— 默认覆盖 20+ 主流语言
+
+<br />
+
+## 后台命令速查
+
+| 命令 | 用途 |
+|---|---|
+| `BurstCode: Toggle Background Code Explorer` | 启 / 停 |
+| `BurstCode: Run Background Analysis Now` | 立即跑一轮（不等空闲） |
+| `BurstCode: Select Background Explorer Model` | 单独为后台选模型 |
+| `BurstCode: Show Background Explorer Report` | 打开 `.burstcode/README.md` |
+| `BurstCode: Show Background Explorer Activity Log` | 打开 Output 通道实时看进度 |
+| `BurstCode: Reset Background Explorer State` | 清空 hash，让所有文件重新分析 |
+| `BurstCode: Background Explorer Menu` | 状态药丸的菜单入口（一站式） |
+
+<br />
+
+## 完整配置项
+
+```jsonc
+// ── 总开关 ─────────────────────────────────────
+"burstcode.background.enabled": false,
+
+// ── 节律（什么时候跑、跑多频）──────────────────
+"burstcode.background.idleThresholdMs":   10000,   // 用户停手多久后开始
+"burstcode.background.minIntervalMs":     30000,   // 两轮最小间隔
+"burstcode.background.filesPerCycle":     1,       // 每轮分析几个文件
+"burstcode.background.maxConcurrentTopics": 10,    // 单轮并发主题数
+"burstcode.background.perFileTimeoutMs":  300000,  // 单文件 / Planner 超时；Topic 取此值 × 4
+
+// ── 范围（看哪些文件）──────────────────────────
+"burstcode.background.includeExtensions": [
+  "ts","tsx","js","jsx","py","go","rs","java","kt",
+  "c","cpp","cs","rb","php","swift","scala","lua","dart"
+],
+"burstcode.background.maxFileBytes": 120000,       // 超过此值直接跳
+
+// ── 端点 / 模型（独立于 Chat）─────────────────
+"burstcode.background.endpoint":  "",              // 引用 llm.endpoints[*].name
+"burstcode.background.baseURL":   "",              // 设了它就完全独立
+"burstcode.background.apiKey":    "",
+"burstcode.background.allowSelfSignedCerts": false,
+"burstcode.background.model":     "",              // 留空 = 端点默认 / 继承 Chat
+"burstcode.background.temperature":   0.2,
+"burstcode.background.contextWindow": 0,           // 0 = 继承端点
+
+// ── 输出与执行 ─────────────────────────────────
+"burstcode.background.outputDir": ".burstcode",
+"burstcode.background.runGeneratedTests": false,   // 自动跑生成的测试
+"burstcode.background.testRunTimeoutMs": 60000
+```
+
+完整描述（每项的英文文档）见 `package.json` 的 `contributes.configuration`（搜 `burstcode.background.`）。
+
+<br />
 
 ---
 
-## 🏗 架构总览
+<br />
 
-<img src="media/readme/architecture.svg" alt="" width="48" height="48" align="left" />
+## 兼容性
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                       extension.ts (激活入口)                     │
-└──────┬──────────────┬───────────────┬──────────────┬─────────────┘
-       │              │               │              │
-       ▼              ▼               ▼              ▼
- ┌──────────┐  ┌────────────┐  ┌────────────┐  ┌─────────────┐
- │ ChatView │  │ AgentLoop  │  │ HunkApplier│  │ Background  │
- │ Provider │◄─┤ (工具循环) ├──┤ + DiffPrev │  │ Explorer    │
- │ (Webview)│  └─────┬──────┘  └─────┬──────┘  └──────┬──────┘
- └─────┬────┘        │               │                │
-       │             │  调用工具      │  Git 快照       │ 闲置时跑
-       │             ▼               ▼                ▼
-       │      ┌───────────┐  ┌──────────────┐  ┌──────────────┐
-       │      │ tools/*.ts│  │ GitCheckpoint│  │ TestRunner   │
-       │      │  + LSP    │  └──────────────┘  └──────────────┘
-       │      └───────────┘
-       ▼
- ┌──────────────────────────────────────────────────────┐
- │ OpenAIClient → 任意 OpenAI 兼容 endpoint              │
- │ (Ollama / LM Studio / vLLM / llama.cpp / 自建网关)    │
- └──────────────────────────────────────────────────────┘
+只要服务说 OpenAI 协议（`/v1/chat/completions` + `/v1/models`）就能接：
 
-  支撑模块: WorkspaceIndex · WorkspaceOutline · Compressor
-            tokenizer (gpt-tokenizer) · LspBridge · DependencyGuard
+**Ollama** · **LM Studio** · **vLLM** · **llama.cpp / llama-server** · **TGI** · **OpenRouter** · **Azure OpenAI** · 自建网关
+
+支持任何已安装语言扩展的工程：TypeScript · Python · Go · Rust · Java · C/C++ · C# · Ruby · PHP · Swift · Kotlin · Scala · Lua · Dart …
+
+---
+
+## 开发
+
+```powershell
+npm install
+npm run watch          # 增量编译
+# 在 VS Code 按 F5 启动 Extension Host
+
+npm run package        # 生产构建
+npm run vsix           # 打 vsix
 ```
 
-源码目录：
+技术栈：TypeScript 5 · esbuild · openai SDK · gpt-tokenizer · diff · VS Code API ≥ 1.85
+
+源码导航：
 
 | 目录 | 内容 |
 |---|---|
-| [`src/agent/`](src/agent) | Agent 主循环、提示词、工具实现 |
-| [`src/background/`](src/background) | 后台代码探索器、单测执行 |
-| [`src/chat/`](src/chat) | Webview Chat 视图、会话存储 |
-| [`src/context/`](src/context) | 工作区索引、大纲、上下文压缩 |
-| [`src/edits/`](src/edits) | Diff 预览、Hunk 应用器 |
-| [`src/git/`](src/git) | Git checkpoint 实现 |
-| [`src/llm/`](src/llm) | OpenAI 兼容客户端 + tokenizer |
-| [`src/lsp/`](src/lsp) | 对 vscode LSP 的桥接 |
-| [`src/memory/`](src/memory) | 跨会话教训持久化 |
-| [`src/deps/`](src/deps) | 依赖（VS Code 扩展）守护 |
-
-### 🌐 支持的后端
-
-只要它说 OpenAI 协议（`/v1/chat/completions`、`/v1/models` 即可）：
-
-- ✅ **Ollama** — 默认配置开箱即用
-- ✅ **LM Studio** — Local Server 模式
-- ✅ **vLLM** — `--api-server openai`
-- ✅ **llama.cpp / llama-server**
-- ✅ **Text Generation Inference (TGI)** OpenAI 适配
-- ✅ **OpenRouter / 自建网关 / Azure OpenAI**
+| `src/agent/` | Agent 主循环、提示词、工具实现（plan、ask_user、edits、lsp…） |
+| `src/background/` | 后台代码探索器、单测执行 |
+| `src/chat/` | Webview Chat 视图、会话存储 |
+| `src/context/` | 工作区索引、大纲、上下文压缩 |
+| `src/edits/` | Diff 预览、Hunk 应用器 |
+| `src/git/` | Git checkpoint |
+| `src/llm/` | OpenAI 兼容客户端 + tokenizer |
+| `src/lsp/` | LSP 桥接 |
+| `src/memory/` | Lesson 持久化（自我进化的存储） |
 
 ---
 
-## 🧪 开发
+## License
 
-```powershell
-# 拉依赖
-npm install
+MIT — 自由使用、修改、闭源分发，保留版权声明即可。详见 [`LICENSE`](LICENSE)。
 
-# 增量编译（监听）
-npm run watch
-
-# 在 VS Code 里按 F5 启动 Extension Host
-
-# 生产构建
-npm run package
-
-# 打 vsix
-npm run vsix
-```
-
-技术栈：
-
-- **TypeScript 5** + **esbuild**（单文件打包到 `dist/extension.js`）
-- **openai** SDK（指向任意兼容 endpoint）
-- **gpt-tokenizer**（本地 token 计算 / 上下文用量仪表）
-- **diff** （hunk 解析）
-- VS Code API ≥ 1.85
-
-调试：
-
-- `.vscode/launch.json` 已配好 `Run Extension`
-- 后台探索器有自己的 Output 通道：`BurstCode Background`
-- 主日志在 `BurstCode` Output 通道
-
----
-
-## 📜 许可证
-
-<img src="media/readme/license.svg" alt="" width="48" height="48" align="left" />
-
-MIT License — 自由使用、修改、闭源分发，但保留版权声明。详见 [`LICENSE`](LICENSE)（如未附带，本仓库默认按 MIT 释出）。
-
----
+<br />
 
 <div align="center">
 
-**让模型留在你的机器里 · 让代码留在你的仓库里**
+**模型留在你的机器里 · 代码留在你的仓库里**
 
-如果你觉得 BurstCode 有用，欢迎 ⭐ Star，提 Issue，发 PR。
+如果 BurstCode 帮到你，欢迎 ⭐ Star · 提 Issue · 发 PR。
 
 </div>

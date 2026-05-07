@@ -396,8 +396,8 @@
         },
         "burstcode.background.perFileTimeoutMs": {
           "type": "number",
-          "default": 180000,
-          "description": "Cancel a single-file analysis if it has not finished within this many milliseconds."
+          "default": 300000,
+          "description": "Base timeout (ms) for a single background LLM call. Used directly for the planner pass and per-file analysis (default 5 min). Topic investigations run an entire AgentLoop with multiple tool calls and use 4× this value (default 20 min) so a slow grep / multi-file read doesn't kill the run. Raise this if you're driving the explorer with a small / slow / CPU-only model."
         },
         "burstcode.background.runGeneratedTests": {
           "type": "boolean",
