@@ -110,7 +110,7 @@ python -m vllm.entrypoints.openai.api_server \
 ## 第 2 步 · 安装扩展
 
 ```powershell
-code --install-extension burstcode-0.1.3.vsix
+code --install-extension burstcode-0.1.4.vsix
 ```
 
 或者在仓库根目录自己打一份：
@@ -118,7 +118,7 @@ code --install-extension burstcode-0.1.3.vsix
 ```powershell
 npm install
 npm run package
-npm run vsix          # 产出 burstcode-0.1.3.vsix
+npm run vsix          # 产出 burstcode-0.1.4.vsix
 ```
 
 装好后 VS Code 活动栏会多出一个 ⚡ 图标。

@@ -110,7 +110,7 @@ python -m vllm.entrypoints.openai.api_server \
 ## Step 2 · Install the extension
 
 ```powershell
-code --install-extension burstcode-0.1.3.vsix
+code --install-extension burstcode-0.1.4.vsix
 ```
 
 Or build it from source:
@@ -118,7 +118,7 @@ Or build it from source:
 ```powershell
 npm install
 npm run package
-npm run vsix          # produces burstcode-0.1.3.vsix
+npm run vsix          # produces burstcode-0.1.4.vsix
 ```
 
 After install, a ⚡ icon appears in the VS Code activity bar.
