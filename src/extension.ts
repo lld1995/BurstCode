@@ -272,9 +272,26 @@ export function activate(context: vscode.ExtensionContext): void {
       const cfg = vscode.workspace.getConfiguration('burstcode.background');
       const currentEp = cfg.get<string>('endpoint') ?? '';
       const currentModel = cfg.get<string>('model') ?? '';
+      const currentBaseURL = (cfg.get<string>('baseURL') ?? '').trim();
       const items: Item[] = [
-        { label: '$(arrow-swap) Inherit from chat', description: 'Use whichever model the chat panel is on', endpoint: '', model: '' }
+        { label: '$(arrow-swap) Inherit from chat', description: 'Use whichever model the chat panel is on', endpoint: '', model: '' },
+        {
+          label: '$(globe) Custom base URL...',
+          description: currentBaseURL
+            ? `Currently: ${currentBaseURL}${currentModel ? ' · ' + currentModel : ''}`
+            : 'Point background loop at a fully independent server',
+          endpoint: '__custom_url__',
+          model: ''
+        }
       ];
+      if (currentBaseURL) {
+        items.push({
+          label: '$(circle-slash) Clear custom URL',
+          description: 'Stop using the custom baseURL and fall back to endpoint inheritance',
+          endpoint: '__clear_url__',
+          model: ''
+        });
+      }
       for (const ep of endpoints) {
         items.push({
           label: ep.name,
@@ -303,6 +320,57 @@ export function activate(context: vscode.ExtensionContext): void {
         placeHolder: 'Pick a model for the background loop (independent of chat)'
       });
       if (!picked) return;
+      if (picked.endpoint === '__custom_url__') {
+        const url = await vscode.window.showInputBox({
+          title: 'BurstCode: Custom background base URL',
+          prompt: 'OpenAI-compatible base URL for the background explorer (e.g. http://192.168.1.50:11434/v1)',
+          value: currentBaseURL,
+          ignoreFocusOut: true,
+          validateInput: (v) => {
+            const s = (v ?? '').trim();
+            if (!s) return undefined; // empty = clear
+            try { new URL(s); return undefined; } catch { return 'Not a valid URL.'; }
+          }
+        });
+        if (url === undefined) return; // cancelled
+        const trimmed = url.trim();
+        if (!trimmed) {
+          await cfg.update('baseURL', '', vscode.ConfigurationTarget.Global);
+          await cfg.update('apiKey', '', vscode.ConfigurationTarget.Global);
+          vscode.window.showInformationMessage('BurstCode: cleared background custom URL.');
+          return;
+        }
+        const apiKey = await vscode.window.showInputBox({
+          title: 'BurstCode: API key for background URL',
+          prompt: 'Optional API key for the background server (leave empty for local servers like Ollama)',
+          value: cfg.get<string>('apiKey') ?? '',
+          ignoreFocusOut: true,
+          password: true
+        });
+        if (apiKey === undefined) return; // cancelled mid-way
+        const modelId = await vscode.window.showInputBox({
+          title: 'BurstCode: Model id on the custom URL',
+          prompt: 'Model id to call on the custom server (e.g. qwen2.5-coder:7b). Leave empty to inherit later.',
+          value: cfg.get<string>('model') ?? '',
+          ignoreFocusOut: true
+        });
+        if (modelId === undefined) return;
+        await cfg.update('baseURL', trimmed, vscode.ConfigurationTarget.Global);
+        await cfg.update('apiKey', apiKey.trim(), vscode.ConfigurationTarget.Global);
+        await cfg.update('model', modelId.trim(), vscode.ConfigurationTarget.Global);
+        // Clear endpoint name override so it doesn't fight the explicit URL.
+        await cfg.update('endpoint', '', vscode.ConfigurationTarget.Global);
+        vscode.window.showInformationMessage(
+          `BurstCode: background explorer pointed at "${trimmed}"${modelId.trim() ? ' · ' + modelId.trim() : ''}.`
+        );
+        return;
+      }
+      if (picked.endpoint === '__clear_url__') {
+        await cfg.update('baseURL', '', vscode.ConfigurationTarget.Global);
+        await cfg.update('apiKey', '', vscode.ConfigurationTarget.Global);
+        vscode.window.showInformationMessage('BurstCode: cleared background custom URL — falling back to endpoint inheritance.');
+        return;
+      }
       if (picked.model === '__fetch__') {
         const ep = endpoints.find((e) => e.name === picked.endpoint);
         if (!ep) return;
@@ -330,6 +398,13 @@ export function activate(context: vscode.ExtensionContext): void {
       } else {
         await cfg.update('endpoint', picked.endpoint, vscode.ConfigurationTarget.Global);
         await cfg.update('model', picked.model, vscode.ConfigurationTarget.Global);
+        // Picking a named endpoint (or "Inherit from chat") supersedes any
+        // previously-set custom baseURL — otherwise the override would win
+        // silently and the user would be confused why their pick was ignored.
+        if (currentBaseURL) {
+          await cfg.update('baseURL', '', vscode.ConfigurationTarget.Global);
+          await cfg.update('apiKey', '', vscode.ConfigurationTarget.Global);
+        }
         if (picked.endpoint || picked.model) {
           vscode.window.showInformationMessage(
             `BurstCode: background explorer using "${picked.endpoint || '(chat endpoint)'} / ${picked.model || '(endpoint default)'}".`

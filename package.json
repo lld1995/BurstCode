@@ -362,7 +362,22 @@
         "burstcode.background.endpoint": {
           "type": "string",
           "default": "",
-          "description": "Endpoint name (from burstcode.llm.endpoints) the background explorer should use. Empty = inherit the chat panel's currently active endpoint."
+          "description": "Endpoint name (from burstcode.llm.endpoints) the background explorer should use. Empty = inherit the chat panel's currently active endpoint. Ignored when burstcode.background.baseURL is set."
+        },
+        "burstcode.background.baseURL": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI-compatible base URL for the background explorer ONLY. When set, this fully decouples the background loop from the chat panel's endpoint — useful when the background work runs against a different / cheaper / local server. Empty = derive baseURL from burstcode.background.endpoint (or chat's active endpoint)."
+        },
+        "burstcode.background.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key paired with burstcode.background.baseURL. Empty = inherit the resolved endpoint's apiKey (or 'ollama' for local servers)."
+        },
+        "burstcode.background.allowSelfSignedCerts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Skip TLS certificate verification for burstcode.background.baseURL. Only applies when burstcode.background.baseURL is set; otherwise the resolved endpoint's setting is inherited."
         },
         "burstcode.background.model": {
           "type": "string",

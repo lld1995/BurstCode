@@ -53,6 +53,17 @@ interface BackgroundConfig {
   outputDir: string;
   /** Endpoint name override (empty → use chat's active endpoint). */
   endpoint: string;
+  /**
+   * Fully-independent base URL override. When non-empty the background loop
+   * stops following the chat panel's endpoint at all and points straight at
+   * this URL — useful for running background work against a different or
+   * cheaper server. Empty = derive baseURL from `endpoint` (or chat's active).
+   */
+  baseURL: string;
+  /** API key paired with the override `baseURL`. Empty = inherit endpoint's. */
+  apiKey: string;
+  /** Skip TLS verification for the override `baseURL`. Only honored when `baseURL` is set. */
+  allowSelfSignedCerts: boolean;
   /** Model id override (empty → use endpoint's first model / chat's active). */
   model: string;
   /** Temperature override. NaN → endpoint default. */
@@ -89,6 +100,9 @@ function readConfig(): BackgroundConfig {
     maxFileBytes: Math.max(1024, cfg.get<number>('maxFileBytes') ?? 120_000),
     outputDir: (cfg.get<string>('outputDir') ?? '.burstcode').trim() || '.burstcode',
     endpoint: (cfg.get<string>('endpoint') ?? '').trim(),
+    baseURL: (cfg.get<string>('baseURL') ?? '').trim(),
+    apiKey: (cfg.get<string>('apiKey') ?? '').trim(),
+    allowSelfSignedCerts: cfg.get<boolean>('allowSelfSignedCerts') ?? false,
     model: (cfg.get<string>('model') ?? '').trim(),
     temperature: typeof cfg.get<number>('temperature') === 'number'
       ? (cfg.get<number>('temperature') as number)
@@ -105,13 +119,21 @@ function resolveLLMConfig(bg: BackgroundConfig): LLMConfig {
   const ep = (bg.endpoint && endpoints.find((e) => e.name === bg.endpoint)) || getActiveEndpoint();
   const chatActive = readLLMConfig();
   const model = bg.model || ep.models[0] || chatActive.model;
+  // baseURL/apiKey/TLS are independently overridable so the background loop
+  // can target a completely different server than the chat panel. When
+  // `bg.baseURL` is empty we keep the legacy "inherit from endpoint" path.
+  const baseURL = bg.baseURL || ep.baseURL;
+  const apiKey = bg.apiKey || ep.apiKey;
+  const allowSelfSignedCerts = bg.baseURL
+    ? bg.allowSelfSignedCerts
+    : ep.allowSelfSignedCerts;
   return {
-    baseURL: ep.baseURL,
-    apiKey: ep.apiKey,
+    baseURL,
+    apiKey,
     model,
     temperature: Number.isFinite(bg.temperature) ? bg.temperature : ep.temperature,
     contextWindow: bg.contextWindow > 0 ? bg.contextWindow : ep.contextWindow,
-    allowSelfSignedCerts: ep.allowSelfSignedCerts
+    allowSelfSignedCerts
   };
 }
 
