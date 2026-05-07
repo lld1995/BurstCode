@@ -337,58 +337,72 @@ export class OpenAIClient {
     tools: ToolDef[],
     cancellation: vscode.CancellationToken
   ): AsyncGenerator<StreamChunk, void, void> {
-    const stream = await this.client.chat.completions.create({
-      model: this.config.model,
-      messages,
-      tools: tools.length ? tools : undefined,
-      tool_choice: tools.length ? 'auto' : undefined,
-      temperature: this.config.temperature,
-      stream: true
-    });
-
-    cancellation.onCancellationRequested(() => {
+    // Wire an AbortController to the cancellation token BEFORE any await so
+    // that clicking Stop cancels the initial HTTP request too — not only the
+    // streaming body. Without this, a hung/slow endpoint blocks `create()`
+    // forever and the cancellation listener never gets registered, leaving
+    // the user with a frozen run that can't be stopped.
+    const ac = new AbortController();
+    if (cancellation.isCancellationRequested) ac.abort();
+    const sub = cancellation.onCancellationRequested(() => {
       try {
-        stream.controller.abort();
+        ac.abort();
       } catch {
         /* ignore */
       }
     });
 
-    const splitter = new ThinkSplitter();
+    try {
+      const stream = await this.client.chat.completions.create(
+        {
+          model: this.config.model,
+          messages,
+          tools: tools.length ? tools : undefined,
+          tool_choice: tools.length ? 'auto' : undefined,
+          temperature: this.config.temperature,
+          stream: true
+        },
+        { signal: ac.signal }
+      );
 
-    for await (const part of stream) {
-      const choice = part.choices?.[0];
-      if (!choice) continue;
-      const delta = choice.delta;
-      if (delta?.content) {
-        for (const c of splitter.feed(delta.content)) yield c;
-      }
-      // @ts-expect-error - reasoning_content may be present for thinking models (DeepSeek V4, OpenRouter, etc.)
-      if (delta?.reasoning_content) {
-        // @ts-expect-error
-        yield { reasoningDelta: delta.reasoning_content };
-      }
-      if (delta?.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          yield {
-            toolCallDelta: {
-              index: tc.index,
-              id: tc.id,
-              name: tc.function?.name,
-              argumentsDelta: tc.function?.arguments
-            }
-          };
+      const splitter = new ThinkSplitter();
+
+      for await (const part of stream) {
+        const choice = part.choices?.[0];
+        if (!choice) continue;
+        const delta = choice.delta;
+        if (delta?.content) {
+          for (const c of splitter.feed(delta.content)) yield c;
+        }
+        // @ts-expect-error - reasoning_content may be present for thinking models (DeepSeek V4, OpenRouter, etc.)
+        if (delta?.reasoning_content) {
+          // @ts-expect-error
+          yield { reasoningDelta: delta.reasoning_content };
+        }
+        if (delta?.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            yield {
+              toolCallDelta: {
+                index: tc.index,
+                id: tc.id,
+                name: tc.function?.name,
+                argumentsDelta: tc.function?.arguments
+              }
+            };
+          }
+        }
+        if (choice.finish_reason) {
+          // Flush any bytes the splitter held back waiting for a tag boundary
+          // before forwarding the finish event.
+          for (const c of splitter.feed('', true)) yield c;
+          yield { finishReason: choice.finish_reason };
         }
       }
-      if (choice.finish_reason) {
-        // Flush any bytes the splitter held back waiting for a tag boundary
-        // before forwarding the finish event.
-        for (const c of splitter.feed('', true)) yield c;
-        yield { finishReason: choice.finish_reason };
-      }
+      // Defensive flush in case the upstream stream ends without ever sending
+      // a finish_reason (some self-hosted vLLM/sglang frontends do this).
+      for (const c of splitter.feed('', true)) yield c;
+    } finally {
+      sub.dispose();
     }
-    // Defensive flush in case the upstream stream ends without ever sending a
-    // finish_reason (some self-hosted vLLM/sglang frontends do this).
-    for (const c of splitter.feed('', true)) yield c;
   }
 }

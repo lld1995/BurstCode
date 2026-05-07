@@ -526,6 +526,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this.foregroundActivityEmitter.fire('chat-start');
 
+    // Allocate (and publish) the cancellation source FIRST, before any of
+    // the slow setup work below. Otherwise a user clicking Stop while we are
+    // still building the system prompt or creating the git checkpoint would
+    // hit `this.currentRun?.cancel()` on `undefined` and have no effect.
+    const cts = new vscode.CancellationTokenSource();
+    this.currentRun = cts;
+
     const session = this.ensureSessionForUserText(userText);
     const messageIndex = session.messages.length;
     session.messages.push({ role: 'user', content: userText });
@@ -571,11 +578,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const bridge = new LspBridge(
       vscode.workspace.getConfiguration('burstcode.lsp').get<number>('maxWaitMs') ?? 60000
     );
-
-    // Allocate the cancellation source up front so the askUser callback below
-    // can subscribe to it; we activate it on `this.currentRun` further down,
-    // immediately before agent.run() starts streaming.
-    const cts = new vscode.CancellationTokenSource();
 
     const askUser = (spec: AskUserSpec): Promise<string> => {
       return new Promise<string>((resolve) => {
@@ -648,7 +650,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       systemPrompt
     });
 
-    this.currentRun = cts;
     this.post({ type: 'run-start' });
 
     try {
