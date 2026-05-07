@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FDE68A"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="1.2"/>
+      <feOffset dx="0" dy="1.5" result="offsetblur"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.45"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Rounded gradient tile -->
+  <rect x="4" y="4" width="120" height="120" rx="26" ry="26" fill="url(#bg)"/>
+
+  <!-- Subtle inner highlight -->
+  <rect x="4" y="4" width="120" height="60" rx="26" ry="26" fill="#ffffff" opacity="0.06"/>
+
+  <!-- Brackets + lightning bolt, inspired by media/icon.svg -->
+  <g filter="url(#softShadow)" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- left bracket -->
+    <path d="M40 36 L20 64 L40 92" stroke="#ffffff" stroke-width="7"/>
+    <!-- right bracket -->
+    <path d="M88 36 L108 64 L88 92" stroke="#ffffff" stroke-width="7"/>
+  </g>
+
+  <!-- Lightning bolt -->
+  <path d="M72 30 L46 70 H60 L52 100 L86 58 H70 Z"
+        fill="url(#bolt)" stroke="#92400E" stroke-width="2.2" stroke-linejoin="round"/>
+
+  <!-- Accent dots -->
+  <circle cx="102" cy="26" r="3.4" fill="#34D399"/>
+  <circle cx="26" cy="102" r="2.4" fill="#F472B6"/>
+</svg>
