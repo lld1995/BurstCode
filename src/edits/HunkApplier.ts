@@ -50,11 +50,35 @@ interface DecisionRecord {
   totalHunks: number;
 }
 
+/**
+ * A flat, JSON-serializable view of one pending file. The webview uses these
+ * entries to render a clickable file list inside the pending-edits banner so
+ * users can jump directly into the diff editor for a specific file.
+ */
+export interface PendingFileSummary {
+  /** Stable identifier (the source `vscode.Uri.toString()`), used for IPC. */
+  uri: string;
+  /** Workspace-relative POSIX path when possible, else the absolute fsPath. */
+  path: string;
+  /** Just the basename, for compact display. */
+  name: string;
+  /** Hunks still awaiting a decision. */
+  pendingHunks: number;
+  /** Hunks already accepted but not yet flushed (file still in the queue). */
+  acceptedHunks: number;
+  /** Hunks already rejected. */
+  rejectedHunks: number;
+  /** True for files that don't exist on disk yet (creation flow). */
+  isNewFile: boolean;
+}
+
 export interface PendingState {
   /** Number of files with at least one pending hunk. */
   files: number;
   /** Total number of pending hunks across all files. */
   hunks: number;
+  /** Per-file summaries for rendering a clickable list in the banner. */
+  fileList: PendingFileSummary[];
   /** Latest propose_edit summary, for display in the chat banner. */
   latestSummary?: string;
   /**
@@ -98,14 +122,48 @@ export class HunkApplier implements vscode.Disposable {
   getPendingState(): PendingState {
     let hunks = 0;
     let files = 0;
+    const fileList: PendingFileSummary[] = [];
     for (const f of this.pending.values()) {
       const pendingCount = f.hunks.filter((h) => h.status === 'pending').length;
+      const acceptedCount = f.hunks.filter((h) => h.status === 'accepted').length;
+      const rejectedCount = f.hunks.filter((h) => h.status === 'rejected').length;
       if (pendingCount > 0) {
         files++;
         hunks += pendingCount;
       }
+      fileList.push({
+        uri: f.uri.toString(),
+        path: this.workspaceRelative(f.uri),
+        name: path.basename(f.uri.fsPath),
+        pendingHunks: pendingCount,
+        acceptedHunks: acceptedCount,
+        rejectedHunks: rejectedCount,
+        isNewFile: f.isNewFile
+      });
     }
-    return { files, hunks, latestSummary: this.latestSummary };
+    // Stable order: files with pending hunks first, then by path.
+    fileList.sort((a, b) => {
+      if ((b.pendingHunks > 0 ? 1 : 0) !== (a.pendingHunks > 0 ? 1 : 0)) {
+        return (b.pendingHunks > 0 ? 1 : 0) - (a.pendingHunks > 0 ? 1 : 0);
+      }
+      return a.path.localeCompare(b.path);
+    });
+    return { files, hunks, fileList, latestSummary: this.latestSummary };
+  }
+
+  /**
+   * Compute a workspace-relative POSIX path for display. Falls back to the
+   * absolute fsPath when the file lives outside the open workspace folders.
+   */
+  private workspaceRelative(uri: vscode.Uri): string {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    for (const folder of folders) {
+      const rel = path.relative(folder.uri.fsPath, uri.fsPath);
+      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+        return rel.split(path.sep).join('/');
+      }
+    }
+    return uri.fsPath;
   }
 
   private emitState(extra?: Partial<PendingState>): void {
@@ -233,13 +291,40 @@ export class HunkApplier implements vscode.Disposable {
 
   /** Open the diff editor for the first file with pending hunks (Review button). */
   async openPendingDiff(): Promise<void> {
-    const first = this.pending.values().next().value;
-    if (!first) return;
+    // Prefer files that still have pending hunks; fall back to any queued file.
+    const entries = Array.from(this.pending.values());
+    const target =
+      entries.find((f) => f.hunks.some((h) => h.status === 'pending')) ?? entries[0];
+    if (!target) return;
+    await this.openDiffForEntry(target);
+  }
+
+  /**
+   * Open the diff editor for a specific queued file. The webview's banner
+   * file list calls this so users can step through each changed file
+   * individually instead of always landing on the first one.
+   *
+   * Accepts the source uri.toString() (as returned in `PendingFileSummary.uri`).
+   */
+  async openDiffForFile(sourceUriKey: string): Promise<void> {
+    const entry = this.pending.get(sourceUriKey);
+    if (!entry) return;
+    await this.openDiffForEntry(entry);
+  }
+
+  private async openDiffForEntry(entry: PendingFile): Promise<void> {
+    if (entry.isNewFile) {
+      // Brand-new file: nothing on disk to compare against, so open the
+      // proposed virtual document directly. CodeLenses still work because
+      // the diff-preview scheme is registered with the CodeLens provider.
+      await vscode.window.showTextDocument(entry.proposedUri, { preview: true });
+      return;
+    }
     await vscode.commands.executeCommand(
       'vscode.diff',
-      first.proposedUri,
-      first.uri,
-      `BurstCode • ${path.basename(first.uri.fsPath)} (Proposed ↔ Current)`
+      entry.proposedUri,
+      entry.uri,
+      `BurstCode • ${path.basename(entry.uri.fsPath)} (Proposed ↔ Current)`
     );
   }
 

@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { Logger } from '../util/Logger';
 import { DependencyGuard } from '../deps/DependencyGuard';
-import { HunkApplier } from '../edits/HunkApplier';
+import { HunkApplier, PendingState } from '../edits/HunkApplier';
 import {
   OpenAIClient,
   readLLMConfig,
@@ -105,7 +105,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return !!this.currentRun;
   }
 
-  private broadcastPendingEdits(state: { files: number; hunks: number; latestSummary?: string; recentDecision?: string }): void {
+  private broadcastPendingEdits(state: PendingState): void {
     if (!this.view) return;
     this.post({ type: 'pending-edits', payload: state });
   }
@@ -284,9 +284,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'reject-all-edits':
         await this.applier.rejectAll();
         break;
-      case 'review-edits':
-        await this.applier.openPendingDiff();
+      case 'review-edits': {
+        const uri = String((msg.payload as { uri?: string })?.uri ?? '').trim();
+        if (uri) {
+          await this.applier.openDiffForFile(uri);
+        } else {
+          await this.applier.openPendingDiff();
+        }
         break;
+      }
       case 'rollback': {
         const payload = (msg.payload ?? {}) as { ref?: string; messageIndex?: number };
         await this.rollbackToCheckpoint(String(payload.ref ?? ''), Number(payload.messageIndex ?? -1));
@@ -951,10 +957,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /* ============ Pending edits banner (sticky, above composer) ============ */
   #pendingBanner { display: none; padding: 8px 10px; margin: 0 12px 8px; border-radius: 8px; background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-charts-orange, #d18616); flex-shrink: 0; }
-  #pendingBanner.visible { display: flex; align-items: center; gap: 8px; }
+  #pendingBanner.visible { display: flex; flex-direction: column; gap: 6px; }
+  #pendingBanner .header { display: flex; align-items: center; gap: 8px; }
   #pendingBanner .icon { font-size: 1em; opacity: 0.85; }
   #pendingBanner .text { flex: 1; min-width: 0; line-height: 1.35; }
-  #pendingBanner .text .title { font-weight: 600; font-size: 0.88em; }
+  #pendingBanner .text .title { font-weight: 600; font-size: 0.88em; display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+  #pendingBanner .text .title .chevron { font-size: 0.75em; opacity: 0.7; transition: transform 0.15s ease; display: inline-block; }
+  #pendingBanner.collapsed .text .title .chevron { transform: rotate(-90deg); }
   #pendingBanner .text .summary { font-size: 0.78em; opacity: 0.7; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #pendingBanner .actions { display: flex; gap: 4px; flex-shrink: 0; }
   #pendingBanner button { padding: 4px 10px; border-radius: 5px; border: 1px solid var(--vscode-button-border, transparent); cursor: pointer; font-size: 0.85em; }
@@ -964,6 +973,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   #pendingBanner button.accept:hover { filter: brightness(1.1); }
   #pendingBanner button.reject { background: transparent; color: var(--vscode-foreground); border-color: var(--vscode-panel-border); }
   #pendingBanner button.reject:hover { background: var(--vscode-toolbar-hoverBackground); }
+  #pendingBanner .file-list { display: flex; flex-direction: column; gap: 2px; max-height: 180px; overflow-y: auto; border-top: 1px solid var(--vscode-panel-border); padding-top: 6px; margin-top: 2px; }
+  #pendingBanner.collapsed .file-list { display: none; }
+  #pendingBanner .file-row { display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 4px; cursor: pointer; font-size: 0.82em; line-height: 1.3; }
+  #pendingBanner .file-row:hover { background: var(--vscode-list-hoverBackground); }
+  #pendingBanner .file-row .fname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #pendingBanner .file-row .fname .basename { font-weight: 500; }
+  #pendingBanner .file-row .fname .dir { opacity: 0.6; font-size: 0.92em; margin-left: 4px; }
+  #pendingBanner .file-row .badge { font-size: 0.75em; padding: 1px 6px; border-radius: 8px; flex-shrink: 0; }
+  #pendingBanner .file-row .badge.pending { background: var(--vscode-charts-orange, #d18616); color: #fff; }
+  #pendingBanner .file-row .badge.done { background: var(--vscode-charts-green, #2ea043); color: #fff; opacity: 0.7; }
+  #pendingBanner .file-row .badge.new { background: var(--vscode-charts-blue, #1f6feb); color: #fff; }
   .decision-flash { padding: 4px 8px; margin: 4px 0; font-size: 0.85em; border-radius: 4px; opacity: 0.9; }
   .decision-flash.accept { color: var(--vscode-charts-green, #2ea043); }
   .decision-flash.reject { color: var(--vscode-descriptionForeground); }
@@ -1092,16 +1112,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </div>
   <div id="pendingBanner">
-    <span class="icon">📝</span>
-    <div class="text">
-      <div class="title"></div>
-      <div class="summary"></div>
+    <div class="header">
+      <span class="icon">📝</span>
+      <div class="text">
+        <div class="title" id="pendingTitle" title="Click to expand/collapse the changed file list"><span class="chevron">▾</span><span class="title-text"></span></div>
+        <div class="summary"></div>
+      </div>
+      <div class="actions">
+        <button class="review" id="pendingReviewBtn" title="Open the diff editor">Review</button>
+        <button class="reject" id="pendingRejectBtn" title="Discard all queued edits">Reject All</button>
+        <button class="accept" id="pendingAcceptBtn" title="Apply all queued edits">Accept All</button>
+      </div>
     </div>
-    <div class="actions">
-      <button class="review" id="pendingReviewBtn" title="Open the diff editor">Review</button>
-      <button class="reject" id="pendingRejectBtn" title="Discard all queued edits">Reject All</button>
-      <button class="accept" id="pendingAcceptBtn" title="Apply all queued edits">Accept All</button>
-    </div>
+    <div class="file-list" id="pendingFileList"></div>
   </div>
   <div id="composer-wrap">
     <div id="modelPicker" role="listbox" aria-label="Select model"></div>
@@ -1237,11 +1260,13 @@ const lessonsBtn = document.getElementById('lessonsBtn');
 const lessonsEl = document.getElementById('lessons');
 const planEl = document.getElementById('plan');
 const pendingBanner = document.getElementById('pendingBanner');
-const pendingTitle = pendingBanner.querySelector('.title');
+const pendingTitleRow = document.getElementById('pendingTitle');
+const pendingTitle = pendingTitleRow.querySelector('.title-text');
 const pendingSummary = pendingBanner.querySelector('.summary');
 const pendingReviewBtn = document.getElementById('pendingReviewBtn');
 const pendingAcceptBtn = document.getElementById('pendingAcceptBtn');
 const pendingRejectBtn = document.getElementById('pendingRejectBtn');
+const pendingFileList = document.getElementById('pendingFileList');
 const statusEl = document.getElementById('status');
 const statusDot = statusEl.querySelector('.dot');
 const statusLabel = statusEl.querySelector('.label');
@@ -1388,6 +1413,7 @@ function formatTime(ts) {
 function renderPendingBanner(state) {
   const files = (state && state.files) || 0;
   const hunks = (state && state.hunks) || 0;
+  const fileList = (state && Array.isArray(state.fileList)) ? state.fileList : [];
   if (hunks === 0 || files === 0) {
     pendingBanner.classList.remove('visible');
     return;
@@ -1400,6 +1426,56 @@ function renderPendingBanner(state) {
     + ' across ' + files + ' file' + (files === 1 ? '' : 's');
   pendingSummary.textContent = state.latestSummary || '';
   pendingSummary.style.display = state.latestSummary ? '' : 'none';
+  renderPendingFileList(fileList);
+}
+
+function renderPendingFileList(fileList) {
+  pendingFileList.innerHTML = '';
+  if (!fileList.length) return;
+  fileList.forEach((f) => {
+    const row = document.createElement('div');
+    row.className = 'file-row';
+    row.title = 'Click to open the diff for ' + f.path;
+
+    const fname = document.createElement('div');
+    fname.className = 'fname';
+    const base = document.createElement('span');
+    base.className = 'basename';
+    base.textContent = f.name || f.path;
+    fname.appendChild(base);
+    // Show parent directory dimmed if the path is more than just a basename.
+    const slashIdx = (f.path || '').lastIndexOf('/');
+    if (slashIdx > 0) {
+      const dir = document.createElement('span');
+      dir.className = 'dir';
+      dir.textContent = f.path.slice(0, slashIdx);
+      fname.appendChild(dir);
+    }
+    row.appendChild(fname);
+
+    if (f.isNewFile) {
+      const newBadge = document.createElement('span');
+      newBadge.className = 'badge new';
+      newBadge.textContent = 'new';
+      row.appendChild(newBadge);
+    }
+    if (f.pendingHunks > 0) {
+      const b = document.createElement('span');
+      b.className = 'badge pending';
+      b.textContent = f.pendingHunks + ' pending';
+      row.appendChild(b);
+    } else if ((f.acceptedHunks || 0) + (f.rejectedHunks || 0) > 0) {
+      const b = document.createElement('span');
+      b.className = 'badge done';
+      b.textContent = 'decided';
+      row.appendChild(b);
+    }
+
+    row.addEventListener('click', () => {
+      vscode.postMessage({ type: 'review-edits', payload: { uri: f.uri } });
+    });
+    pendingFileList.appendChild(row);
+  });
 }
 
 function renderHistory() {
@@ -2728,6 +2804,10 @@ cfgBtn.addEventListener('click', () => vscode.postMessage({ type: 'open-config' 
 
 // Pending-edits banner: persistent controls for the queued edit set.
 pendingReviewBtn.addEventListener('click', () => vscode.postMessage({ type: 'review-edits' }));
+// Click the title to collapse/expand the changed-file list.
+pendingTitleRow.addEventListener('click', () => {
+  pendingBanner.classList.toggle('collapsed');
+});
 pendingAcceptBtn.addEventListener('click', () => {
   pendingAcceptBtn.disabled = true;
   pendingRejectBtn.disabled = true;
