@@ -314,6 +314,27 @@ class ThinkSplitter {
   }
 }
 
+/**
+ * DashScope's Qwen-thinking endpoint validates the request body by walking
+ * every assistant message and demanding that `reasoning_content` be present
+ * (even as an empty string) once thinking mode has been engaged anywhere in
+ * the session. Any missing field — whether on a turn that didn't think, on a
+ * pre-thinking-era message restored from disk, or on a partial turn left
+ * behind by a cancelled stream — trips the
+ *   400 The `reasoning_content` in the thinking mode must be passed back
+ *       to the API.
+ * response. We backfill an empty string when the field is missing so the
+ * request always validates while preserving any captured chain-of-thought.
+ */
+function normalizeReasoningContent(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((m) => {
+    if (m.role !== 'assistant') return m;
+    const am = m as ChatMessage & { reasoning_content?: unknown };
+    if (typeof am.reasoning_content === 'string') return m;
+    return { ...m, reasoning_content: '' } as ChatMessage;
+  });
+}
+
 export class OpenAIClient {
   private client: OpenAI;
 
@@ -352,11 +373,25 @@ export class OpenAIClient {
       }
     });
 
+    // DashScope / Qwen-thinking strictly enforces that any assistant message
+    // returned by a thinking model must round-trip the `reasoning_content`
+    // field on subsequent requests — the server replies with
+    //   400 The `reasoning_content` in the thinking mode must be passed back
+    //       to the API.
+    // when the field is missing on ANY assistant message in the history. We
+    // already attach it on freshly-streamed turns (see AgentLoop), but stale
+    // sessions, mid-stream cancellations, and turns where the model chose not
+    // to think can all leave the field absent. Backfill an empty string here
+    // so the request body is always shape-correct without losing the original
+    // chain-of-thought when one was captured. Other OpenAI-compatible servers
+    // simply ignore unknown fields, so this is safe to send unconditionally.
+    const safeMessages = normalizeReasoningContent(messages);
+
     try {
       const stream = await this.client.chat.completions.create(
         {
           model: this.config.model,
-          messages,
+          messages: safeMessages,
           tools: tools.length ? tools : undefined,
           tool_choice: tools.length ? 'auto' : undefined,
           temperature: this.config.temperature,
