@@ -75,9 +75,37 @@ npm run package | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "esbuild bundle failed." }
 
 # ---- vsce package --------------------------------------------------------
-Write-Host "[pack] vsce package..." -ForegroundColor Yellow
-& $vsceCmd package --no-dependencies --allow-missing-repository --skip-license | Out-Host
-if ($LASTEXITCODE -ne 0) { throw "vsce package failed." }
+# vsce 拒绝 README 里所有 <img src="*.svg">（除少数 badge 源），所以打包前
+# 临时把 README 里指向 .svg 的 <img> 标签删掉，打完包再恢复。
+$repoRootStr  = [string]$repoRoot
+$readmePath   = [System.IO.Path]::Combine($repoRootStr, "README.md")
+$readmeBackup = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "burstcode-README.md.packbak")
+$swappedReadme = $false
+if ([System.IO.File]::Exists($readmePath)) {
+  [System.IO.File]::Copy($readmePath, $readmeBackup, $true)
+  $swappedReadme = $true
+  $orig = [System.IO.File]::ReadAllText($readmePath)
+  if ($null -eq $orig) { $orig = "" }
+  $imgPattern = '<img\b[^>]*?src="[^"]*\.svg"[^>]*?>'
+  $rxOpts = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline
+  $stripped = [System.Text.RegularExpressions.Regex]::Replace($orig, $imgPattern, '', $rxOpts)
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($readmePath, $stripped, $utf8NoBom)
+  $removed = ($orig.Length - $stripped.Length)
+  Write-Host "[pack] README.md: stripped SVG <img> tags ($removed chars)." -ForegroundColor DarkGray
+}
+
+try {
+  Write-Host "[pack] vsce package..." -ForegroundColor Yellow
+  & $vsceCmd package --no-dependencies --allow-missing-repository --skip-license | Out-Host
+  if ($LASTEXITCODE -ne 0) { throw "vsce package failed." }
+}
+finally {
+  if ($swappedReadme -and (Test-Path $readmeBackup)) {
+    Move-Item -Path $readmeBackup -Destination $readmePath -Force
+    Write-Host "[pack] README.md restored." -ForegroundColor DarkGray
+  }
+}
 
 # ---- report newest .vsix -------------------------------------------------
 $vsix = Get-ChildItem -Path $repoRoot -Filter "*.vsix" -File |
