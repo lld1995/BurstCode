@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -408,6 +408,26 @@
           "type": "number",
           "default": 60000,
           "description": "Per-test execution timeout (ms). The runner is killed and recorded as 'error: timed out' if it exceeds this duration."
+        },
+        "burstcode.shell.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow the agent to execute shell commands via the run_shell tool. Disable to remove the tool from the agent's toolbox entirely (existing chats won't be able to spawn processes)."
+        },
+        "burstcode.shell.autoApprove": {
+          "type": "boolean",
+          "default": false,
+          "description": "Skip the per-command approval prompt and execute every run_shell call immediately. Convenient for trusted local workflows; LEAVE OFF unless you understand the risk — the agent runs with the same privileges as VS Code."
+        },
+        "burstcode.shell.defaultTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "description": "Default timeout (ms) for a single run_shell invocation when the model does not specify one. Hard cap is 600000 (10 minutes). Processes that exceed the timeout are killed and the call returns isError=true."
+        },
+        "burstcode.shell.maxOutputBytes": {
+          "type": "number",
+          "default": 32768,
+          "description": "Maximum bytes of stdout / stderr (each, separately) returned to the agent per run_shell call. Output past this cap is truncated; redirect to a file inside the workspace and read_file it back if you need the full transcript."
         }
       }
     }

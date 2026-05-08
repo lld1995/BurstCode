@@ -26,6 +26,7 @@ import { buildLangTools } from '../agent/tools/lang';
 import { buildEditTools, AskUserSpec } from '../agent/tools/edits';
 import { buildPlanTool, PlanStep } from '../agent/tools/plan';
 import { buildLessonTools } from '../agent/tools/lessons';
+import { buildShellTools } from '../agent/tools/shell';
 import { LessonStore, renderLessonsBlock } from '../memory/LessonStore';
 import { CheckpointInfo, GitCheckpoint } from '../git/GitCheckpoint';
 import {
@@ -623,6 +624,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ...buildLspTools(bridge, this.depGuard),
       ...buildLangTools(),
       ...buildEditTools(this.applier, askUser),
+      ...buildShellTools({ askUser }),
       buildPlanTool(onPlanUpdate),
       ...buildLessonTools(this.lessons, (list) => {
         // Lessons are read into the system prompt at run START. Mid-run
