@@ -1,9 +1,5 @@
 import * as vscode from 'vscode';
-import {
-  getActiveEndpointName,
-  getActiveModelName,
-  getBackgroundProfile
-} from '../llm/OpenAIClient';
+import { readChatProfile, readBackgroundProfile } from '../llm/OpenAIClient';
 import type { ExplorerStatus } from '../background/BackgroundExplorer';
 
 type NodeKind = 'group' | 'leaf';
@@ -69,7 +65,6 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     this.configSub = vscode.workspace.onDidChangeConfiguration((e) => {
       if (
         e.affectsConfiguration('burstcode.llm') ||
-        e.affectsConfiguration('burstcode.profiles') ||
         e.affectsConfiguration('burstcode.background') ||
         e.affectsConfiguration('burstcode.shell')
       ) {
@@ -97,9 +92,9 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
   }
 
   private buildRoot(): BasicNode[] {
-    const chatEndpoint = getActiveEndpointName();
-    const chatModel = getActiveModelName();
-    const bgProfile = getBackgroundProfile();
+    const chatProfile = readChatProfile();
+    const chatModel = chatProfile.model || chatProfile.models[0] || '';
+    const bgProfile = readBackgroundProfile();
     const bg = vscode.workspace.getConfiguration('burstcode.background');
     const shell = vscode.workspace.getConfiguration('burstcode.shell');
 
@@ -114,17 +109,10 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     const phaseLabel = formatPhase(status?.phase ?? 'unknown', bgEnabled);
     const version = String(this.context.extension.packageJSON?.version ?? '');
 
-    const chatPair =
-      chatEndpoint && chatModel
-        ? `${chatEndpoint} · ${chatModel}`
-        : chatModel
-          ? chatModel
-          : '';
+    const chatPair = chatModel || '';
     const bgPair = bgProfile.inherit
       ? 'inherit chat'
-      : bgProfile.endpoint && bgProfile.model
-        ? `${bgProfile.endpoint} · ${bgProfile.model}`
-        : bgProfile.endpoint || bgProfile.model || 'inherit chat';
+      : bgProfile.model || bgProfile.models[0] || 'inherit chat';
 
     // ---------- Models ----------
     const modelsGroup = new BasicNode('group', 'Models', {
@@ -137,7 +125,7 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
         description: chatPair || 'pick one',
         icon: chatModel ? 'comment-discussion' : 'warning',
         tooltip: chatModel
-          ? `Chat model: ${chatPair}\nClick to switch.`
+          ? `Chat model: ${chatPair}\nbaseURL: ${chatProfile.baseURL || '(unset)'}\nClick to switch.`
           : 'No active chat model — click to pick one.',
         command: { command: 'burstcode.selectModel', title: 'Select Chat Model' }
       }),
@@ -152,13 +140,22 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
           title: 'Select Background Model'
         }
       }),
-      new BasicNode('leaf', 'Manage endpoints…', {
-        description: 'baseURL / apiKey / models',
+      new BasicNode('leaf', 'Chat profile settings…', {
+        description: 'baseURL / apiKey / model',
         icon: 'globe',
         command: {
           command: 'workbench.action.openSettings',
-          title: 'Open Endpoint Settings',
-          arguments: ['burstcode.llm.endpoints']
+          title: 'Open Chat Profile Settings',
+          arguments: ['burstcode.llm.chat']
+        }
+      }),
+      new BasicNode('leaf', 'Background profile settings…', {
+        description: 'inherit / baseURL / apiKey / model',
+        icon: 'globe',
+        command: {
+          command: 'workbench.action.openSettings',
+          title: 'Open Background Profile Settings',
+          arguments: ['burstcode.llm.background']
         }
       })
     ];

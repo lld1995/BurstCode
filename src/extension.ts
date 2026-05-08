@@ -7,13 +7,13 @@ import { DiffPreview } from './edits/DiffPreview';
 import { GitCheckpoint } from './git/GitCheckpoint';
 import { Logger } from './util/Logger';
 import {
-  readEndpoints,
-  fetchEndpointModels,
-  setActiveSelection,
-  setBackgroundProfile,
-  getActiveEndpointName,
-  getActiveModelName,
-  getBackgroundProfile
+  readChatProfile,
+  readBackgroundProfile,
+  setChatModel,
+  addChatModel,
+  updateBackgroundProfile,
+  addBackgroundModel,
+  fetchProfileModels
 } from './llm/OpenAIClient';
 import { WorkspaceIndex } from './context/WorkspaceIndex';
 import { BackgroundExplorer, ExplorerStatus } from './background/BackgroundExplorer';
@@ -99,79 +99,82 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     }),
     vscode.commands.registerCommand('burstcode.selectModel', async () => {
-      const endpoints = readEndpoints();
-      type Item = vscode.QuickPickItem & { endpoint: string; model: string };
-      const activeEp = getActiveEndpointName();
-      const activeModel = getActiveModelName();
+      const chat = readChatProfile();
+      type Item = vscode.QuickPickItem & { action?: 'pick' | 'fetch' | 'add'; model?: string };
       const items: Item[] = [];
-      for (const ep of endpoints) {
+      if (chat.models.length > 0) {
         items.push({
-          label: ep.name,
-          kind: vscode.QuickPickItemKind.Separator,
-          endpoint: ep.name,
-          model: ''
+          label: 'Stored models',
+          kind: vscode.QuickPickItemKind.Separator
         });
-        for (const m of ep.models) {
+        for (const m of chat.models) {
           items.push({
             label: m,
-            description: ep.name === activeEp && m === activeModel ? '(active)' : '',
-            detail: ep.baseURL,
-            endpoint: ep.name,
+            description: m === chat.model ? '(active)' : '',
+            detail: chat.baseURL,
+            action: 'pick',
             model: m
           });
         }
-        items.push({
-          label: '$(cloud-download) Fetch models from this endpoint',
-          description: ep.baseURL,
-          endpoint: ep.name,
-          model: '__fetch__'
-        });
-        items.push({
-          label: '$(add) Add custom model id...',
-          endpoint: ep.name,
-          model: '__add__'
-        });
       }
+      items.push({
+        label: '$(cloud-download) Fetch models from /v1/models',
+        description: chat.baseURL || '(set baseURL first)',
+        action: 'fetch'
+      });
+      items.push({
+        label: '$(add) Add custom model id…',
+        action: 'add'
+      });
       const picked = await vscode.window.showQuickPick(items, {
-        title: 'BurstCode: Select Active Model',
-        placeHolder: 'Pick a model, fetch from /v1/models, or add one manually'
+        title: 'BurstCode: Select Chat Model',
+        placeHolder: 'Pick a stored model, fetch from /v1/models, or add manually'
       });
       if (!picked) return;
-      if (picked.model === '__fetch__') {
-        const ep = endpoints.find((e) => e.name === picked.endpoint);
-        if (!ep) return;
+      if (picked.action === 'fetch') {
+        if (!chat.baseURL) {
+          vscode.window.showWarningMessage('BurstCode: set burstcode.llm.chat.baseURL before fetching models.');
+          return;
+        }
         try {
           const ids = await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: `Fetching models from ${ep.name}...` },
-            () => fetchEndpointModels(ep)
+            { location: vscode.ProgressLocation.Notification, title: `Fetching models from ${chat.baseURL}…` },
+            () =>
+              fetchProfileModels({
+                baseURL: chat.baseURL,
+                apiKey: chat.apiKey,
+                allowSelfSignedCerts: chat.allowSelfSignedCerts
+              })
           );
           if (ids.length === 0) {
-            vscode.window.showWarningMessage(`BurstCode: ${ep.name} returned no models.`);
+            vscode.window.showWarningMessage(`BurstCode: ${chat.baseURL} returned no models.`);
             return;
           }
           const sub = await vscode.window.showQuickPick(ids, {
-            title: `BurstCode: Models on ${ep.name}`,
+            title: 'BurstCode: Models on chat baseURL',
             placeHolder: 'Pick a model to activate'
           });
           if (sub) {
-            await setActiveSelection(ep.name, sub);
-            vscode.window.showInformationMessage(`BurstCode: switched to "${ep.name} / ${sub}".`);
+            await setChatModel(sub);
+            vscode.window.showInformationMessage(`BurstCode: chat model set to "${sub}".`);
           }
         } catch (err) {
           vscode.window.showErrorMessage(`BurstCode: failed to fetch models — ${String((err as Error).message ?? err)}`);
         }
-      } else if (picked.model === '__add__') {
+      } else if (picked.action === 'add') {
         const id = await vscode.window.showInputBox({
-          title: `BurstCode: Add model under ${picked.endpoint}`,
+          title: 'BurstCode: Add chat model id',
           placeHolder: 'e.g. qwen2.5-coder:7b'
         });
-        if (id && id.trim()) {
-          await setActiveSelection(picked.endpoint, id.trim());
-          vscode.window.showInformationMessage(`BurstCode: switched to "${picked.endpoint} / ${id.trim()}".`);
+        const trimmed = id?.trim();
+        if (trimmed) {
+          await addChatModel(trimmed);
+          await setChatModel(trimmed);
+          vscode.window.showInformationMessage(`BurstCode: chat model set to "${trimmed}".`);
         }
-      } else if (picked.model) {
-        await setActiveSelection(picked.endpoint, picked.model);
-        vscode.window.showInformationMessage(`BurstCode: switched to "${picked.endpoint} / ${picked.model}".`);
+      } else if (picked.action === 'pick' && picked.model) {
+        await setChatModel(picked.model);
+        vscode.window.showInformationMessage(`BurstCode: chat model set to "${picked.model}".`);
       }
     }),
     vscode.commands.registerCommand('burstcode.restoreCheckpoint', () =>
@@ -225,13 +228,10 @@ export function activate(context: vscode.ExtensionContext): void {
       const cfg = vscode.workspace.getConfiguration('burstcode.background');
       const isOn = cfg.get<boolean>('enabled') ?? false;
       const status = backgroundExplorer.getStatus();
-      const profile = getBackgroundProfile();
-      const epLabel = profile.inherit
-        ? '(inherit chat)'
-        : profile.endpoint || '(chat endpoint)';
+      const profile = readBackgroundProfile();
       const modelLabel = profile.inherit
         ? '(inherit chat)'
-        : profile.model || '(endpoint default)';
+        : profile.model || profile.models[0] || '(chat default)';
       type Item = vscode.QuickPickItem & { id: string };
       const items: Item[] = [
         {
@@ -242,7 +242,7 @@ export function activate(context: vscode.ExtensionContext): void {
         {
           id: 'model',
           label: '$(circuit-board) Select background model\u2026',
-          description: `${epLabel} \u00b7 ${modelLabel}`
+          description: modelLabel
         },
         {
           id: 'toggle',
@@ -311,87 +311,98 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.commands.registerCommand('burstcode.background.selectModel', async () => {
-      const endpoints = readEndpoints();
-      type Item = vscode.QuickPickItem & { endpoint: string; model: string };
-      const profile = getBackgroundProfile();
-      const currentEp = profile.inherit ? '' : profile.endpoint;
-      const currentModel = profile.inherit ? '' : profile.model;
+      const profile = readBackgroundProfile();
+      const chat = readChatProfile();
+      type Item = vscode.QuickPickItem & { action?: 'inherit' | 'pick' | 'fetch' | 'add'; model?: string };
       const items: Item[] = [
         {
           label: '$(arrow-swap) Inherit from chat',
           description: profile.inherit
-            ? '(active) Use whichever model the chat panel is on'
-            : 'Use whichever model the chat panel is on',
-          endpoint: '__inherit__',
-          model: ''
+            ? '(active) Reuse the chat profile'
+            : 'Reuse the chat profile',
+          action: 'inherit'
         }
       ];
-      for (const ep of endpoints) {
+      if (profile.models.length > 0) {
         items.push({
-          label: ep.name,
-          kind: vscode.QuickPickItemKind.Separator,
-          endpoint: ep.name,
-          model: ''
+          label: 'Background-only stored models',
+          kind: vscode.QuickPickItemKind.Separator
         });
-        for (const m of ep.models) {
+        for (const m of profile.models) {
           items.push({
             label: m,
             description:
-              !profile.inherit && ep.name === currentEp && m === currentModel ? '(active)' : '',
-            detail: ep.baseURL,
-            endpoint: ep.name,
+              !profile.inherit && m === profile.model ? '(active)' : '',
+            detail: profile.baseURL || `(inherit ${chat.baseURL})`,
+            action: 'pick',
             model: m
           });
         }
-        items.push({
-          label: '$(cloud-download) Fetch models from this endpoint',
-          description: ep.baseURL,
-          endpoint: ep.name,
-          model: '__fetch__'
-        });
       }
+      const probeBaseURL = profile.baseURL || chat.baseURL;
+      items.push({
+        label: '$(cloud-download) Fetch models from /v1/models',
+        description: probeBaseURL || '(set baseURL first)',
+        action: 'fetch'
+      });
+      items.push({
+        label: '$(add) Add custom background model id…',
+        action: 'add'
+      });
       const picked = await vscode.window.showQuickPick(items, {
         title: 'BurstCode: Background Explorer Model',
         placeHolder: 'Pick a model for the background loop, or inherit from chat'
       });
       if (!picked) return;
-      if (picked.endpoint === '__inherit__') {
-        await setBackgroundProfile({ inherit: true, endpoint: '', model: '' });
+      if (picked.action === 'inherit') {
+        await updateBackgroundProfile({ inherit: true });
         vscode.window.showInformationMessage('BurstCode: background explorer will inherit the chat model.');
         return;
       }
-      if (picked.model === '__fetch__') {
-        const ep = endpoints.find((e) => e.name === picked.endpoint);
-        if (!ep) return;
+      if (picked.action === 'fetch') {
+        if (!probeBaseURL) {
+          vscode.window.showWarningMessage('BurstCode: set a baseURL on the background or chat profile before fetching.');
+          return;
+        }
         try {
           const ids = await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: `Fetching models from ${ep.name}...` },
-            () => fetchEndpointModels(ep)
+            { location: vscode.ProgressLocation.Notification, title: `Fetching models from ${probeBaseURL}…` },
+            () =>
+              fetchProfileModels({
+                baseURL: probeBaseURL,
+                apiKey: profile.apiKey || chat.apiKey,
+                allowSelfSignedCerts: profile.allowSelfSignedCerts || chat.allowSelfSignedCerts
+              })
           );
           if (ids.length === 0) {
-            vscode.window.showWarningMessage(`BurstCode: ${ep.name} returned no models.`);
+            vscode.window.showWarningMessage(`BurstCode: ${probeBaseURL} returned no models.`);
             return;
           }
           const sub = await vscode.window.showQuickPick(ids, {
-            title: `BurstCode: Models on ${ep.name}`,
+            title: 'BurstCode: Models on background baseURL',
             placeHolder: 'Pick a model for the background explorer'
           });
           if (sub) {
-            await setBackgroundProfile({ inherit: false, endpoint: ep.name, model: sub });
-            vscode.window.showInformationMessage(`BurstCode: background explorer using "${ep.name} / ${sub}".`);
+            await updateBackgroundProfile({ inherit: false, model: sub });
+            vscode.window.showInformationMessage(`BurstCode: background explorer using "${sub}".`);
           }
         } catch (err) {
           vscode.window.showErrorMessage(`BurstCode: failed to fetch models — ${String((err as Error).message ?? err)}`);
         }
-      } else if (picked.model) {
-        await setBackgroundProfile({
-          inherit: false,
-          endpoint: picked.endpoint,
-          model: picked.model
+      } else if (picked.action === 'add') {
+        const id = await vscode.window.showInputBox({
+          title: 'BurstCode: Add background model id',
+          placeHolder: 'e.g. qwen2.5-coder:7b'
         });
-        vscode.window.showInformationMessage(
-          `BurstCode: background explorer using "${picked.endpoint} / ${picked.model}".`
-        );
+        const trimmed = id?.trim();
+        if (trimmed) {
+          await addBackgroundModel(trimmed);
+          await updateBackgroundProfile({ inherit: false, model: trimmed });
+          vscode.window.showInformationMessage(`BurstCode: background explorer using "${trimmed}".`);
+        }
+      } else if (picked.action === 'pick' && picked.model) {
+        await updateBackgroundProfile({ inherit: false, model: picked.model });
+        vscode.window.showInformationMessage(`BurstCode: background explorer using "${picked.model}".`);
       }
     })
   );
@@ -402,3 +413,7 @@ export function activate(context: vscode.ExtensionContext): void {
 export function deactivate(): void {
   // disposables handled via context.subscriptions
 }
+
+// (Legacy settings migration intentionally removed — the new flat
+// `burstcode.llm.chat.*` / `burstcode.llm.background.*` keys are the only
+// supported schema.)

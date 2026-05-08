@@ -14,220 +14,210 @@ export interface LLMConfig {
 }
 
 /**
- * An endpoint = a remote server (baseURL + apiKey + connection options).
- * Models are tracked separately so the user can pick any model the endpoint
- * exposes (via /v1/models) or supplement the list manually.
+ * A profile = a complete, self-contained LLM configuration. Two profiles are
+ * tracked as separate top-level settings so the VS Code Settings UI can
+ * render an inline form for each (instead of falling back to "Edit in
+ * settings.json" the way an array-of-objects schema does):
+ *
+ *   - `burstcode.llm.chat`        — foreground (chat panel)
+ *   - `burstcode.llm.background`  — idle-time explorer (with `inherit`)
+ *
+ * Empty string fields on the background profile fall back to the chat
+ * profile so the user can override only the parts they care about.
  */
-export interface LLMEndpoint {
-  name: string;
+export interface LLMProfile {
   baseURL: string;
   apiKey: string;
+  model: string;
   temperature: number;
   contextWindow: number;
   allowSelfSignedCerts: boolean;
-  /** User-curated model list for this endpoint (manual additions). */
+  /** User-curated model list shown in the picker alongside fetched ones. */
   models: string[];
 }
 
+export interface BackgroundProfile extends LLMProfile {
+  /** When true, the explorer ignores its own fields and uses the chat profile. */
+  inherit: boolean;
+}
+
 const DEFAULT_BASE_URL = 'http://localhost:11434/v1';
-const DEFAULT_API_KEY = 'none';
+const DEFAULT_API_KEY = '';
 const DEFAULT_MODEL = 'qwen2.5-coder:7b';
 const DEFAULT_TEMPERATURE = 0.2;
 const DEFAULT_CONTEXT_WINDOW = 32768;
-// Use the URL itself as the default endpoint name so the picker is
-// self-describing on a fresh install (e.g. "http://localhost:11434/v1").
-const DEFAULT_ENDPOINT_NAME = DEFAULT_BASE_URL;
 
 /**
- * Read every configured endpoint from `burstcode.llm.endpoints`. If the user
- * has not added any yet, return a single sensible local default so the
- * extension is usable on a fresh install.
+ * Read every field of a profile via individual flat-key lookups
+ * (`burstcode.llm.<scope>.baseURL`, …). Each field is declared as its own
+ * top-level configuration property in package.json so the VS Code Settings
+ * UI can render an inline editor for it; storing the whole profile as a
+ * single object would force users to fall back to "Edit in settings.json".
+ *
+ * `cfg.get('chat.baseURL')` also descends into a legacy object form (where
+ * `burstcode.llm.chat` is set as `{ baseURL: ... }` in settings.json), so
+ * users coming from an earlier preview keep working until the activation-
+ * time migration cleans things up.
  */
-export function readEndpoints(): LLMEndpoint[] {
+function readProfile(scope: 'chat' | 'background', defaults: Partial<LLMProfile> = {}): LLMProfile {
   const cfg = vscode.workspace.getConfiguration('burstcode.llm');
-  const out: LLMEndpoint[] = [];
-  const seen = new Set<string>();
+  const baseURL = cfg.get<string>(`${scope}.baseURL`);
+  const apiKey = cfg.get<string>(`${scope}.apiKey`);
+  const model = cfg.get<string>(`${scope}.model`);
+  const temperature = cfg.get<number>(`${scope}.temperature`);
+  const contextWindow = cfg.get<number>(`${scope}.contextWindow`);
+  const allowSelfSignedCerts = cfg.get<boolean>(`${scope}.allowSelfSignedCerts`);
+  const models = cfg.get<string[]>(`${scope}.models`);
 
-  const rawEndpoints = cfg.get<Array<Partial<LLMEndpoint>>>('endpoints') ?? [];
-  for (const r of rawEndpoints) {
-    if (!r || typeof r !== 'object') continue;
-    const name = typeof r.name === 'string' ? r.name.trim() : '';
-    if (!name || seen.has(name)) continue;
-    seen.add(name);
-    out.push({
-      name,
-      baseURL: typeof r.baseURL === 'string' && r.baseURL ? r.baseURL : DEFAULT_BASE_URL,
-      apiKey: typeof r.apiKey === 'string' && r.apiKey ? r.apiKey : DEFAULT_API_KEY,
-      contextWindow:
-        typeof r.contextWindow === 'number' && r.contextWindow > 0
-          ? r.contextWindow
-          : DEFAULT_CONTEXT_WINDOW,
-      temperature: typeof r.temperature === 'number' ? r.temperature : DEFAULT_TEMPERATURE,
-      allowSelfSignedCerts: r.allowSelfSignedCerts === true,
-      models: Array.isArray(r.models)
-        ? r.models
-            .filter((m): m is string => typeof m === 'string' && !!m.trim())
-            .map((m) => m.trim())
-        : []
-    });
-  }
+  return {
+    baseURL: typeof baseURL === 'string' ? baseURL.trim() : (defaults.baseURL ?? ''),
+    apiKey: typeof apiKey === 'string' ? apiKey : (defaults.apiKey ?? ''),
+    model: typeof model === 'string' ? model.trim() : (defaults.model ?? ''),
+    temperature:
+      typeof temperature === 'number' ? temperature : (defaults.temperature ?? DEFAULT_TEMPERATURE),
+    contextWindow:
+      typeof contextWindow === 'number' && contextWindow > 0
+        ? contextWindow
+        : (defaults.contextWindow ?? DEFAULT_CONTEXT_WINDOW),
+    allowSelfSignedCerts:
+      typeof allowSelfSignedCerts === 'boolean'
+        ? allowSelfSignedCerts
+        : (defaults.allowSelfSignedCerts === true),
+    models: Array.isArray(models)
+      ? models
+          .filter((m): m is string => typeof m === 'string' && !!m.trim())
+          .map((m) => m.trim())
+      : (defaults.models ?? [])
+  };
+}
 
-  if (out.length === 0) {
-    out.push({
-      name: DEFAULT_ENDPOINT_NAME,
-      baseURL: DEFAULT_BASE_URL,
-      apiKey: DEFAULT_API_KEY,
-      contextWindow: DEFAULT_CONTEXT_WINDOW,
-      temperature: DEFAULT_TEMPERATURE,
-      allowSelfSignedCerts: false,
-      models: [DEFAULT_MODEL]
-    });
-  }
+/** Read the chat profile, applying sensible defaults so a fresh install works. */
+export function readChatProfile(): LLMProfile {
+  return readProfile('chat', {
+    baseURL: DEFAULT_BASE_URL,
+    apiKey: DEFAULT_API_KEY,
+    model: DEFAULT_MODEL
+  });
+}
 
-  return out;
+/** Read the background profile (raw — does NOT apply `inherit` fallback). */
+export function readBackgroundProfile(): BackgroundProfile {
+  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
+  const inheritRaw = cfg.get<boolean>('background.inherit');
+  // Default to inherit:true so a never-touched install just follows chat.
+  const inherit = typeof inheritRaw === 'boolean' ? inheritRaw : true;
+  return { ...readProfile('background'), inherit };
+}
+
+export function readLLMConfig(): LLMConfig {
+  const p = readChatProfile();
+  return {
+    baseURL: p.baseURL || DEFAULT_BASE_URL,
+    apiKey: p.apiKey,
+    model: p.model || p.models[0] || DEFAULT_MODEL,
+    temperature: p.temperature,
+    contextWindow: p.contextWindow,
+    allowSelfSignedCerts: p.allowSelfSignedCerts
+  };
+}
+
+/**
+ * Resolve the background profile to a fully-specified LLMConfig. Empty
+ * string/zero fields fall back to the chat profile so users can override
+ * only the model (or only the baseURL) without re-typing everything.
+ */
+export function resolveBackgroundLLMConfig(): LLMConfig {
+  const bg = readBackgroundProfile();
+  if (bg.inherit) return readLLMConfig();
+  const chat = readLLMConfig();
+  return {
+    baseURL: bg.baseURL || chat.baseURL,
+    apiKey: bg.apiKey || chat.apiKey,
+    model: bg.model || bg.models[0] || chat.model,
+    temperature: typeof bg.temperature === 'number' ? bg.temperature : chat.temperature,
+    contextWindow: bg.contextWindow > 0 ? bg.contextWindow : chat.contextWindow,
+    allowSelfSignedCerts: bg.allowSelfSignedCerts
+  };
 }
 
 /* ------------------------------------------------------------------ */
-/* Active profile (chat) and background profile                       */
+/* Mutation helpers — every write goes through `cfg.update(..., Global)` */
 /* ------------------------------------------------------------------ */
 
 /**
- * Profile = which (endpoint, model) the runtime should use right now. Two
- * profiles are tracked: `chat` (foreground panel) and `background`
- * (idle-time explorer). Each profile is just a pair of strings; everything
- * else — baseURL, apiKey, contextWindow, temperature, TLS — lives on the
- * referenced endpoint inside `burstcode.llm.endpoints`. The background
- * profile additionally has an `inherit` flag that pins it to whatever
- * `chat` is currently using.
+ * Write a partial profile patch one key at a time so each lands in
+ * settings.json under its own dotted path
+ * (e.g. `"burstcode.llm.chat.model": "..."`). Writing the whole profile as
+ * a single object would re-introduce the very shape the Settings UI can't
+ * edit inline.
  */
-export interface BackgroundProfile {
-  inherit: boolean;
-  endpoint: string;
-  model: string;
-}
-
-function readChatProfile(): { endpoint: string; model: string } {
-  const p = vscode.workspace.getConfiguration('burstcode.profiles');
-  return {
-    endpoint: (p.get<string>('chat.endpoint') ?? '').trim(),
-    model: (p.get<string>('chat.model') ?? '').trim()
-  };
-}
-
-export function getActiveEndpointName(): string | undefined {
-  const v = readChatProfile().endpoint;
-  return v || undefined;
-}
-
-export function getActiveModelName(): string | undefined {
-  const v = readChatProfile().model;
-  return v || undefined;
-}
-
-export function getActiveEndpoint(): LLMEndpoint {
-  const endpoints = readEndpoints();
-  const name = getActiveEndpointName();
-  return endpoints.find((e) => e.name === name) ?? endpoints[0];
-}
-
-/** Persist the user's active chat endpoint+model selection. */
-export async function setActiveSelection(endpointName: string, modelName: string): Promise<void> {
-  const profiles = vscode.workspace.getConfiguration('burstcode.profiles');
-  await profiles.update('chat.endpoint', endpointName, vscode.ConfigurationTarget.Global);
-  await profiles.update('chat.model', modelName, vscode.ConfigurationTarget.Global);
-}
-
-export function getBackgroundProfile(): BackgroundProfile {
-  const p = vscode.workspace.getConfiguration('burstcode.profiles');
-  return {
-    inherit: p.get<boolean>('background.inherit') ?? true,
-    endpoint: (p.get<string>('background.endpoint') ?? '').trim(),
-    model: (p.get<string>('background.model') ?? '').trim()
-  };
-}
-
-export async function setBackgroundProfile(
-  next: { inherit?: boolean; endpoint?: string; model?: string }
+async function writeProfilePatch(
+  scope: 'chat' | 'background',
+  patch: Partial<BackgroundProfile>
 ): Promise<void> {
-  const p = vscode.workspace.getConfiguration('burstcode.profiles');
-  if (typeof next.inherit === 'boolean') {
-    await p.update('background.inherit', next.inherit, vscode.ConfigurationTarget.Global);
-  }
-  if (typeof next.endpoint === 'string') {
-    await p.update('background.endpoint', next.endpoint, vscode.ConfigurationTarget.Global);
-  }
-  if (typeof next.model === 'string') {
-    await p.update('background.model', next.model, vscode.ConfigurationTarget.Global);
+  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue;
+    const value = Array.isArray(v) ? v.slice() : v;
+    await cfg.update(`${scope}.${k}`, value, vscode.ConfigurationTarget.Global);
   }
 }
 
-/** Resolve the background profile to a fully-specified LLMConfig. */
-export function resolveBackgroundLLMConfig(): LLMConfig {
-  const profile = getBackgroundProfile();
-  if (profile.inherit) return readLLMConfig();
-  const endpoints = readEndpoints();
-  const ep = endpoints.find((e) => e.name === profile.endpoint) ?? getActiveEndpoint();
-  const fallback = readLLMConfig();
-  const model = profile.model || ep.models[0] || fallback.model;
-  return {
-    baseURL: ep.baseURL,
-    apiKey: ep.apiKey,
-    model,
-    temperature: ep.temperature,
-    contextWindow: ep.contextWindow,
-    allowSelfSignedCerts: ep.allowSelfSignedCerts
-  };
+export async function updateChatProfile(patch: Partial<LLMProfile>): Promise<void> {
+  await writeProfilePatch('chat', patch);
 }
 
-/** Persist a manually-added model under the given endpoint (no-op if dup). */
-export async function addModelToEndpoint(endpointName: string, model: string): Promise<void> {
+export async function updateBackgroundProfile(
+  patch: Partial<BackgroundProfile>
+): Promise<void> {
+  await writeProfilePatch('background', patch);
+}
+
+export async function setChatModel(model: string): Promise<void> {
+  await updateChatProfile({ model: model.trim() });
+}
+
+export async function addChatModel(model: string): Promise<void> {
   const trimmed = model.trim();
   if (!trimmed) return;
-  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
-  const endpoints = readEndpoints();
-  // Materialise the endpoints array so legacy profile-only setups still get
-  // a writable endpoints[] entry to attach the new model to.
-  const next = endpoints.map((e) => ({
-    name: e.name,
-    baseURL: e.baseURL,
-    apiKey: e.apiKey,
-    contextWindow: e.contextWindow,
-    temperature: e.temperature,
-    allowSelfSignedCerts: e.allowSelfSignedCerts,
-    models: e.models.slice()
-  }));
-  const target = next.find((e) => e.name === endpointName);
-  if (!target) return;
-  if (!target.models.includes(trimmed)) target.models.push(trimmed);
-  await cfg.update('endpoints', next, vscode.ConfigurationTarget.Global);
+  const cur = readChatProfile();
+  if (cur.models.includes(trimmed)) return;
+  await updateChatProfile({ models: [...cur.models, trimmed] });
 }
 
-export async function removeModelFromEndpoint(endpointName: string, model: string): Promise<void> {
-  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
-  const endpoints = readEndpoints();
-  const next = endpoints.map((e) => ({
-    name: e.name,
-    baseURL: e.baseURL,
-    apiKey: e.apiKey,
-    contextWindow: e.contextWindow,
-    temperature: e.temperature,
-    allowSelfSignedCerts: e.allowSelfSignedCerts,
-    models: e.models.filter((m) => m !== model)
-  }));
-  await cfg.update('endpoints', next, vscode.ConfigurationTarget.Global);
+export async function removeChatModel(model: string): Promise<void> {
+  const cur = readChatProfile();
+  await updateChatProfile({ models: cur.models.filter((m) => m !== model) });
+}
+
+export async function addBackgroundModel(model: string): Promise<void> {
+  const trimmed = model.trim();
+  if (!trimmed) return;
+  const cur = readBackgroundProfile();
+  if (cur.models.includes(trimmed)) return;
+  await updateBackgroundProfile({ models: [...cur.models, trimmed] });
+}
+
+export async function removeBackgroundModel(model: string): Promise<void> {
+  const cur = readBackgroundProfile();
+  await updateBackgroundProfile({ models: cur.models.filter((m) => m !== model) });
 }
 
 /**
- * Probe the endpoint's `/models` listing (OpenAI-compatible). Returns model IDs
- * sorted alphabetically. Throws on transport / auth errors so callers can show
- * a meaningful message in the UI.
+ * Probe the profile's `/models` endpoint (OpenAI-compatible). Returns model
+ * IDs sorted alphabetically. Throws on transport/auth errors so callers can
+ * show a meaningful message in the UI.
  */
-export async function fetchEndpointModels(endpoint: LLMEndpoint): Promise<string[]> {
+export async function fetchProfileModels(profile: {
+  baseURL: string;
+  apiKey?: string;
+  allowSelfSignedCerts?: boolean;
+}): Promise<string[]> {
   const opts: ConstructorParameters<typeof OpenAI>[0] = {
-    baseURL: endpoint.baseURL,
-    apiKey: endpoint.apiKey || 'no-key'
+    baseURL: profile.baseURL,
+    apiKey: profile.apiKey || 'no-key'
   };
-  if (endpoint.allowSelfSignedCerts) {
+  if (profile.allowSelfSignedCerts) {
     opts.httpAgent = new https.Agent({ rejectUnauthorized: false });
   }
   const client = new OpenAI(opts);
@@ -237,19 +227,6 @@ export async function fetchEndpointModels(endpoint: LLMEndpoint): Promise<string
     .filter((id) => !!id);
   ids.sort((a, b) => a.localeCompare(b));
   return ids;
-}
-
-export function readLLMConfig(): LLMConfig {
-  const ep = getActiveEndpoint();
-  const model = getActiveModelName() || ep.models[0] || DEFAULT_MODEL;
-  return {
-    baseURL: ep.baseURL,
-    apiKey: ep.apiKey,
-    model,
-    temperature: ep.temperature,
-    contextWindow: ep.contextWindow,
-    allowSelfSignedCerts: ep.allowSelfSignedCerts
-  };
 }
 
 export type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;

@@ -6,7 +6,7 @@ import {
   ChatMessage,
   LLMConfig,
   OpenAIClient,
-  getBackgroundProfile,
+  readBackgroundProfile,
   resolveBackgroundLLMConfig
 } from '../llm/OpenAIClient';
 import { ChatViewProvider } from '../chat/ChatViewProvider';
@@ -254,7 +254,7 @@ export class BackgroundExplorer implements vscode.Disposable {
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (
           e.affectsConfiguration('burstcode.background') ||
-          e.affectsConfiguration('burstcode.profiles')
+          e.affectsConfiguration('burstcode.llm')
         ) {
           const wasEnabled = this.cfg.enabled;
           this.cfg = readConfig();
@@ -1519,11 +1519,11 @@ function renderIndexReadme(
   lines.push('');
   lines.push('- Toggle: `burstcode.background.enabled`');
   lines.push('- Idle threshold (ms): `burstcode.background.idleThresholdMs`');
-  const profile = getBackgroundProfile();
+  const profile = readBackgroundProfile();
   lines.push(
     profile.inherit
-      ? '- Model: inherits chat profile (`burstcode.profiles.chat.*`)'
-      : `- Model: \`${profile.endpoint || '(chat endpoint)'} · ${profile.model || '(endpoint default)'}\` (set via \`burstcode.profiles.background.*\`)`
+      ? '- Model: inherits chat profile (`burstcode.llm.chat`)'
+      : `- Model: \`${profile.model || profile.models[0] || '(chat default)'}\` (set via \`burstcode.llm.background\`)`
   );
   lines.push(`- Auto-run generated tests: \`burstcode.background.runGeneratedTests\` (currently ${cfg.runGeneratedTests ? 'on' : 'off'})`);
   lines.push('');

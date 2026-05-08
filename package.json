@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -161,91 +161,86 @@
     "configuration": {
       "title": "BurstCode",
       "properties": {
-        "burstcode.profiles.chat.endpoint": {
+        "burstcode.llm.chat.baseURL": {
+          "type": "string",
+          "default": "http://localhost:11434/v1",
+          "description": "Chat profile · OpenAI-compatible base URL (e.g. http://localhost:11434/v1)."
+        },
+        "burstcode.llm.chat.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Active endpoint name for the chat panel. Pick one from `burstcode.llm.endpoints`. Set automatically when you change the model in the chat picker."
+          "description": "Chat profile · API key (optional for most local servers)."
         },
-        "burstcode.profiles.chat.model": {
+        "burstcode.llm.chat.model": {
           "type": "string",
-          "default": "",
-          "description": "Active model id for the chat panel under the chosen endpoint."
+          "default": "qwen2.5-coder:7b",
+          "description": "Chat profile · active model id used for chat requests."
         },
-        "burstcode.profiles.background.inherit": {
+        "burstcode.llm.chat.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "description": "Chat profile · sampling temperature."
+        },
+        "burstcode.llm.chat.contextWindow": {
+          "type": "number",
+          "default": 32768,
+          "description": "Chat profile · total context window in tokens."
+        },
+        "burstcode.llm.chat.allowSelfSignedCerts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Chat profile · skip TLS certificate verification for the baseURL."
+        },
+        "burstcode.llm.chat.models": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Chat profile · manually-curated model ids shown in the picker alongside ids fetched from /v1/models."
+        },
+        "burstcode.llm.background.inherit": {
           "type": "boolean",
           "default": true,
-          "description": "When true, the Background Explorer uses the same endpoint+model as the chat profile. Set to false to pin the background loop to its own selection below."
+          "description": "Background profile · when true, the Background Explorer uses the same configuration as the chat profile. Uncheck to override the fields below."
         },
-        "burstcode.profiles.background.endpoint": {
+        "burstcode.llm.background.baseURL": {
           "type": "string",
           "default": "",
-          "description": "Endpoint name (from `burstcode.llm.endpoints`) to use for background analysis. Ignored when `burstcode.profiles.background.inherit` is true."
+          "description": "Background profile · OpenAI-compatible base URL. Leave empty to inherit from the chat profile when `inherit` is false."
         },
-        "burstcode.profiles.background.model": {
+        "burstcode.llm.background.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Model id to use for background analysis. Ignored when `burstcode.profiles.background.inherit` is true."
+          "description": "Background profile · API key. Leave empty to inherit from the chat profile when `inherit` is false."
         },
-        "burstcode.llm.endpoints": {
+        "burstcode.llm.background.model": {
+          "type": "string",
+          "default": "",
+          "description": "Background profile · model id used for background analysis. Leave empty to fall back to the first entry of `models`, then the chat model."
+        },
+        "burstcode.llm.background.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "description": "Background profile · sampling temperature."
+        },
+        "burstcode.llm.background.contextWindow": {
+          "type": "number",
+          "default": 32768,
+          "description": "Background profile · total context window in tokens."
+        },
+        "burstcode.llm.background.allowSelfSignedCerts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Background profile · skip TLS certificate verification for the baseURL."
+        },
+        "burstcode.llm.background.models": {
           "type": "array",
-          "default": [
-            {
-              "name": "http://localhost:11434/v1",
-              "baseURL": "http://localhost:11434/v1",
-              "apiKey": "",
-              "contextWindow": 32768,
-              "temperature": 0.2,
-              "allowSelfSignedCerts": false,
-              "models": []
-            }
-          ],
-          "description": "List of OpenAI-compatible endpoints. Each entry is a remote server (baseURL + apiKey). Models for each endpoint can be fetched live via /v1/models from the chat panel's model picker, or supplemented manually in the 'models' field below. The chat panel shows endpoints grouped in the picker.",
           "items": {
-            "type": "object",
-            "required": [
-              "name",
-              "baseURL"
-            ],
-            "properties": {
-              "name": {
-                "type": "string",
-                "default": "http://localhost:11434/v1",
-                "description": "Display name shown in the model picker. Defaults to the baseURL so the picker is self-describing."
-              },
-              "baseURL": {
-                "type": "string",
-                "default": "http://localhost:11434/v1",
-                "description": "OpenAI-compatible base URL (e.g. http://localhost:11434/v1)."
-              },
-              "apiKey": {
-                "type": "string",
-                "default": "",
-                "description": "API key (optional for most local servers)."
-              },
-              "contextWindow": {
-                "type": "number",
-                "default": 32768,
-                "description": "Total context window in tokens."
-              },
-              "temperature": {
-                "type": "number",
-                "default": 0.2
-              },
-              "allowSelfSignedCerts": {
-                "type": "boolean",
-                "default": false,
-                "description": "Skip TLS certificate verification for this endpoint's baseURL."
-              },
-              "models": {
-                "type": "array",
-                "description": "Manually-curated model ids for this endpoint. The picker shows these in addition to anything fetched from /v1/models.",
-                "items": {
-                  "type": "string"
-                },
-                "default": []
-              }
-            }
-          }
+            "type": "string"
+          },
+          "default": [],
+          "description": "Background profile · manually-curated model ids for the picker."
         },
         "burstcode.git.autoCheckpoint": {
           "type": "boolean",

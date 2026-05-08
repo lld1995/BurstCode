@@ -5,13 +5,11 @@ import { HunkApplier, PendingState } from '../edits/HunkApplier';
 import {
   OpenAIClient,
   readLLMConfig,
-  readEndpoints,
-  getActiveEndpointName,
-  getActiveModelName,
-  setActiveSelection,
-  addModelToEndpoint,
-  removeModelFromEndpoint,
-  fetchEndpointModels,
+  readChatProfile,
+  setChatModel,
+  addChatModel,
+  removeChatModel,
+  fetchProfileModels,
   ChatMessage
 } from '../llm/OpenAIClient';
 import { LspBridge } from '../lsp/LspBridge';
@@ -74,10 +72,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.sessions = new SessionStore(context.workspaceState);
     this.lessons = new LessonStore(context.workspaceState);
     this.configSub = vscode.workspace.onDidChangeConfiguration((e) => {
-      if (
-        e.affectsConfiguration('burstcode.llm') ||
-        e.affectsConfiguration('burstcode.profiles')
-      ) {
+      if (e.affectsConfiguration('burstcode.llm')) {
         this.broadcastModels();
         this.broadcastContextUsage();
       }
@@ -186,23 +181,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private broadcastModels(): void {
     if (!this.view) return;
-    const endpoints = readEndpoints();
-    const activeEndpoint = getActiveEndpointName();
-    const resolvedActiveEp =
-      endpoints.find((e) => e.name === activeEndpoint)?.name ?? endpoints[0]?.name ?? '';
-    const resolvedActiveModel =
-      getActiveModelName() ??
-      endpoints.find((e) => e.name === resolvedActiveEp)?.models[0] ??
-      '';
+    const chat = readChatProfile();
+    const activeModel = chat.model || chat.models[0] || '';
     this.post({
       type: 'models',
       payload: {
-        active: { endpoint: resolvedActiveEp, model: resolvedActiveModel },
-        endpoints: endpoints.map((e) => ({
-          name: e.name,
-          baseURL: e.baseURL,
-          models: e.models.slice()
-        }))
+        active: { model: activeModel },
+        chat: {
+          baseURL: chat.baseURL,
+          model: activeModel,
+          models: chat.models.slice()
+        }
       }
     });
   }
@@ -332,54 +321,53 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         break;
       case 'select-model': {
-        const p = (msg.payload ?? {}) as { endpoint?: string; model?: string };
-        const endpoint = String(p.endpoint ?? '').trim();
+        const p = (msg.payload ?? {}) as { model?: string };
         const model = String(p.model ?? '').trim();
-        if (endpoint && model) {
-          await setActiveSelection(endpoint, model);
+        if (model) {
+          await setChatModel(model);
           // onDidChangeConfiguration will broadcast the new active selection.
         }
         break;
       }
       case 'add-custom-model': {
-        const p = (msg.payload ?? {}) as { endpoint?: string; model?: string; activate?: boolean };
-        const endpoint = String(p.endpoint ?? '').trim();
+        const p = (msg.payload ?? {}) as { model?: string; activate?: boolean };
         const model = String(p.model ?? '').trim();
-        if (endpoint && model) {
-          await addModelToEndpoint(endpoint, model);
+        if (model) {
+          await addChatModel(model);
           if (p.activate !== false) {
-            await setActiveSelection(endpoint, model);
+            await setChatModel(model);
           }
         }
         break;
       }
       case 'remove-custom-model': {
-        const p = (msg.payload ?? {}) as { endpoint?: string; model?: string };
-        const endpoint = String(p.endpoint ?? '').trim();
+        const p = (msg.payload ?? {}) as { model?: string };
         const model = String(p.model ?? '').trim();
-        if (endpoint && model) {
-          await removeModelFromEndpoint(endpoint, model);
+        if (model) {
+          await removeChatModel(model);
         }
         break;
       }
-      case 'refresh-endpoint-models': {
-        const p = (msg.payload ?? {}) as { endpoint?: string };
-        const endpointName = String(p.endpoint ?? '').trim();
-        const ep = readEndpoints().find((e) => e.name === endpointName);
-        if (!ep) {
+      case 'refresh-models': {
+        const chat = readChatProfile();
+        if (!chat.baseURL) {
           this.post({
-            type: 'endpoint-models',
-            payload: { endpoint: endpointName, error: 'Endpoint not found' }
+            type: 'models-fetched',
+            payload: { error: 'baseURL is empty — set burstcode.llm.chat.baseURL first' }
           });
           break;
         }
         try {
-          const models = await fetchEndpointModels(ep);
-          this.post({ type: 'endpoint-models', payload: { endpoint: ep.name, models } });
+          const models = await fetchProfileModels({
+            baseURL: chat.baseURL,
+            apiKey: chat.apiKey,
+            allowSelfSignedCerts: chat.allowSelfSignedCerts
+          });
+          this.post({ type: 'models-fetched', payload: { models } });
         } catch (err) {
           this.post({
-            type: 'endpoint-models',
-            payload: { endpoint: ep.name, error: String((err as Error)?.message ?? err) }
+            type: 'models-fetched',
+            payload: { error: String((err as Error)?.message ?? err) }
           });
         }
         break;
@@ -970,6 +958,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .ask-clarify.answered { opacity: 0.78; border-color: var(--vscode-panel-border); }
   .ask-clarify.cancelled .ask-answer { color: var(--vscode-errorForeground); }
   .ask-clarify .ask-answer { margin-top: 8px; font-size: 0.88em; opacity: 0.85; font-style: italic; }
+  /* Once submitted, drop the question/options framing entirely and only keep the
+     selected option(s), styled like a regular user reply line. */
+  .ask-clarify.collapsed { background: var(--vscode-textBlockQuote-background); border: none; border-left: 2px solid var(--vscode-textLink-foreground); border-radius: 0 4px 4px 0; padding: 6px 10px; opacity: 0.95; }
+  .ask-clarify.collapsed .ask-reply { display: flex; gap: 8px; line-height: 1.5; word-wrap: break-word; }
+  .ask-clarify.collapsed .ask-reply .gutter { color: var(--vscode-textLink-foreground); font-weight: 700; flex-shrink: 0; user-select: none; }
+  .ask-clarify.collapsed .ask-reply .body { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
 
   /* ============ Pending edits banner (sticky, above composer) ============ */
   #pendingBanner { display: none; padding: 8px 10px; margin: 0 12px 8px; border-radius: 8px; background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-charts-orange, #d18616); flex-shrink: 0; }
@@ -2338,14 +2332,22 @@ window.addEventListener('message', (e) => {
       const sendAnswer = (answer) => {
         if (wrap.dataset.done === '1') return;
         wrap.dataset.done = '1';
-        // Disable controls but keep them visible so the user can see what they answered.
-        wrap.classList.add('answered');
-        const ctrls = wrap.querySelectorAll('button, input, label');
-        ctrls.forEach((el) => { el.setAttribute('disabled', 'true'); el.classList.add('disabled'); });
-        const echo = document.createElement('div');
-        echo.className = 'ask-answer';
-        echo.textContent = '↪ ' + (answer || '(empty)');
-        wrap.appendChild(echo);
+        // Replace the entire question/options box with a compact user-reply-style
+        // line that only shows the selected option(s). The framing of the box is
+        // dropped via the "collapsed" modifier so it blends into the chat flow.
+        wrap.classList.add('answered', 'collapsed');
+        while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+        const reply = document.createElement('div');
+        reply.className = 'ask-reply';
+        const gutter = document.createElement('span');
+        gutter.className = 'gutter';
+        gutter.textContent = '>';
+        const body = document.createElement('span');
+        body.className = 'body';
+        body.textContent = answer || '(empty)';
+        reply.appendChild(gutter);
+        reply.appendChild(body);
+        wrap.appendChild(reply);
         vscode.postMessage({ type: 'ask-user-response', payload: { id: askId, answer: answer } });
       };
 
@@ -2515,22 +2517,18 @@ window.addEventListener('message', (e) => {
       break;
     }
     case 'models': {
-      const payload = msg.payload || { endpoints: [], active: { endpoint: '', model: '' } };
-      modelsState.endpoints = payload.endpoints || [];
-      modelsState.active = payload.active || { endpoint: '', model: '' };
-      // Drop fetched-cache entries for endpoints that no longer exist.
-      const liveNames = new Set(modelsState.endpoints.map((e) => e.name));
-      Object.keys(modelsState.fetched).forEach((k) => { if (!liveNames.has(k)) delete modelsState.fetched[k]; });
+      const payload = msg.payload || { chat: { baseURL: '', model: '', models: [] }, active: { model: '' } };
+      modelsState.chat = payload.chat || { baseURL: '', model: '', models: [] };
+      modelsState.active = payload.active || { model: modelsState.chat.model || '' };
       renderModelPickerLabel();
       if (modelPicker.classList.contains('open')) renderModelPicker();
       break;
     }
-    case 'endpoint-models': {
-      const { endpoint, models, error } = msg.payload || {};
-      if (!endpoint) break;
-      modelsState.fetched[endpoint] = {
+    case 'models-fetched': {
+      const { models, error } = msg.payload || {};
+      modelsState.fetched = {
         loading: false,
-        models: Array.isArray(models) ? models : (modelsState.fetched[endpoint] && modelsState.fetched[endpoint].models) || null,
+        models: Array.isArray(models) ? models : (modelsState.fetched && modelsState.fetched.models) || null,
         error: error || null
       };
       if (modelPicker.classList.contains('open')) renderModelPicker();
@@ -2623,12 +2621,12 @@ input.addEventListener('keydown', (e) => {
 });
 
 // ============== Model picker ==============
-// State pushed in by the host via 'models' / 'endpoint-models' messages, plus
-// a per-endpoint cache of fetched IDs from /v1/models.
+// Single chat profile only. Background profile is managed via Settings UI
+// (or via the 'BurstCode: Background Explorer Model' command).
 const modelsState = {
-  endpoints: [],
-  active: { endpoint: '', model: '' },
-  fetched: {} // endpointName -> { loading, models, error }
+  chat: { baseURL: '', model: '', models: [] },
+  active: { model: '' },
+  fetched: { loading: false, models: null, error: null }
 };
 
 function setModelPickerOpen(open) {
@@ -2645,149 +2643,141 @@ function setModelPickerOpen(open) {
 function renderModelPickerLabel() {
   const labelEl = modelPickerBtn.querySelector('.label');
   if (!labelEl) return;
-  const a = modelsState.active || { endpoint: '', model: '' };
+  const a = modelsState.active || { model: '' };
   if (!a.model) {
     labelEl.innerHTML = '<span class="ep">No model selected</span>';
     return;
   }
-  const ep = (a.endpoint || '').trim();
-  const epHtml = ep ? '<span class="ep">' + escapeHtml(ep) + '</span><span class="sep">/</span>' : '';
-  labelEl.innerHTML = epHtml + '<span class="model">' + escapeHtml(a.model) + '</span>';
+  labelEl.innerHTML = '<span class="model">' + escapeHtml(a.model) + '</span>';
 }
 
 function renderModelPicker() {
   modelPicker.innerHTML = '';
-  const active = modelsState.active || { endpoint: '', model: '' };
-  if (!modelsState.endpoints.length) {
-    const empty = document.createElement('div');
-    empty.style.cssText = 'padding:14px; opacity:0.7; text-align:center; font-size:0.85em;';
-    empty.textContent = 'No endpoint configured. Open settings to add one.';
-    modelPicker.appendChild(empty);
+  const active = modelsState.active || { model: '' };
+  const chat = modelsState.chat || { baseURL: '', model: '', models: [] };
+  const cache = modelsState.fetched || { loading: false, models: null, error: null };
+
+  const group = document.createElement('div');
+  group.className = 'ep-group';
+
+  const head = document.createElement('div');
+  head.className = 'ep-head';
+  const nm = document.createElement('span');
+  nm.className = 'name';
+  nm.textContent = 'Chat';
+  const url = document.createElement('span');
+  url.className = 'url';
+  url.textContent = chat.baseURL || '(no baseURL)';
+  url.title = chat.baseURL || '';
+  const refresh = document.createElement('button');
+  refresh.className = 'refresh';
+  refresh.type = 'button';
+  refresh.title = 'Fetch models from /v1/models';
+  refresh.innerHTML = '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8a5.5 5.5 0 0 1 9.7-3.5"/><path d="M12.5 2v3h-3"/><path d="M13.5 8a5.5 5.5 0 0 1-9.7 3.5"/><path d="M3.5 14v-3h3"/></svg><span>Refresh</span>';
+  if (cache.loading) refresh.dataset.loading = 'true';
+  refresh.onclick = (e) => {
+    e.stopPropagation();
+    modelsState.fetched = { ...cache, loading: true, error: null };
+    renderModelPicker();
+    vscode.postMessage({ type: 'refresh-models' });
+  };
+  head.appendChild(nm);
+  head.appendChild(url);
+  head.appendChild(refresh);
+  group.appendChild(head);
+
+  if (cache.error) {
+    const err = document.createElement('div');
+    err.className = 'ep-error';
+    err.textContent = '⚠ ' + cache.error;
+    group.appendChild(err);
   }
-  modelsState.endpoints.forEach((ep) => {
-    const group = document.createElement('div');
-    group.className = 'ep-group';
 
-    const head = document.createElement('div');
-    head.className = 'ep-head';
-    const nm = document.createElement('span');
-    nm.className = 'name';
-    nm.textContent = ep.name;
-    const url = document.createElement('span');
-    url.className = 'url';
-    url.textContent = ep.baseURL || '';
-    url.title = ep.baseURL || '';
-    const refresh = document.createElement('button');
-    refresh.className = 'refresh';
-    refresh.type = 'button';
-    refresh.title = 'Fetch models from /v1/models';
-    refresh.innerHTML = '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8a5.5 5.5 0 0 1 9.7-3.5"/><path d="M12.5 2v3h-3"/><path d="M13.5 8a5.5 5.5 0 0 1-9.7 3.5"/><path d="M3.5 14v-3h3"/></svg><span>Refresh</span>';
-    const cache = modelsState.fetched[ep.name];
-    if (cache && cache.loading) refresh.dataset.loading = 'true';
-    refresh.onclick = (e) => {
-      e.stopPropagation();
-      modelsState.fetched[ep.name] = { ...(modelsState.fetched[ep.name] || {}), loading: true, error: null };
-      renderModelPicker();
-      vscode.postMessage({ type: 'refresh-endpoint-models', payload: { endpoint: ep.name } });
-    };
-    head.appendChild(nm);
-    head.appendChild(url);
-    head.appendChild(refresh);
-    group.appendChild(head);
+  // Compose the row list: manual models first, then any fetched-only IDs.
+  const manual = (chat.models || []).slice();
+  const fetched = Array.isArray(cache.models) ? cache.models : [];
+  const seen = new Set();
+  const rows = [];
+  manual.forEach((m) => { if (!seen.has(m)) { seen.add(m); rows.push({ id: m, source: 'manual' }); } });
+  fetched.forEach((m) => { if (!seen.has(m)) { seen.add(m); rows.push({ id: m, source: 'fetched' }); } });
 
-    if (cache && cache.error) {
-      const err = document.createElement('div');
-      err.className = 'ep-error';
-      err.textContent = '⚠ ' + cache.error;
-      group.appendChild(err);
-    }
-
-    // Compose the row list: manual models first, then any fetched-only IDs.
-    const manual = (ep.models || []).slice();
-    const fetched = (cache && Array.isArray(cache.models)) ? cache.models : [];
-    const seen = new Set();
-    const rows = [];
-    manual.forEach((m) => { if (!seen.has(m)) { seen.add(m); rows.push({ id: m, source: 'manual' }); } });
-    fetched.forEach((m) => { if (!seen.has(m)) { seen.add(m); rows.push({ id: m, source: 'fetched' }); } });
-
-    if (rows.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'empty-models';
-      empty.textContent = cache && cache.loading ? 'Loading...' : 'No models yet — refresh or add one below.';
-      group.appendChild(empty);
-    } else {
-      rows.forEach((r) => {
-        const row = document.createElement('div');
-        row.className = 'model-row';
-        const isActive = ep.name === active.endpoint && r.id === active.model;
-        if (isActive) row.classList.add('active');
-        const check = document.createElement('span');
-        check.className = 'check';
-        check.textContent = isActive ? '✓' : '';
-        const name = document.createElement('span');
-        name.className = 'name';
-        name.textContent = r.id;
-        name.title = r.id;
-        const badge = document.createElement('span');
-        badge.className = 'badge';
-        badge.textContent = r.source === 'manual' ? 'manual' : 'fetched';
-        row.appendChild(check);
-        row.appendChild(name);
-        row.appendChild(badge);
-        if (r.source === 'manual') {
-          const del = document.createElement('button');
-          del.className = 'del';
-          del.type = 'button';
-          del.title = 'Remove from this endpoint';
-          del.textContent = '✕';
-          del.onclick = (e) => {
-            e.stopPropagation();
-            vscode.postMessage({ type: 'remove-custom-model', payload: { endpoint: ep.name, model: r.id } });
-          };
-          row.appendChild(del);
-        }
-        row.onclick = () => {
-          vscode.postMessage({ type: 'select-model', payload: { endpoint: ep.name, model: r.id } });
-          setModelPickerOpen(false);
+  if (rows.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-models';
+    empty.textContent = cache.loading ? 'Loading...' : 'No models yet — refresh or add one below.';
+    group.appendChild(empty);
+  } else {
+    rows.forEach((r) => {
+      const row = document.createElement('div');
+      row.className = 'model-row';
+      const isActive = r.id === active.model;
+      if (isActive) row.classList.add('active');
+      const check = document.createElement('span');
+      check.className = 'check';
+      check.textContent = isActive ? '✓' : '';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = r.id;
+      name.title = r.id;
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = r.source === 'manual' ? 'manual' : 'fetched';
+      row.appendChild(check);
+      row.appendChild(name);
+      row.appendChild(badge);
+      if (r.source === 'manual') {
+        const del = document.createElement('button');
+        del.className = 'del';
+        del.type = 'button';
+        del.title = 'Remove from chat profile';
+        del.textContent = '✕';
+        del.onclick = (e) => {
+          e.stopPropagation();
+          vscode.postMessage({ type: 'remove-custom-model', payload: { model: r.id } });
         };
-        group.appendChild(row);
-      });
-    }
-
-    // Manual-add input
-    const addRow = document.createElement('div');
-    addRow.className = 'add-row';
-    const addInput = document.createElement('input');
-    addInput.type = 'text';
-    addInput.placeholder = 'Add custom model id...';
-    addInput.spellcheck = false;
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.textContent = 'Add';
-    const submitAdd = () => {
-      const id = addInput.value.trim();
-      if (!id) return;
-      vscode.postMessage({ type: 'add-custom-model', payload: { endpoint: ep.name, model: id, activate: true } });
-      addInput.value = '';
-      setModelPickerOpen(false);
-    };
-    addBtn.onclick = (e) => { e.stopPropagation(); submitAdd(); };
-    addInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); submitAdd(); }
-      e.stopPropagation();
+        row.appendChild(del);
+      }
+      row.onclick = () => {
+        vscode.postMessage({ type: 'select-model', payload: { model: r.id } });
+        setModelPickerOpen(false);
+      };
+      group.appendChild(row);
     });
-    addInput.addEventListener('click', (e) => e.stopPropagation());
-    addRow.appendChild(addInput);
-    addRow.appendChild(addBtn);
-    group.appendChild(addRow);
+  }
 
-    modelPicker.appendChild(group);
+  // Manual-add input
+  const addRow = document.createElement('div');
+  addRow.className = 'add-row';
+  const addInput = document.createElement('input');
+  addInput.type = 'text';
+  addInput.placeholder = 'Add custom model id...';
+  addInput.spellcheck = false;
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.textContent = 'Add';
+  const submitAdd = () => {
+    const id = addInput.value.trim();
+    if (!id) return;
+    vscode.postMessage({ type: 'add-custom-model', payload: { model: id, activate: true } });
+    addInput.value = '';
+    setModelPickerOpen(false);
+  };
+  addBtn.onclick = (e) => { e.stopPropagation(); submitAdd(); };
+  addInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); submitAdd(); }
+    e.stopPropagation();
   });
+  addInput.addEventListener('click', (e) => e.stopPropagation());
+  addRow.appendChild(addInput);
+  addRow.appendChild(addBtn);
+  group.appendChild(addRow);
+
+  modelPicker.appendChild(group);
 
   const footer = document.createElement('div');
   footer.className = 'footer';
   const link = document.createElement('a');
-  link.textContent = 'Manage endpoints in settings →';
+  link.textContent = 'Open chat profile settings →';
   link.onclick = (e) => { e.stopPropagation(); vscode.postMessage({ type: 'open-config' }); setModelPickerOpen(false); };
   footer.appendChild(link);
   modelPicker.appendChild(footer);

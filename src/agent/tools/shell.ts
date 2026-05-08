@@ -229,13 +229,23 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
 
       // ---- Spawn ---------------------------------------------------------
       const plan = planSpawn(shellKind, command);
+      const isWin = process.platform === 'win32';
       return await new Promise<ToolResult>((resolve) => {
-        let proc: cp.ChildProcessWithoutNullStreams;
+        let proc: cp.ChildProcess;
         try {
           proc = cp.spawn(plan.exe, plan.args, {
             cwd,
             env: process.env,
-            windowsHide: true
+            windowsHide: true,
+            // Close stdin so commands that read input (npm init, git commit,
+            // pause, Read-Host, [Y/n] prompts, …) see EOF immediately and
+            // exit instead of blocking the whole tool call forever.
+            // Keep stdout/stderr piped so we can capture them.
+            stdio: ['ignore', 'pipe', 'pipe'],
+            // On POSIX, put the shell in its own process group so we can
+            // signal the entire tree (shell + its children) on cancel. On
+            // Windows we rely on taskkill /T below instead.
+            detached: !isWin
           });
         } catch (err) {
           resolve({
@@ -250,44 +260,86 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
         const stdoutCap = maxOutputBytes;
         const stderrCap = maxOutputBytes;
         let timedOut = false;
+        let settled = false;
+        let forcedExit = false;
+
+        // Kill the shell AND every descendant it spawned. On Windows the
+        // grandchildren (npm.exe, node.exe, …) do not die when the shell
+        // does and they keep the inherited stdout/stderr pipes open, which
+        // means proc.on('close') never fires and the Promise hangs forever.
+        // taskkill /T /F walks the whole tree and terminates each one.
+        // On POSIX we kill the negative pid (process group) we created via
+        // detached:true.
+        const killTree = (): void => {
+          if (proc.exitCode !== null && proc.signalCode === null) return;
+          if (isWin) {
+            if (typeof proc.pid === 'number') {
+              try {
+                cp.spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], {
+                  windowsHide: true,
+                  stdio: 'ignore'
+                }).on('error', () => {
+                  /* fall back to direct kill below */
+                  try { proc.kill(); } catch { /* ignore */ }
+                });
+              } catch {
+                try { proc.kill(); } catch { /* ignore */ }
+              }
+            } else {
+              try { proc.kill(); } catch { /* ignore */ }
+            }
+          } else {
+            // Negative pid => signal whole process group.
+            const pid = proc.pid;
+            try {
+              if (typeof pid === 'number') process.kill(-pid, 'SIGTERM');
+              else proc.kill('SIGTERM');
+            } catch {
+              try { proc.kill('SIGTERM'); } catch { /* ignore */ }
+            }
+            setTimeout(() => {
+              if (proc.exitCode === null) {
+                try {
+                  if (typeof pid === 'number') process.kill(-pid, 'SIGKILL');
+                  else proc.kill('SIGKILL');
+                } catch { /* ignore */ }
+              }
+            }, 2000);
+          }
+        };
 
         const timer = setTimeout(() => {
           timedOut = true;
-          try {
-            proc.kill('SIGTERM');
-          } catch {
-            /* ignore */
-          }
-          // Hard kill if SIGTERM was ignored.
-          setTimeout(() => {
-            try {
-              proc.kill('SIGKILL');
-            } catch {
-              /* ignore */
-            }
-          }, 2000);
+          killTree();
         }, timeoutMs);
 
         const cancelSub = ctx.cancellation.onCancellationRequested(() => {
-          try {
-            proc.kill('SIGTERM');
-          } catch {
-            /* ignore */
-          }
+          killTree();
+          // Belt-and-braces: even if 'close' fails to fire because some
+          // descendant kept a pipe handle alive, force-resolve so the UI
+          // unblocks. 5s is enough for taskkill to finish in normal cases.
+          setTimeout(() => {
+            if (!settled) {
+              forcedExit = true;
+              proc.emit('close', null, 'SIGTERM');
+            }
+          }, 5000);
         });
 
-        proc.stdout.on('data', (chunk: Buffer) => {
+        proc.stdout?.on('data', (chunk: Buffer) => {
           if (Buffer.byteLength(stdout, 'utf8') < stdoutCap) {
             stdout += chunk.toString('utf8');
           }
         });
-        proc.stderr.on('data', (chunk: Buffer) => {
+        proc.stderr?.on('data', (chunk: Buffer) => {
           if (Buffer.byteLength(stderr, 'utf8') < stderrCap) {
             stderr += chunk.toString('utf8');
           }
         });
 
         proc.on('error', (err) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
           cancelSub.dispose();
           resolve({
@@ -297,16 +349,24 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
         });
 
         proc.on('close', (code, signal) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
           cancelSub.dispose();
 
+          const cancelled = ctx.cancellation.isCancellationRequested;
           const stdoutTrunc = truncate(stdout, stdoutCap);
           const stderrTrunc = truncate(stderr, stderrCap);
+          const exitLabel = forcedExit
+            ? 'forced (descendant kept stdio open)'
+            : code === null
+              ? 'null'
+              : String(code);
           const headerLines = [
             `# command: ${command}`,
             `# shell: ${shellKind} (${plan.exe})`,
             `# cwd: ${cwd ?? '(default)'}`,
-            `# exit: ${code === null ? 'null' : code}${signal ? ` signal=${signal}` : ''}${timedOut ? ' (timed out)' : ''}`
+            `# exit: ${exitLabel}${signal ? ` signal=${signal}` : ''}${timedOut ? ' (timed out)' : ''}${cancelled ? ' (cancelled by user)' : ''}`
           ];
           const sections: string[] = [headerLines.join('\n')];
           sections.push(
@@ -318,11 +378,13 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
 
           resolve({
             content: sections.join('\n\n'),
-            isError: timedOut || (typeof code === 'number' && code !== 0),
+            isError: timedOut || cancelled || forcedExit || (typeof code === 'number' && code !== 0),
             meta: {
               exitCode: code,
               signal: signal ?? null,
               timedOut,
+              cancelled,
+              forcedExit,
               shell: shellKind,
               executable: plan.exe,
               cwd: cwd ?? null,
