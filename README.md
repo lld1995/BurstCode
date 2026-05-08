@@ -14,7 +14,7 @@
 
 Powered by your own local models · Code never leaves your machine · Works with any OpenAI-compatible endpoint
 
-[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.85-1f1f1f?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
+[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.106-1f1f1f?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/MIT-1f1f1f.svg)](LICENSE)
 [![Local First](https://img.shields.io/badge/Local%20First-1f1f1f)](#)
 [![Ollama](https://img.shields.io/badge/Ollama-1f1f1f)](https://ollama.com)
@@ -110,7 +110,7 @@ python -m vllm.entrypoints.openai.api_server \
 ## Step 2 · Install the extension
 
 ```powershell
-code --install-extension burstcode-0.1.4.vsix
+code --install-extension burstcode-0.1.8.vsix
 ```
 
 Or build it from source:
@@ -118,10 +118,16 @@ Or build it from source:
 ```powershell
 npm install
 npm run package
-npm run vsix          # produces burstcode-0.1.4.vsix
+npm run vsix          # produces burstcode-0.1.8.vsix
 ```
 
-After install, a ⚡ icon appears in the VS Code activity bar.
+After install you'll see two BurstCode surfaces:
+
+- **Primary Side Bar** (⚡ icon in the activity bar) — the *BurstCode* panel: model picker, permissions, background-explorer toggles, quick actions.
+- **Secondary Side Bar** — the *BurstCode Chat* panel itself, so it lives next to your editor without competing with the file explorer.
+- **Editor title bar** — a BurstCode logo button (`Open Chat`) that focuses the chat panel from anywhere.
+
+If the Secondary Side Bar is hidden, run `View: Toggle Secondary Side Bar` (`Ctrl+Alt+B`) once.
 
 ## Step 3 · Register an endpoint
 
@@ -426,52 +432,62 @@ Clicking the pill also opens the **Background Explorer Menu** — one-stop acces
 
 <br />
 
-## Which model should the background use? Three configurations
+## Which model should the background use? Profiles
 
-The background loop runs far more cycles than Chat — strongly recommended to give it **its own smaller, cheaper model**.
-Three modes, ordered by coupling:
+BurstCode uses a single **profile** concept: a `(endpoint, model)` pair. There are
+two profiles — `chat` and `background`. The model itself only ever lives in
+`burstcode.llm.endpoints`; profiles just *point at* one of those entries.
 
-### Mode A · Inherit Chat entirely (zero config)
+### Mode A · Inherit Chat (default, zero config)
 
-Don't set anything; the background uses Chat's currently-active endpoint + model.
-
-```jsonc
-// Just leave burstcode.background.endpoint / baseURL / model unset
-```
-
-Best for: just installed, want to try it; or only running one local model.
-
-### Mode B · Reuse an existing endpoint with a smaller model (recommended)
-
-Reference an endpoint by `name` from `burstcode.llm.endpoints`, then pin a lighter model on the same server:
+The background profile starts with `inherit: true`, so it uses whatever Chat is
+on. Best for: just installed, or only running one local model.
 
 ```jsonc
-"burstcode.background.endpoint": "Local Ollama",     // refers to llm.endpoints[*].name
-"burstcode.background.model":    "qwen2.5-coder:1.5b" // smaller than what Chat uses
+"burstcode.profiles.background.inherit": true   // ← the default; nothing else needed
 ```
 
-Best for: same Ollama / vLLM service, but you want Chat to use a 14B model for quality and the background to use a 1.5B model for efficiency.
+### Mode B · Pin to a smaller / cheaper model (recommended)
 
-### Mode C · Fully independent service (maximum isolation)
-
-Decouple the background completely — e.g. an Ollama on an old PC, or a shared small-model gateway:
+Keep one entry in `burstcode.llm.endpoints` and point the background profile at
+a lighter model on the same server:
 
 ```jsonc
-"burstcode.background.baseURL":   "http://192.168.1.50:11434/v1",
-"burstcode.background.apiKey":    "ollama",
-"burstcode.background.model":     "qwen2.5-coder:3b",
-"burstcode.background.contextWindow": 8192,
-"burstcode.background.temperature":   0.2,
-"burstcode.background.allowSelfSignedCerts": false
+"burstcode.profiles.background.inherit":  false,
+"burstcode.profiles.background.endpoint": "http://localhost:11434/v1",  // an entry in llm.endpoints
+"burstcode.profiles.background.model":    "qwen2.5-coder:1.5b"          // smaller than Chat's
 ```
 
-> Once `baseURL` is set, `endpoint` is **completely ignored** — all connection params come from `background.*` exclusively.
+Best for: same Ollama / vLLM, but you want Chat at 14B for quality and background
+at 1.5B for efficiency.
 
-Best for: running the background loop on another machine, another GPU, or a dedicated "long-running tasks" gateway at work.
+### Mode C · A completely separate server
 
-### Switch model after configuring
+There are no longer dedicated `burstcode.background.baseURL/apiKey/...` keys.
+Just add another entry to `burstcode.llm.endpoints` and point the background
+profile at it:
 
-Don't want to edit JSON? Run **`BurstCode: Select Background Explorer Model`** to pop a QuickPick.
+```jsonc
+"burstcode.llm.endpoints": [
+  { "name": "http://localhost:11434/v1",      "baseURL": "http://localhost:11434/v1",      "models": ["qwen2.5-coder:14b"] },
+  { "name": "http://192.168.1.50:11434/v1",   "baseURL": "http://192.168.1.50:11434/v1",   "apiKey": "ollama", "models": ["qwen2.5-coder:3b"] }
+],
+"burstcode.profiles.chat.endpoint":       "http://localhost:11434/v1",
+"burstcode.profiles.chat.model":          "qwen2.5-coder:14b",
+"burstcode.profiles.background.inherit":  false,
+"burstcode.profiles.background.endpoint": "http://192.168.1.50:11434/v1",
+"burstcode.profiles.background.model":    "qwen2.5-coder:3b"
+```
+
+Best for: running the background loop on another machine, another GPU, or a
+dedicated "long-running tasks" gateway at work.
+
+### Switch model without editing JSON
+
+In the BurstCode side panel, click **Models → Background**, or run
+**`BurstCode: Select Background Explorer Model`** — a QuickPick lists every
+registered endpoint+model plus an *Inherit chat* option. Picking writes
+`burstcode.profiles.background.*` for you.
 
 <br />
 
@@ -587,16 +603,14 @@ Understanding what it does makes tuning easier.
 ],
 "burstcode.background.maxFileBytes": 120000,       // skip files larger than this
 
-// ── Endpoint / model (independent of Chat) ─────
-"burstcode.background.endpoint":  "",              // refers to llm.endpoints[*].name
-"burstcode.background.baseURL":   "",              // setting this fully decouples from Chat
-"burstcode.background.apiKey":    "",
-"burstcode.background.allowSelfSignedCerts": false,
-"burstcode.background.model":     "",              // empty = endpoint default / inherit Chat
-"burstcode.background.temperature":   0.2,
-"burstcode.background.contextWindow": 0,           // 0 = inherit endpoint
+// ── Endpoint / model (driven by profiles) ─────
+// `burstcode.background.endpoint/model/baseURL/apiKey/...` no longer exist.
+// Configure via the unified profiles instead:
+"burstcode.profiles.background.inherit":  true,    // true = use Chat's profile
+"burstcode.profiles.background.endpoint": "",      // entry name in burstcode.llm.endpoints
+"burstcode.profiles.background.model":    "",      // empty = endpoint's first known model
 
-// ── Output & execution ─────────────────────────
+// ── Output & execution ────────────────────────
 "burstcode.background.outputDir": ".burstcode",
 "burstcode.background.runGeneratedTests": false,   // auto-execute generated tests
 "burstcode.background.testRunTimeoutMs": 60000
@@ -631,7 +645,7 @@ npm run package        # production build
 npm run vsix           # produce vsix
 ```
 
-Stack: TypeScript 5 · esbuild · openai SDK · gpt-tokenizer · diff · VS Code API ≥ 1.85
+Stack: TypeScript 5 · esbuild · openai SDK · gpt-tokenizer · diff · VS Code API ≥ 1.106
 
 Source map:
 

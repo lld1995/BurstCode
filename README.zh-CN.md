@@ -14,7 +14,7 @@
 
 由你自己的本地模型驱动 · 代码不出本机 · 兼容任何 OpenAI 协议端点
 
-[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.85-1f1f1f?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
+[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.106-1f1f1f?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/MIT-1f1f1f.svg)](LICENSE)
 [![Local First](https://img.shields.io/badge/Local%20First-1f1f1f)](#)
 [![Ollama](https://img.shields.io/badge/Ollama-1f1f1f)](https://ollama.com)
@@ -110,7 +110,7 @@ python -m vllm.entrypoints.openai.api_server \
 ## 第 2 步 · 安装扩展
 
 ```powershell
-code --install-extension burstcode-0.1.4.vsix
+code --install-extension burstcode-0.1.8.vsix
 ```
 
 或者在仓库根目录自己打一份：
@@ -118,10 +118,16 @@ code --install-extension burstcode-0.1.4.vsix
 ```powershell
 npm install
 npm run package
-npm run vsix          # 产出 burstcode-0.1.4.vsix
+npm run vsix          # 产出 burstcode-0.1.8.vsix
 ```
 
-装好后 VS Code 活动栏会多出一个 ⚡ 图标。
+装好后会看到三个 BurstCode 入口：
+
+- **主侧边栏**（活动栏 ⚡ 图标）—— *BurstCode* 面板：模型选择、权限开关、后台探索器控制、快捷动作。
+- **辅助侧边栏** —— *BurstCode Chat* 聊天面板本体，贴着编辑器右侧，不与资源管理器抢位置。
+- **编辑器标题栏** —— 一个 BurstCode logo 按钮（`Open Chat`），在任何地方一键调出聊天面板。
+
+如果辅助侧边栏隐藏了，先运行一次 `View: Toggle Secondary Side Bar`（`Ctrl+Alt+B`）。
 
 ## 第 3 步 · 注册端点
 
@@ -425,52 +431,58 @@ Agent 会主动用 `ask_user` 把球踢回给你：
 
 <br />
 
-## 后台用哪个模型？三种配法
+## 后台用哪个模型？用 Profile
 
-后台跑的轮次远多于 Chat —— 强烈建议给它**单独配一个更小、更便宜的模型**。
-按"耦合度"从低到高三种模式：
+BurstCode 采用统一的 **profile** 概念：一个 profile 就是一对 `(endpoint, model)`。
+一共只有两个 profile —— `chat` 与 `background`。模型本身只会出现在
+`burstcode.llm.endpoints` 里；profile 只是 *指向* 某个已注册的端点。
 
-### 模式 A · 完全继承 Chat（零配置）
+### 模式 A · 继承 Chat（默认，零配置）
 
-什么都不写，后台就用你 Chat 当前激活的端点 + 模型。
-
-```jsonc
-// settings.json 不写任何 burstcode.background.endpoint / baseURL / model 即可
-```
-
+`background` profile 默认 `inherit: true`，后台会跟随 Chat 当前选择。
 适合：刚装完想试试，或本地只跑一个模型。
 
-### 模式 B · 复用已有端点，换个小模型（推荐）
-
-引用 `burstcode.llm.endpoints` 里某个端点的 `name`，再单独指定一个该端点上更轻的模型：
-
 ```jsonc
-"burstcode.background.endpoint": "Local Ollama",     // 引用 llm.endpoints[*].name
-"burstcode.background.model":    "qwen2.5-coder:1.5b" // 比 Chat 用的更小
+"burstcode.profiles.background.inherit": true   // ← 默认值，其他不用写
 ```
 
-适合：服务还是同一个 Ollama / vLLM，但希望 Chat 用 14B 大模型保质量、后台用 1.5B 小模型省电。
+### 模式 B · 同服务上换个小模型（推荐）
 
-### 模式 C · 完全独立的服务（最高隔离）
-
-把后台彻底和 Chat 解耦 —— 例如另一台旧电脑上的 Ollama，或者一个共享小模型网关：
+`burstcode.llm.endpoints` 里保留原有端点，把 `background` profile 指向同一服务上更轻的模型：
 
 ```jsonc
-"burstcode.background.baseURL":   "http://192.168.1.50:11434/v1",
-"burstcode.background.apiKey":    "ollama",
-"burstcode.background.model":     "qwen2.5-coder:3b",
-"burstcode.background.contextWindow": 8192,
-"burstcode.background.temperature":   0.2,
-"burstcode.background.allowSelfSignedCerts": false
+"burstcode.profiles.background.inherit":  false,
+"burstcode.profiles.background.endpoint": "http://localhost:11434/v1",  // llm.endpoints 中一条
+"burstcode.profiles.background.model":    "qwen2.5-coder:1.5b"          // 比 Chat 用的更小
 ```
 
-> 一旦设了 `baseURL`，就**完全无视** `endpoint` 字段，所有连接参数走 background.* 自己的。
+适合：同一个 Ollama / vLLM，但希望 Chat 用 14B 保质量、后台用 1.5B 省能耗。
 
-适合：希望后台跑在另一台机器、另一张 GPU、或公司专门的"长任务"网关上。
+### 模式 C · 完全独立的服务
 
-### 配完后切模型
+不再需要 `burstcode.background.baseURL/apiKey/...` 一套重复字段。
+直接在 `burstcode.llm.endpoints` 再加一条，然后让 `background` profile 指过去：
 
-不想改 JSON？运行 **`BurstCode: Select Background Explorer Model`** 直接弹 QuickPick 切。
+```jsonc
+"burstcode.llm.endpoints": [
+  { "name": "http://localhost:11434/v1",      "baseURL": "http://localhost:11434/v1",      "models": ["qwen2.5-coder:14b"] },
+  { "name": "http://192.168.1.50:11434/v1",   "baseURL": "http://192.168.1.50:11434/v1",   "apiKey": "ollama", "models": ["qwen2.5-coder:3b"] }
+],
+"burstcode.profiles.chat.endpoint":       "http://localhost:11434/v1",
+"burstcode.profiles.chat.model":          "qwen2.5-coder:14b",
+"burstcode.profiles.background.inherit":  false,
+"burstcode.profiles.background.endpoint": "http://192.168.1.50:11434/v1",
+"burstcode.profiles.background.model":    "qwen2.5-coder:3b"
+```
+
+适合：后台跑在另一台机器、另一张 GPU、或公司专门的“长任务”网关上。
+
+### 不想改 JSON？
+
+在左侧 BurstCode 面板里点击 **Models → Background**，或运行
+**`BurstCode: Select Background Explorer Model`** —— QuickPick 会列出所有已注册
+的 endpoint+model，加上一个 *Inherit chat* 选项，选完自动写回
+`burstcode.profiles.background.*`。
 
 <br />
 
@@ -586,14 +598,12 @@ Agent 会主动用 `ask_user` 把球踢回给你：
 ],
 "burstcode.background.maxFileBytes": 120000,       // 超过此值直接跳
 
-// ── 端点 / 模型（独立于 Chat）─────────────────
-"burstcode.background.endpoint":  "",              // 引用 llm.endpoints[*].name
-"burstcode.background.baseURL":   "",              // 设了它就完全独立
-"burstcode.background.apiKey":    "",
-"burstcode.background.allowSelfSignedCerts": false,
-"burstcode.background.model":     "",              // 留空 = 端点默认 / 继承 Chat
-"burstcode.background.temperature":   0.2,
-"burstcode.background.contextWindow": 0,           // 0 = 继承端点
+// ── 端点 / 模型（由 profile 控制）──────────
+// `burstcode.background.endpoint/model/baseURL/apiKey/...` 已全部移除，
+// 现在全部走统一 profile：
+"burstcode.profiles.background.inherit":  true,    // true = 用 Chat 的 profile
+"burstcode.profiles.background.endpoint": "",      // burstcode.llm.endpoints 中一条的 name
+"burstcode.profiles.background.model":    "",      // 留空 = 该端点的首个模型
 
 // ── 输出与执行 ─────────────────────────────────
 "burstcode.background.outputDir": ".burstcode",
@@ -630,7 +640,7 @@ npm run package        # 生产构建
 npm run vsix           # 打 vsix
 ```
 
-技术栈：TypeScript 5 · esbuild · openai SDK · gpt-tokenizer · diff · VS Code API ≥ 1.85
+技术栈：TypeScript 5 · esbuild · openai SDK · gpt-tokenizer · diff · VS Code API ≥ 1.106
 
 源码导航：
 
