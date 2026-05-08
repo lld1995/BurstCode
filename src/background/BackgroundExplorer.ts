@@ -6,9 +6,8 @@ import {
   ChatMessage,
   LLMConfig,
   OpenAIClient,
-  getActiveEndpoint,
-  readEndpoints,
-  readLLMConfig
+  getBackgroundProfile,
+  resolveBackgroundLLMConfig
 } from '../llm/OpenAIClient';
 import { ChatViewProvider } from '../chat/ChatViewProvider';
 import { WorkspaceIndex } from '../context/WorkspaceIndex';
@@ -51,25 +50,6 @@ interface BackgroundConfig {
   maxFileBytes: number;
   /** Output directory relative to workspace root. */
   outputDir: string;
-  /** Endpoint name override (empty → use chat's active endpoint). */
-  endpoint: string;
-  /**
-   * Fully-independent base URL override. When non-empty the background loop
-   * stops following the chat panel's endpoint at all and points straight at
-   * this URL — useful for running background work against a different or
-   * cheaper server. Empty = derive baseURL from `endpoint` (or chat's active).
-   */
-  baseURL: string;
-  /** API key paired with the override `baseURL`. Empty = inherit endpoint's. */
-  apiKey: string;
-  /** Skip TLS verification for the override `baseURL`. Only honored when `baseURL` is set. */
-  allowSelfSignedCerts: boolean;
-  /** Model id override (empty → use endpoint's first model / chat's active). */
-  model: string;
-  /** Temperature override. NaN → endpoint default. */
-  temperature: number;
-  /** Context window override. 0 → endpoint default. */
-  contextWindow: number;
   /** How long to wait for a single LLM analysis call (ms). */
   perFileTimeoutMs: number;
   /** When true, attempt to actually execute generated unit tests and record results. */
@@ -99,42 +79,14 @@ function readConfig(): BackgroundConfig {
       : DEFAULT_INCLUDE_EXTENSIONS,
     maxFileBytes: Math.max(1024, cfg.get<number>('maxFileBytes') ?? 120_000),
     outputDir: (cfg.get<string>('outputDir') ?? '.burstcode').trim() || '.burstcode',
-    endpoint: (cfg.get<string>('endpoint') ?? '').trim(),
-    baseURL: (cfg.get<string>('baseURL') ?? '').trim(),
-    apiKey: (cfg.get<string>('apiKey') ?? '').trim(),
-    allowSelfSignedCerts: cfg.get<boolean>('allowSelfSignedCerts') ?? false,
-    model: (cfg.get<string>('model') ?? '').trim(),
-    temperature: typeof cfg.get<number>('temperature') === 'number'
-      ? (cfg.get<number>('temperature') as number)
-      : NaN,
-    contextWindow: cfg.get<number>('contextWindow') ?? 0,
     perFileTimeoutMs: Math.max(15_000, cfg.get<number>('perFileTimeoutMs') ?? 300_000),
     runGeneratedTests: cfg.get<boolean>('runGeneratedTests') ?? false,
     testRunTimeoutMs: Math.max(5_000, cfg.get<number>('testRunTimeoutMs') ?? 60_000)
   };
 }
 
-function resolveLLMConfig(bg: BackgroundConfig): LLMConfig {
-  const endpoints = readEndpoints();
-  const ep = (bg.endpoint && endpoints.find((e) => e.name === bg.endpoint)) || getActiveEndpoint();
-  const chatActive = readLLMConfig();
-  const model = bg.model || ep.models[0] || chatActive.model;
-  // baseURL/apiKey/TLS are independently overridable so the background loop
-  // can target a completely different server than the chat panel. When
-  // `bg.baseURL` is empty we keep the legacy "inherit from endpoint" path.
-  const baseURL = bg.baseURL || ep.baseURL;
-  const apiKey = bg.apiKey || ep.apiKey;
-  const allowSelfSignedCerts = bg.baseURL
-    ? bg.allowSelfSignedCerts
-    : ep.allowSelfSignedCerts;
-  return {
-    baseURL,
-    apiKey,
-    model,
-    temperature: Number.isFinite(bg.temperature) ? bg.temperature : ep.temperature,
-    contextWindow: bg.contextWindow > 0 ? bg.contextWindow : ep.contextWindow,
-    allowSelfSignedCerts
-  };
+function resolveLLMConfig(): LLMConfig {
+  return resolveBackgroundLLMConfig();
 }
 
 /* ------------------------------------------------------------------ */
@@ -300,7 +252,10 @@ export class BackgroundExplorer implements vscode.Disposable {
     this.disposables.push(
       vscode.workspace.onDidChangeTextDocument((e) => this.handleTextDocumentChange(e)),
       vscode.workspace.onDidChangeConfiguration((e) => {
-        if (e.affectsConfiguration('burstcode.background')) {
+        if (
+          e.affectsConfiguration('burstcode.background') ||
+          e.affectsConfiguration('burstcode.profiles')
+        ) {
           const wasEnabled = this.cfg.enabled;
           this.cfg = readConfig();
           if (this.cfg.enabled && !wasEnabled) this.start();
@@ -497,7 +452,7 @@ export class BackgroundExplorer implements vscode.Disposable {
         return;
       }
       const state = await this.loadState(root);
-      const llm = resolveLLMConfig(this.cfg);
+      const llm = resolveLLMConfig();
       this.status.modelLabel = `${displayEndpoint(llm.baseURL)} · ${llm.model}`;
       // Sync persisted counters into the live status so the status bar tooltip
       // and chat panel show the lifetime totals, not just this-cycle deltas.
@@ -1564,8 +1519,12 @@ function renderIndexReadme(
   lines.push('');
   lines.push('- Toggle: `burstcode.background.enabled`');
   lines.push('- Idle threshold (ms): `burstcode.background.idleThresholdMs`');
-  lines.push(`- Endpoint override: \`${cfg.endpoint || '(use chat active)'}\``);
-  lines.push(`- Model override: \`${cfg.model || '(use endpoint default)'}\``);
+  const profile = getBackgroundProfile();
+  lines.push(
+    profile.inherit
+      ? '- Model: inherits chat profile (`burstcode.profiles.chat.*`)'
+      : `- Model: \`${profile.endpoint || '(chat endpoint)'} · ${profile.model || '(endpoint default)'}\` (set via \`burstcode.profiles.background.*\`)`
+  );
   lines.push(`- Auto-run generated tests: \`burstcode.background.runGeneratedTests\` (currently ${cfg.runGeneratedTests ? 'on' : 'off'})`);
   lines.push('');
   if (activityTail.length > 0) {

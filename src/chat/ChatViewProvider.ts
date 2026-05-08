@@ -74,7 +74,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.sessions = new SessionStore(context.workspaceState);
     this.lessons = new LessonStore(context.workspaceState);
     this.configSub = vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('burstcode.llm')) {
+      if (
+        e.affectsConfiguration('burstcode.llm') ||
+        e.affectsConfiguration('burstcode.profiles')
+      ) {
         this.broadcastModels();
         this.broadcastContextUsage();
       }
@@ -316,7 +319,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.broadcastSessions();
         break;
       case 'open-config':
-        await vscode.commands.executeCommand('workbench.action.openSettings', 'burstcode');
+        try {
+          await vscode.commands.executeCommand('workbench.view.extension.burstcode');
+        } catch {
+          /* container may not exist yet — fall through to focusing the view directly */
+        }
+        try {
+          await vscode.commands.executeCommand('burstcode.basicInfoView.focus');
+        } catch {
+          // last-resort fallback: open the raw settings page
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'burstcode');
+        }
         break;
       case 'select-model': {
         const p = (msg.payload ?? {}) as { endpoint?: string; model?: string };

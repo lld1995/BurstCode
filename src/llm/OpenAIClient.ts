@@ -34,114 +34,94 @@ const DEFAULT_API_KEY = 'none';
 const DEFAULT_MODEL = 'qwen2.5-coder:7b';
 const DEFAULT_TEMPERATURE = 0.2;
 const DEFAULT_CONTEXT_WINDOW = 32768;
-const DEFAULT_ENDPOINT_NAME = 'Local';
+// Use the URL itself as the default endpoint name so the picker is
+// self-describing on a fresh install (e.g. "http://localhost:11434/v1").
+const DEFAULT_ENDPOINT_NAME = DEFAULT_BASE_URL;
 
 /**
- * Read all configured endpoints. Always returns at least one entry, derived in
- * order from:
- *   1. `burstcode.llm.endpoints` (the new structure)
- *   2. `burstcode.llm.profiles`  (legacy: each profile becomes an endpoint and
- *      contributes its model to the endpoint's model list)
- *   3. The legacy single-model settings (baseURL/apiKey/model)
+ * Read every configured endpoint from `burstcode.llm.endpoints`. If the user
+ * has not added any yet, return a single sensible local default so the
+ * extension is usable on a fresh install.
  */
 export function readEndpoints(): LLMEndpoint[] {
   const cfg = vscode.workspace.getConfiguration('burstcode.llm');
   const out: LLMEndpoint[] = [];
-  const byName = new Map<string, LLMEndpoint>();
-
-  const upsert = (ep: LLMEndpoint): void => {
-    const existing = byName.get(ep.name);
-    if (existing) {
-      // Merge model lists, preserving order.
-      for (const m of ep.models) {
-        if (!existing.models.includes(m)) existing.models.push(m);
-      }
-      return;
-    }
-    byName.set(ep.name, ep);
-    out.push(ep);
-  };
+  const seen = new Set<string>();
 
   const rawEndpoints = cfg.get<Array<Partial<LLMEndpoint>>>('endpoints') ?? [];
   for (const r of rawEndpoints) {
     if (!r || typeof r !== 'object') continue;
     const name = typeof r.name === 'string' ? r.name.trim() : '';
-    if (!name) continue;
-    upsert({
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push({
       name,
-      baseURL: typeof r.baseURL === 'string' && r.baseURL ? r.baseURL : (cfg.get<string>('baseURL') ?? DEFAULT_BASE_URL),
-      apiKey: typeof r.apiKey === 'string' && r.apiKey ? r.apiKey : (cfg.get<string>('apiKey') ?? DEFAULT_API_KEY),
-      contextWindow: typeof r.contextWindow === 'number' && r.contextWindow > 0
-        ? r.contextWindow
-        : (cfg.get<number>('contextWindow') ?? DEFAULT_CONTEXT_WINDOW),
-      temperature: typeof r.temperature === 'number'
-        ? r.temperature
-        : (cfg.get<number>('temperature') ?? DEFAULT_TEMPERATURE),
-      allowSelfSignedCerts: typeof r.allowSelfSignedCerts === 'boolean'
-        ? r.allowSelfSignedCerts
-        : (cfg.get<boolean>('allowSelfSignedCerts') ?? false),
+      baseURL: typeof r.baseURL === 'string' && r.baseURL ? r.baseURL : DEFAULT_BASE_URL,
+      apiKey: typeof r.apiKey === 'string' && r.apiKey ? r.apiKey : DEFAULT_API_KEY,
+      contextWindow:
+        typeof r.contextWindow === 'number' && r.contextWindow > 0
+          ? r.contextWindow
+          : DEFAULT_CONTEXT_WINDOW,
+      temperature: typeof r.temperature === 'number' ? r.temperature : DEFAULT_TEMPERATURE,
+      allowSelfSignedCerts: r.allowSelfSignedCerts === true,
       models: Array.isArray(r.models)
-        ? r.models.filter((m): m is string => typeof m === 'string' && !!m.trim()).map((m) => m.trim())
+        ? r.models
+            .filter((m): m is string => typeof m === 'string' && !!m.trim())
+            .map((m) => m.trim())
         : []
     });
   }
 
-  // Legacy: each profile becomes (or extends) an endpoint, contributing its
-  // model to the endpoint's manual list.
-  const rawProfiles = cfg.get<Array<{ name?: string; baseURL?: string; apiKey?: string; model?: string; contextWindow?: number; temperature?: number; allowSelfSignedCerts?: boolean }>>('profiles') ?? [];
-  for (const p of rawProfiles) {
-    if (!p || typeof p !== 'object') continue;
-    const model = typeof p.model === 'string' ? p.model.trim() : '';
-    if (!model) continue;
-    const name = (typeof p.name === 'string' && p.name.trim()) || model;
-    upsert({
-      name,
-      baseURL: typeof p.baseURL === 'string' && p.baseURL ? p.baseURL : (cfg.get<string>('baseURL') ?? DEFAULT_BASE_URL),
-      apiKey: typeof p.apiKey === 'string' && p.apiKey ? p.apiKey : (cfg.get<string>('apiKey') ?? DEFAULT_API_KEY),
-      contextWindow: typeof p.contextWindow === 'number' && p.contextWindow > 0
-        ? p.contextWindow
-        : (cfg.get<number>('contextWindow') ?? DEFAULT_CONTEXT_WINDOW),
-      temperature: typeof p.temperature === 'number'
-        ? p.temperature
-        : (cfg.get<number>('temperature') ?? DEFAULT_TEMPERATURE),
-      allowSelfSignedCerts: typeof p.allowSelfSignedCerts === 'boolean'
-        ? p.allowSelfSignedCerts
-        : (cfg.get<boolean>('allowSelfSignedCerts') ?? false),
-      models: [model]
-    });
-  }
-
   if (out.length === 0) {
-    // Final fallback: synthesize a single endpoint from the legacy single-model
-    // settings so the extension is usable on a fresh install.
-    const legacyModel = cfg.get<string>('model') ?? DEFAULT_MODEL;
     out.push({
       name: DEFAULT_ENDPOINT_NAME,
-      baseURL: cfg.get<string>('baseURL') ?? DEFAULT_BASE_URL,
-      apiKey: cfg.get<string>('apiKey') ?? DEFAULT_API_KEY,
-      contextWindow: cfg.get<number>('contextWindow') ?? DEFAULT_CONTEXT_WINDOW,
-      temperature: cfg.get<number>('temperature') ?? DEFAULT_TEMPERATURE,
-      allowSelfSignedCerts: cfg.get<boolean>('allowSelfSignedCerts') ?? false,
-      models: legacyModel ? [legacyModel] : []
+      baseURL: DEFAULT_BASE_URL,
+      apiKey: DEFAULT_API_KEY,
+      contextWindow: DEFAULT_CONTEXT_WINDOW,
+      temperature: DEFAULT_TEMPERATURE,
+      allowSelfSignedCerts: false,
+      models: [DEFAULT_MODEL]
     });
   }
 
   return out;
 }
 
+/* ------------------------------------------------------------------ */
+/* Active profile (chat) and background profile                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Profile = which (endpoint, model) the runtime should use right now. Two
+ * profiles are tracked: `chat` (foreground panel) and `background`
+ * (idle-time explorer). Each profile is just a pair of strings; everything
+ * else — baseURL, apiKey, contextWindow, temperature, TLS — lives on the
+ * referenced endpoint inside `burstcode.llm.endpoints`. The background
+ * profile additionally has an `inherit` flag that pins it to whatever
+ * `chat` is currently using.
+ */
+export interface BackgroundProfile {
+  inherit: boolean;
+  endpoint: string;
+  model: string;
+}
+
+function readChatProfile(): { endpoint: string; model: string } {
+  const p = vscode.workspace.getConfiguration('burstcode.profiles');
+  return {
+    endpoint: (p.get<string>('chat.endpoint') ?? '').trim(),
+    model: (p.get<string>('chat.model') ?? '').trim()
+  };
+}
+
 export function getActiveEndpointName(): string | undefined {
-  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
-  const v = cfg.get<string>('activeEndpoint');
-  if (v && v.trim()) return v.trim();
-  // Fallback to the legacy `activeProfile` so existing users keep their pick.
-  const legacy = cfg.get<string>('activeProfile');
-  return legacy && legacy.trim() ? legacy.trim() : undefined;
+  const v = readChatProfile().endpoint;
+  return v || undefined;
 }
 
 export function getActiveModelName(): string | undefined {
-  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
-  const v = cfg.get<string>('activeModel');
-  return v && v.trim() ? v.trim() : undefined;
+  const v = readChatProfile().model;
+  return v || undefined;
 }
 
 export function getActiveEndpoint(): LLMEndpoint {
@@ -150,11 +130,53 @@ export function getActiveEndpoint(): LLMEndpoint {
   return endpoints.find((e) => e.name === name) ?? endpoints[0];
 }
 
-/** Persist the user's active endpoint+model selection. */
+/** Persist the user's active chat endpoint+model selection. */
 export async function setActiveSelection(endpointName: string, modelName: string): Promise<void> {
-  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
-  await cfg.update('activeEndpoint', endpointName, vscode.ConfigurationTarget.Global);
-  await cfg.update('activeModel', modelName, vscode.ConfigurationTarget.Global);
+  const profiles = vscode.workspace.getConfiguration('burstcode.profiles');
+  await profiles.update('chat.endpoint', endpointName, vscode.ConfigurationTarget.Global);
+  await profiles.update('chat.model', modelName, vscode.ConfigurationTarget.Global);
+}
+
+export function getBackgroundProfile(): BackgroundProfile {
+  const p = vscode.workspace.getConfiguration('burstcode.profiles');
+  return {
+    inherit: p.get<boolean>('background.inherit') ?? true,
+    endpoint: (p.get<string>('background.endpoint') ?? '').trim(),
+    model: (p.get<string>('background.model') ?? '').trim()
+  };
+}
+
+export async function setBackgroundProfile(
+  next: { inherit?: boolean; endpoint?: string; model?: string }
+): Promise<void> {
+  const p = vscode.workspace.getConfiguration('burstcode.profiles');
+  if (typeof next.inherit === 'boolean') {
+    await p.update('background.inherit', next.inherit, vscode.ConfigurationTarget.Global);
+  }
+  if (typeof next.endpoint === 'string') {
+    await p.update('background.endpoint', next.endpoint, vscode.ConfigurationTarget.Global);
+  }
+  if (typeof next.model === 'string') {
+    await p.update('background.model', next.model, vscode.ConfigurationTarget.Global);
+  }
+}
+
+/** Resolve the background profile to a fully-specified LLMConfig. */
+export function resolveBackgroundLLMConfig(): LLMConfig {
+  const profile = getBackgroundProfile();
+  if (profile.inherit) return readLLMConfig();
+  const endpoints = readEndpoints();
+  const ep = endpoints.find((e) => e.name === profile.endpoint) ?? getActiveEndpoint();
+  const fallback = readLLMConfig();
+  const model = profile.model || ep.models[0] || fallback.model;
+  return {
+    baseURL: ep.baseURL,
+    apiKey: ep.apiKey,
+    model,
+    temperature: ep.temperature,
+    contextWindow: ep.contextWindow,
+    allowSelfSignedCerts: ep.allowSelfSignedCerts
+  };
 }
 
 /** Persist a manually-added model under the given endpoint (no-op if dup). */
@@ -219,11 +241,7 @@ export async function fetchEndpointModels(endpoint: LLMEndpoint): Promise<string
 
 export function readLLMConfig(): LLMConfig {
   const ep = getActiveEndpoint();
-  const activeModel = getActiveModelName();
-  // Resolve the model: explicit selection > endpoint's first known model >
-  // legacy `burstcode.llm.model` fallback.
-  const fallback = vscode.workspace.getConfiguration('burstcode.llm').get<string>('model') ?? DEFAULT_MODEL;
-  const model = activeModel || ep.models[0] || fallback;
+  const model = getActiveModelName() || ep.models[0] || DEFAULT_MODEL;
   return {
     baseURL: ep.baseURL,
     apiKey: ep.apiKey,

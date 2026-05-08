@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { ChatViewProvider } from './chat/ChatViewProvider';
+import { BasicInfoView } from './chat/BasicInfoView';
 import { DependencyGuard } from './deps/DependencyGuard';
 import { HunkApplier } from './edits/HunkApplier';
 import { DiffPreview } from './edits/DiffPreview';
@@ -9,8 +10,10 @@ import {
   readEndpoints,
   fetchEndpointModels,
   setActiveSelection,
+  setBackgroundProfile,
   getActiveEndpointName,
-  getActiveModelName
+  getActiveModelName,
+  getBackgroundProfile
 } from './llm/OpenAIClient';
 import { WorkspaceIndex } from './context/WorkspaceIndex';
 import { BackgroundExplorer, ExplorerStatus } from './background/BackgroundExplorer';
@@ -58,11 +61,43 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
+  const basicInfoView = new BasicInfoView(context);
   context.subscriptions.push(
+    basicInfoView,
+    vscode.window.registerTreeDataProvider(BasicInfoView.viewType, basicInfoView)
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('burstcode.openChat', async () => {
+      try {
+        await vscode.commands.executeCommand('workbench.view.extension.burstcode-chat');
+      } catch {
+        await vscode.commands.executeCommand('workbench.action.focusAuxiliaryBar');
+      }
+      try {
+        await vscode.commands.executeCommand(`${ChatViewProvider.viewType}.focus`);
+      } catch {
+        await vscode.commands.executeCommand('workbench.action.focusAuxiliaryBar');
+      }
+    }),
     vscode.commands.registerCommand('burstcode.newChat', () => chatProvider.newChat()),
     vscode.commands.registerCommand('burstcode.configureModel', () =>
       vscode.commands.executeCommand('workbench.action.openSettings', 'burstcode.llm')
     ),
+    vscode.commands.registerCommand('burstcode.toggleSetting', async (key?: string) => {
+      if (!key || typeof key !== 'string') return;
+      const dot = key.lastIndexOf('.');
+      if (dot <= 0) return;
+      const section = key.slice(0, dot);
+      const prop = key.slice(dot + 1);
+      const cfg = vscode.workspace.getConfiguration(section);
+      const current = cfg.get<boolean>(prop) ?? false;
+      await cfg.update(prop, !current, vscode.ConfigurationTarget.Global);
+      vscode.window.setStatusBarMessage(
+        `BurstCode: ${key} = ${!current ? 'on' : 'off'}`,
+        2000
+      );
+    }),
     vscode.commands.registerCommand('burstcode.selectModel', async () => {
       const endpoints = readEndpoints();
       type Item = vscode.QuickPickItem & { endpoint: string; model: string };
@@ -158,8 +193,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // (sibling of the context-usage gauge); we forward every transition to the
   // ChatViewProvider, which owns the webview.
   chatProvider.setBackgroundStatus(backgroundExplorer.getStatus());
+  basicInfoView.setBackgroundStatus(backgroundExplorer.getStatus());
   context.subscriptions.push(
-    backgroundExplorer.onDidChangeStatus((s: ExplorerStatus) => chatProvider.setBackgroundStatus(s)),
+    backgroundExplorer.onDidChangeStatus((s: ExplorerStatus) => {
+      chatProvider.setBackgroundStatus(s);
+      basicInfoView.setBackgroundStatus(s);
+    }),
     chatProvider.onDidForegroundActivity((reason) => backgroundExplorer.notifyForegroundActivity(reason))
   );
 
@@ -186,8 +225,13 @@ export function activate(context: vscode.ExtensionContext): void {
       const cfg = vscode.workspace.getConfiguration('burstcode.background');
       const isOn = cfg.get<boolean>('enabled') ?? false;
       const status = backgroundExplorer.getStatus();
-      const epLabel = cfg.get<string>('endpoint') || '(inherit chat)';
-      const modelLabel = cfg.get<string>('model') || '(endpoint default)';
+      const profile = getBackgroundProfile();
+      const epLabel = profile.inherit
+        ? '(inherit chat)'
+        : profile.endpoint || '(chat endpoint)';
+      const modelLabel = profile.inherit
+        ? '(inherit chat)'
+        : profile.model || '(endpoint default)';
       type Item = vscode.QuickPickItem & { id: string };
       const items: Item[] = [
         {
@@ -269,29 +313,19 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('burstcode.background.selectModel', async () => {
       const endpoints = readEndpoints();
       type Item = vscode.QuickPickItem & { endpoint: string; model: string };
-      const cfg = vscode.workspace.getConfiguration('burstcode.background');
-      const currentEp = cfg.get<string>('endpoint') ?? '';
-      const currentModel = cfg.get<string>('model') ?? '';
-      const currentBaseURL = (cfg.get<string>('baseURL') ?? '').trim();
+      const profile = getBackgroundProfile();
+      const currentEp = profile.inherit ? '' : profile.endpoint;
+      const currentModel = profile.inherit ? '' : profile.model;
       const items: Item[] = [
-        { label: '$(arrow-swap) Inherit from chat', description: 'Use whichever model the chat panel is on', endpoint: '', model: '' },
         {
-          label: '$(globe) Custom base URL...',
-          description: currentBaseURL
-            ? `Currently: ${currentBaseURL}${currentModel ? ' · ' + currentModel : ''}`
-            : 'Point background loop at a fully independent server',
-          endpoint: '__custom_url__',
+          label: '$(arrow-swap) Inherit from chat',
+          description: profile.inherit
+            ? '(active) Use whichever model the chat panel is on'
+            : 'Use whichever model the chat panel is on',
+          endpoint: '__inherit__',
           model: ''
         }
       ];
-      if (currentBaseURL) {
-        items.push({
-          label: '$(circle-slash) Clear custom URL',
-          description: 'Stop using the custom baseURL and fall back to endpoint inheritance',
-          endpoint: '__clear_url__',
-          model: ''
-        });
-      }
       for (const ep of endpoints) {
         items.push({
           label: ep.name,
@@ -302,7 +336,8 @@ export function activate(context: vscode.ExtensionContext): void {
         for (const m of ep.models) {
           items.push({
             label: m,
-            description: ep.name === currentEp && m === currentModel ? '(background active)' : '',
+            description:
+              !profile.inherit && ep.name === currentEp && m === currentModel ? '(active)' : '',
             detail: ep.baseURL,
             endpoint: ep.name,
             model: m
@@ -317,58 +352,12 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const picked = await vscode.window.showQuickPick(items, {
         title: 'BurstCode: Background Explorer Model',
-        placeHolder: 'Pick a model for the background loop (independent of chat)'
+        placeHolder: 'Pick a model for the background loop, or inherit from chat'
       });
       if (!picked) return;
-      if (picked.endpoint === '__custom_url__') {
-        const url = await vscode.window.showInputBox({
-          title: 'BurstCode: Custom background base URL',
-          prompt: 'OpenAI-compatible base URL for the background explorer (e.g. http://192.168.1.50:11434/v1)',
-          value: currentBaseURL,
-          ignoreFocusOut: true,
-          validateInput: (v) => {
-            const s = (v ?? '').trim();
-            if (!s) return undefined; // empty = clear
-            try { new URL(s); return undefined; } catch { return 'Not a valid URL.'; }
-          }
-        });
-        if (url === undefined) return; // cancelled
-        const trimmed = url.trim();
-        if (!trimmed) {
-          await cfg.update('baseURL', '', vscode.ConfigurationTarget.Global);
-          await cfg.update('apiKey', '', vscode.ConfigurationTarget.Global);
-          vscode.window.showInformationMessage('BurstCode: cleared background custom URL.');
-          return;
-        }
-        const apiKey = await vscode.window.showInputBox({
-          title: 'BurstCode: API key for background URL',
-          prompt: 'Optional API key for the background server (leave empty for local servers like Ollama)',
-          value: cfg.get<string>('apiKey') ?? '',
-          ignoreFocusOut: true,
-          password: true
-        });
-        if (apiKey === undefined) return; // cancelled mid-way
-        const modelId = await vscode.window.showInputBox({
-          title: 'BurstCode: Model id on the custom URL',
-          prompt: 'Model id to call on the custom server (e.g. qwen2.5-coder:7b). Leave empty to inherit later.',
-          value: cfg.get<string>('model') ?? '',
-          ignoreFocusOut: true
-        });
-        if (modelId === undefined) return;
-        await cfg.update('baseURL', trimmed, vscode.ConfigurationTarget.Global);
-        await cfg.update('apiKey', apiKey.trim(), vscode.ConfigurationTarget.Global);
-        await cfg.update('model', modelId.trim(), vscode.ConfigurationTarget.Global);
-        // Clear endpoint name override so it doesn't fight the explicit URL.
-        await cfg.update('endpoint', '', vscode.ConfigurationTarget.Global);
-        vscode.window.showInformationMessage(
-          `BurstCode: background explorer pointed at "${trimmed}"${modelId.trim() ? ' · ' + modelId.trim() : ''}.`
-        );
-        return;
-      }
-      if (picked.endpoint === '__clear_url__') {
-        await cfg.update('baseURL', '', vscode.ConfigurationTarget.Global);
-        await cfg.update('apiKey', '', vscode.ConfigurationTarget.Global);
-        vscode.window.showInformationMessage('BurstCode: cleared background custom URL — falling back to endpoint inheritance.');
+      if (picked.endpoint === '__inherit__') {
+        await setBackgroundProfile({ inherit: true, endpoint: '', model: '' });
+        vscode.window.showInformationMessage('BurstCode: background explorer will inherit the chat model.');
         return;
       }
       if (picked.model === '__fetch__') {
@@ -388,30 +377,21 @@ export function activate(context: vscode.ExtensionContext): void {
             placeHolder: 'Pick a model for the background explorer'
           });
           if (sub) {
-            await cfg.update('endpoint', ep.name, vscode.ConfigurationTarget.Global);
-            await cfg.update('model', sub, vscode.ConfigurationTarget.Global);
+            await setBackgroundProfile({ inherit: false, endpoint: ep.name, model: sub });
             vscode.window.showInformationMessage(`BurstCode: background explorer using "${ep.name} / ${sub}".`);
           }
         } catch (err) {
           vscode.window.showErrorMessage(`BurstCode: failed to fetch models — ${String((err as Error).message ?? err)}`);
         }
-      } else {
-        await cfg.update('endpoint', picked.endpoint, vscode.ConfigurationTarget.Global);
-        await cfg.update('model', picked.model, vscode.ConfigurationTarget.Global);
-        // Picking a named endpoint (or "Inherit from chat") supersedes any
-        // previously-set custom baseURL — otherwise the override would win
-        // silently and the user would be confused why their pick was ignored.
-        if (currentBaseURL) {
-          await cfg.update('baseURL', '', vscode.ConfigurationTarget.Global);
-          await cfg.update('apiKey', '', vscode.ConfigurationTarget.Global);
-        }
-        if (picked.endpoint || picked.model) {
-          vscode.window.showInformationMessage(
-            `BurstCode: background explorer using "${picked.endpoint || '(chat endpoint)'} / ${picked.model || '(endpoint default)'}".`
-          );
-        } else {
-          vscode.window.showInformationMessage('BurstCode: background explorer will inherit the chat model.');
-        }
+      } else if (picked.model) {
+        await setBackgroundProfile({
+          inherit: false,
+          endpoint: picked.endpoint,
+          model: picked.model
+        });
+        vscode.window.showInformationMessage(
+          `BurstCode: background explorer using "${picked.endpoint} / ${picked.model}".`
+        );
       }
     })
   );
