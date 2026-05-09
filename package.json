@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -314,10 +314,15 @@
           "default": 30000,
           "description": "Minimum gap (ms) between successive background cycles, even when the user has been idle the whole time."
         },
-        "burstcode.background.filesPerCycle": {
+        "burstcode.background.batchCharBudget": {
           "type": "number",
-          "default": 1,
-          "description": "How many files to analyse per cycle. Each file = one LLM call."
+          "default": 120000,
+          "description": "Soft character cap per full-scan batch. The background explorer enumerates all candidate source files, sorts by directory, and greedy-packs them into batches whose combined contents stay under this budget (one LLM call per batch). Roughly 4 chars ≈ 1 token; tune to your model's context window. Lower this for small-context models; raise it for big-context models to make each cycle do more work in fewer calls."
+        },
+        "burstcode.background.batchMaxFiles": {
+          "type": "number",
+          "default": 25,
+          "description": "Hard cap on files per full-scan batch. Prevents pathological cases where many tiny files would otherwise pile into a single batch and slow down per-batch latency."
         },
         "burstcode.background.maxConcurrentTopics": {
           "type": "number",
@@ -370,7 +375,7 @@
         "burstcode.background.perFileTimeoutMs": {
           "type": "number",
           "default": 300000,
-          "description": "Base timeout (ms) for a single background LLM call. Used directly for the planner pass and per-file analysis (default 5 min). Topic investigations run an entire AgentLoop with multiple tool calls and use 4× this value (default 20 min) so a slow grep / multi-file read doesn't kill the run. Raise this if you're driving the explorer with a small / slow / CPU-only model."
+          "description": "Base timeout (ms) for a single background LLM call (default 5 min). Full-scan batches and topic investigations both run an entire request and use 4× this value (default 20 min) so a slow batch / multi-file agent loop doesn't get killed prematurely. Raise this if you're driving the explorer with a small / slow / CPU-only model."
         },
         "burstcode.background.runGeneratedTests": {
           "type": "boolean",

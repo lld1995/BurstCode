@@ -13,10 +13,8 @@ import { ChatViewProvider } from '../chat/ChatViewProvider';
 import { WorkspaceIndex } from '../context/WorkspaceIndex';
 import { defaultOutlineOptions } from '../context/WorkspaceOutline';
 import {
-  BACKGROUND_SYSTEM_PROMPT,
-  buildAnalysisUserMessage,
-  BACKGROUND_BRIEF_PROMPT,
-  buildBriefUserMessage,
+  BACKGROUND_BATCH_PROMPT,
+  buildBatchUserMessage,
   BACKGROUND_TOPIC_SYSTEM_PROMPT,
   buildTopicUserMessage
 } from './prompts';
@@ -40,8 +38,6 @@ interface BackgroundConfig {
   idleThresholdMs: number;
   /** Minimum gap between cycles, even on a busy weekend. */
   minIntervalMs: number;
-  /** Files analysed per cycle (each file = one LLM call). */
-  filesPerCycle: number;
   /** How many investigation topics to run concurrently within one cycle. */
   maxConcurrentTopics: number;
   /** Source-file extensions we will scan. */
@@ -56,6 +52,10 @@ interface BackgroundConfig {
   runGeneratedTests: boolean;
   /** Per-test execution timeout. */
   testRunTimeoutMs: number;
+  /** Soft char-count cap per batch in the full-scan pass. */
+  batchCharBudget: number;
+  /** Hard cap on files per batch (defensive against tiny files). */
+  batchMaxFiles: number;
 }
 
 const DEFAULT_INCLUDE_EXTENSIONS = [
@@ -72,7 +72,6 @@ function readConfig(): BackgroundConfig {
     enabled: cfg.get<boolean>('enabled') ?? false,
     idleThresholdMs: Math.max(5000, cfg.get<number>('idleThresholdMs') ?? 10000),
     minIntervalMs: Math.max(1000, cfg.get<number>('minIntervalMs') ?? 30000),
-    filesPerCycle: Math.max(1, cfg.get<number>('filesPerCycle') ?? 1),
     maxConcurrentTopics: Math.max(1, cfg.get<number>('maxConcurrentTopics') ?? 10),
     includeExtensions: Array.isArray(exts) && exts.length > 0
       ? exts.map((e) => e.replace(/^\./, '').toLowerCase()).filter(Boolean)
@@ -81,7 +80,9 @@ function readConfig(): BackgroundConfig {
     outputDir: (cfg.get<string>('outputDir') ?? '.burstcode').trim() || '.burstcode',
     perFileTimeoutMs: Math.max(15_000, cfg.get<number>('perFileTimeoutMs') ?? 300_000),
     runGeneratedTests: cfg.get<boolean>('runGeneratedTests') ?? false,
-    testRunTimeoutMs: Math.max(5_000, cfg.get<number>('testRunTimeoutMs') ?? 60_000)
+    testRunTimeoutMs: Math.max(5_000, cfg.get<number>('testRunTimeoutMs') ?? 60_000),
+    batchCharBudget: Math.max(8_000, cfg.get<number>('batchCharBudget') ?? 120_000),
+    batchMaxFiles: Math.max(1, cfg.get<number>('batchMaxFiles') ?? 25)
   };
 }
 
@@ -141,6 +142,10 @@ interface ExplorerState {
   /** Hash of the workspace top-level layout that produced the current brief.
    *  When the layout changes significantly we trigger a re-plan. */
   briefLayoutHash?: string;
+  /** Per-file one-paragraph summaries produced by the batched full-scan.
+   *  Keys are workspace-relative paths (forward slashes). Used to render
+   *  `project-brief.md` deterministically without an extra LLM call. */
+  fileSummaries?: Record<string, string>;
 }
 
 interface ActivityEntry {
@@ -465,21 +470,18 @@ export class BackgroundExplorer implements vscode.Disposable {
       this.status.testsSkipped = state.testsSkipped ?? 0;
       this.activity('event', `Cycle starting — model ${llm.model} @ ${displayEndpoint(llm.baseURL)}.`);
 
-      // Phase 1: ensure we have a project brief + topic backlog. The planner
-      // also re-runs when the top-level workspace layout changes materially.
+      // Phase 1: full-scan pass. Enumerate every candidate source file,
+      // group into context-window-sized batches, and ask the LLM to (a)
+      // document each file and (b) surface any new multi-file topics. This
+      // is incremental: batches whose files are all unchanged + already
+      // documented are skipped entirely.
       const layoutHash = await this.computeLayoutHash(root);
-      const needsBrief =
-        !state.brief ||
-        !state.topics ||
-        state.topics.length === 0 ||
-        state.briefLayoutHash !== layoutHash;
-      if (needsBrief) {
-        const planned = await this.planProjectBriefAndTopics(root, state, llm, layoutHash);
-        if (!planned) {
-          // Cancelled or error already reported via setPhase/activity. Bail out
-          // of this cycle so we retry on the next idle window.
-          return;
-        }
+      this.cycleAborted = false;
+      const scanned = await this.runBatchedFullScan(root, state, llm, layoutHash);
+      if (!scanned) {
+        // Cancelled mid-scan. State has been saved incrementally by the
+        // scan itself, so any completed batches stick around for next cycle.
+        return;
       }
 
       // Phase 2: drain the pending-topic backlog with a sliding worker pool.
@@ -487,7 +489,6 @@ export class BackgroundExplorer implements vscode.Disposable {
       // times: as soon as one finishes, the next pending topic is launched
       // immediately rather than waiting for the whole batch to complete.
       const concurrency = Math.max(1, this.cfg.maxConcurrentTopics);
-      this.cycleAborted = false;
       // Topics already handed to a worker in this cycle. Prevents two workers
       // from racing on the same topic before its status flips off `pending`.
       const claimed = new Set<string>();
@@ -595,65 +596,170 @@ export class BackgroundExplorer implements vscode.Disposable {
     }
   }
 
-  /**
-   * Read a small set of "high-signal" files at the workspace root that help
-   * the planner understand the project shape (toolchain, entry points, docs).
-   * Each file is capped to ~16KB; missing files are silently skipped.
-   */
-  private async loadKeyFilesForBrief(root: string): Promise<Array<{ relPath: string; contents: string }>> {
-    const candidates = [
-      'package.json', 'pnpm-workspace.yaml', 'tsconfig.json',
-      'pyproject.toml', 'requirements.txt', 'setup.py', 'setup.cfg',
-      'go.mod', 'Cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts',
-      'Gemfile', 'composer.json',
-      'README.md', 'README.rst', 'README.txt', 'README',
-      'ARCHITECTURE.md', 'CONTRIBUTING.md',
-      'src/index.ts', 'src/index.js', 'src/main.ts', 'src/main.py',
-      'src/extension.ts', 'src/app.ts', 'src/server.ts'
-    ];
-    const out: Array<{ relPath: string; contents: string }> = [];
-    for (const rel of candidates) {
-      try {
-        const buf = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(root, rel)));
-        if (buf.byteLength === 0 || buf.byteLength > 64 * 1024) continue;
-        const probe = buf.slice(0, Math.min(4096, buf.byteLength));
-        if (probe.includes(0)) continue;
-        out.push({ relPath: rel, contents: Buffer.from(buf).toString('utf8') });
-      } catch {
-        /* missing — skip */
-      }
-    }
-    return out;
-  }
+  /* ------------------------ batched full-scan -------------------- */
 
   /**
-   * Build the project brief and initial topic backlog with a single LLM call.
-   * Persists to `state.brief` / `state.topics` and writes a human-readable
-   * `project-brief.md`. Returns false if the call was cancelled or failed
-   * irrecoverably.
+   * Phase 1 of every cycle: enumerate every candidate source file, group
+   * them into context-window-sized batches, and ask the LLM to (a) document
+   * each file in the batch and (b) propose any NEW multi-file investigation
+   * topics raised by reading that batch. Each batch is one LLM call.
+   *
+   * Per-file `state.files[].hash` is updated as soon as a batch finishes
+   * successfully, and a batch whose files are all unchanged + already
+   * documented is skipped entirely. State is persisted between batches so a
+   * cancelled cycle keeps the work it had completed.
+   *
+   * Returns false if the cycle was cancelled mid-scan; true otherwise
+   * (including when the scan finds nothing to do).
    */
-  private async planProjectBriefAndTopics(
+  private async runBatchedFullScan(
     root: string,
     state: ExplorerState,
     llm: LLMConfig,
     layoutHash: string
   ): Promise<boolean> {
-    this.setPhase('running', 'Planning: building project brief and topic backlog…');
+    const candidates = await this.collectCandidates(root);
+    if (candidates.length === 0) {
+      this.activity('event', 'Full-scan: no candidate source files found.');
+      // Still refresh the brief so an emptied workspace clears stale data.
+      await this.regenerateProjectBrief(root, state);
+      state.briefLayoutHash = layoutHash;
+      return true;
+    }
 
+    // Sort by directory for locality, then by file name. Files in the same
+    // batch are then likely to be siblings, which produces better topic
+    // proposals than a random permutation.
+    candidates.sort((a, b) => a.relPath.localeCompare(b.relPath));
+
+    // Greedy pack into batches: bound by character budget (proxy for tokens)
+    // and by a hard file count to keep latency predictable.
+    const batches: Array<typeof candidates> = [];
+    let current: typeof candidates = [];
+    let currentChars = 0;
+    const charBudget = this.cfg.batchCharBudget;
+    const maxFiles = this.cfg.batchMaxFiles;
+    for (const c of candidates) {
+      const cost = c.contents.length;
+      // If the file alone exceeds the budget, give it its own batch so we
+      // still produce a doc for it (truncation is handled by maxFileBytes).
+      if (cost > charBudget && current.length === 0) {
+        batches.push([c]);
+        continue;
+      }
+      if (current.length >= maxFiles || (currentChars + cost > charBudget && current.length > 0)) {
+        batches.push(current);
+        current = [];
+        currentChars = 0;
+      }
+      current.push(c);
+      currentChars += cost;
+    }
+    if (current.length > 0) batches.push(current);
+
+    this.activity(
+      'event',
+      `Full-scan: ${candidates.length} file${candidates.length === 1 ? '' : 's'} in ${batches.length} batch${batches.length === 1 ? '' : 'es'}.`
+    );
+
+    let processedBatches = 0;
+    let skippedBatches = 0;
+    let newTopicCount = 0;
+    const outDir = path.join(root, this.cfg.outputDir);
+
+    for (let i = 0; i < batches.length; i++) {
+      if (this.cycleAborted) {
+        this.activity('event', `Full-scan cancelled after ${processedBatches} batch${processedBatches === 1 ? '' : 'es'}.`);
+        return false;
+      }
+      const batch = batches[i];
+
+      // Skip-fast path: every file unchanged AND already has a doc + summary.
+      const summaries = state.fileSummaries ?? {};
+      const allCached = batch.every((f) => {
+        const prior = state.files[f.relPath];
+        const rel = f.relPath.replace(/\\/g, '/');
+        return !!prior && prior.hash === f.hash && typeof summaries[rel] === 'string';
+      });
+      if (allCached) {
+        skippedBatches++;
+        continue;
+      }
+
+      this.setPhase(
+        'running',
+        `Full-scan batch ${i + 1}/${batches.length} — ${batch.length} file${batch.length === 1 ? '' : 's'}`
+      );
+      const ok = await this.analyseBatch(root, batch, state, llm, i, batches.length);
+      if (!ok) {
+        // Cancellation surfaces as cycleAborted; LLM/JSON errors are
+        // already logged by analyseBatch — keep going through other
+        // batches so a single bad batch doesn't poison the whole cycle.
+        if (this.cycleAborted) return false;
+      } else {
+        processedBatches++;
+        const pendingNew = (state.topics ?? []).filter((t) => t.status === 'pending').length;
+        // Persist incrementally and refresh project-brief.md from the
+        // accumulated summaries so a user reading along always sees a brief
+        // that's consistent with the current docs/ + topic backlog.
+        await this.regenerateProjectBrief(root, state);
+        await this.saveState(root, state);
+        newTopicCount = pendingNew;
+      }
+    }
+
+    state.briefLayoutHash = layoutHash;
+    // Final brief regeneration from the accumulated file summaries. Cheap,
+    // deterministic, and ensures the brief reflects every batch we ran.
+    await this.regenerateProjectBrief(root, state);
+
+    this.activity(
+      'event',
+      `Full-scan done: ${processedBatches} batch${processedBatches === 1 ? '' : 'es'} analysed, ${skippedBatches} skipped (cached), ${newTopicCount} pending topic${newTopicCount === 1 ? '' : 's'}.`
+    );
+    return true;
+  }
+
+  /**
+   * Run one batch through the LLM. On success, writes per-file docs, merges
+   * any new topics into `state.topics`, and updates per-file hashes /
+   * summaries so the next cycle can skip this batch.
+   */
+  private async analyseBatch(
+    root: string,
+    batch: Array<{ absPath: string; relPath: string; contents: string; hash: string }>,
+    state: ExplorerState,
+    llm: LLMConfig,
+    batchIndex: number,
+    batchTotal: number
+  ): Promise<boolean> {
     const cts = new vscode.CancellationTokenSource();
     this.currentRuns.add(cts);
-    const timeout = setTimeout(() => cts.cancel(), this.cfg.perFileTimeoutMs);
+    // Batches read whole files at once; allow up to 4× per-file budget so a
+    // big batch on a slow endpoint doesn't time out prematurely.
+    const timeout = setTimeout(() => cts.cancel(), this.cfg.perFileTimeoutMs * 4);
+
     try {
-      const outline = (await this.workspaceIndex.getOutline().catch(() => undefined))?.text ?? '';
-      const keyFiles = await this.loadKeyFilesForBrief(root);
+      const existingTopicTitles = (state.topics ?? []).map((t) => t.title);
+      const filesPayload = batch.map((f) => ({
+        relPath: f.relPath.replace(/\\/g, '/'),
+        language: languageForExtension(path.extname(f.relPath)),
+        contents: f.contents
+      }));
       const messages: ChatMessage[] = [
-        { role: 'system', content: BACKGROUND_BRIEF_PROMPT },
+        { role: 'system', content: BACKGROUND_BATCH_PROMPT },
         {
           role: 'user',
-          content: buildBriefUserMessage({ workspaceOutline: outline, keyFiles })
+          content: buildBatchUserMessage({
+            files: filesPayload,
+            existingTopicTitles,
+            batchIndex,
+            batchTotal
+          })
         }
       ];
 
+      const startedAt = Date.now();
       const client = new OpenAIClient(llm, this.logger);
       let raw = '';
       try {
@@ -662,58 +768,97 @@ export class BackgroundExplorer implements vscode.Disposable {
         }
       } catch (err) {
         if (cts.token.isCancellationRequested) {
-          this.activity('event', 'Planner cancelled before completion.');
+          this.activity('event', `Batch ${batchIndex + 1}/${batchTotal} cancelled mid-stream.`);
           return false;
         }
-        this.activity('error', `Planner LLM error: ${truncate(String(err), 200)}`);
+        this.activity('error', `Batch ${batchIndex + 1}/${batchTotal} LLM error: ${truncate(String(err), 200)}`);
         return false;
       }
       if (cts.token.isCancellationRequested) {
-        this.activity('event', 'Planner cancelled after stream.');
+        this.activity('event', `Batch ${batchIndex + 1}/${batchTotal} cancelled after stream.`);
         return false;
       }
 
-      const plan = parseBriefAndTopics(raw);
-      if (!plan) {
-        this.activity('error', 'Planner output was not valid JSON; will retry next cycle.');
+      const parsed = parseBatchOutput(raw);
+      if (!parsed) {
+        this.activity('error', `Batch ${batchIndex + 1}/${batchTotal}: model output was not parseable JSON; will retry next cycle.`);
         return false;
       }
 
-      // Merge topics: keep done/skipped status from prior plan when ids match,
-      // append new ones, drop nothing the user has already worked on.
-      const existing = new Map<string, TopicState>();
-      for (const t of state.topics ?? []) existing.set(t.id, t);
-      const merged: TopicState[] = [];
-      for (const t of plan.topics) {
-        const prior = existing.get(t.id);
-        merged.push({
-          id: t.id,
+      const allowedPaths = new Set(filesPayload.map((f) => f.relPath));
+      const outDir = path.join(root, this.cfg.outputDir);
+      const summaries = (state.fileSummaries ??= {});
+      let docsWritten = 0;
+      const seenInReply = new Set<string>();
+      for (const fd of parsed.file_docs) {
+        const rel = fd.path.replace(/\\/g, '/');
+        if (!allowedPaths.has(rel)) {
+          // Model invented a path; skip it. Don't poison state.
+          continue;
+        }
+        if (seenInReply.has(rel)) {
+          // Model emitted the same path twice; ignore the duplicate so we
+          // don't double-count or overwrite a better entry with a worse one.
+          continue;
+        }
+        // Don't cache a useless empty doc — that would cause skip-fast to
+        // permanently bypass this file on subsequent cycles even though we
+        // never actually documented it.
+        const summary = (fd.summary ?? '').trim();
+        const docBody = (fd.doc ?? '').trim();
+        if (!summary && !docBody) continue;
+        // Locate the original candidate so we can update its hash.
+        const original = batch.find((f) => f.relPath.replace(/\\/g, '/') === rel);
+        if (!original) continue;
+        seenInReply.add(rel);
+        await writeFileSafe(
+          path.join(outDir, 'docs', rel + '.md'),
+          renderFileDocMarkdown(rel, { path: rel, summary, doc: docBody })
+        );
+        // Fall back to the doc body's first line if the model omitted a
+        // summary; an empty string here would falsely cache the file.
+        summaries[rel] = summary || docBody.split(/\r?\n/, 1)[0].slice(0, 400);
+        state.files[original.relPath] = {
+          hash: original.hash,
+          lastProcessedAt: Date.now(),
+          bugs: state.files[original.relPath]?.bugs ?? 0,
+          uncertainties: state.files[original.relPath]?.uncertainties ?? 0,
+          version: STATE_VERSION
+        };
+        docsWritten++;
+      }
+      state.filesProcessed = (state.filesProcessed ?? 0) + docsWritten;
+      this.status.filesProcessed = state.filesProcessed;
+
+      // Merge new topics. Skip duplicates by id AND by case-insensitive title
+      // (the prompt instructs the model to avoid duplicates by title, but
+      // titles drift slightly between batches).
+      const topics = (state.topics ??= []);
+      const existingIds = new Set(topics.map((t) => t.id));
+      const existingTitles = new Set(topics.map((t) => t.title.toLowerCase()));
+      let added = 0;
+      for (const t of parsed.topics) {
+        let id = slugifyTopicId(t.id || t.title, `topic-${topics.length + added + 1}`);
+        let n = 2;
+        while (existingIds.has(id)) id = `${slugifyTopicId(t.id || t.title, `topic-${topics.length + added + 1}`)}-${n++}`;
+        const titleKey = t.title.toLowerCase();
+        if (existingTitles.has(titleKey)) continue;
+        topics.push({
+          id,
           title: t.title,
           rationale: t.rationale,
           hints: t.hints,
-          status: prior?.status ?? 'pending',
-          updatedAt: prior?.updatedAt,
-          filesExamined: prior?.filesExamined,
-          bugs: prior?.bugs,
-          uncertainties: prior?.uncertainties,
-          lastError: prior?.lastError
+          status: 'pending'
         });
-      }
-      // Preserve prior topics that the new plan dropped (user manual ones, etc.).
-      for (const t of state.topics ?? []) {
-        if (!merged.find((m) => m.id === t.id)) merged.push(t);
+        existingIds.add(id);
+        existingTitles.add(titleKey);
+        added++;
       }
 
-      state.brief = plan.brief;
-      state.topics = merged;
-      state.briefLayoutHash = layoutHash;
-      await writeFileSafe(
-        path.join(root, this.cfg.outputDir, 'project-brief.md'),
-        renderProjectBriefMarkdown(plan.brief, merged)
-      );
+      const elapsedMs = Date.now() - startedAt;
       this.activity(
         'event',
-        `Planner produced ${plan.topics.length} topic${plan.topics.length === 1 ? '' : 's'}; ${merged.filter((t) => t.status === 'pending').length} pending.`
+        `Batch ${batchIndex + 1}/${batchTotal}: ${docsWritten}/${batch.length} doc${docsWritten === 1 ? '' : 's'} written, ${added} new topic${added === 1 ? '' : 's'} (${(elapsedMs / 1000).toFixed(1)}s).`
       );
       return true;
     } finally {
@@ -721,6 +866,21 @@ export class BackgroundExplorer implements vscode.Disposable {
       cts.dispose();
       this.currentRuns.delete(cts);
     }
+  }
+
+  /**
+   * Render `project-brief.md` deterministically from the accumulated
+   * per-file summaries. Avoids an extra LLM call. Also stores the rendered
+   * brief on `state.brief` so topic agents have it for context.
+   */
+  private async regenerateProjectBrief(root: string, state: ExplorerState): Promise<void> {
+    const summaries = state.fileSummaries ?? {};
+    const brief = renderProjectBriefBody(summaries);
+    state.brief = brief;
+    await writeFileSafe(
+      path.join(root, this.cfg.outputDir, 'project-brief.md'),
+      renderProjectBriefMarkdown(brief, state.topics ?? [])
+    );
   }
 
   /* ------------------------ topic investigation ------------------ */
@@ -946,141 +1106,6 @@ export class BackgroundExplorer implements vscode.Disposable {
     }
   }
 
-  private async analyseFile(
-    root: string,
-    file: { absPath: string; relPath: string; contents: string; hash: string },
-    state: ExplorerState,
-    llm: LLMConfig
-  ): Promise<boolean> {
-    this.setPhase('running', `Analysing ${file.relPath}`, file.relPath);
-
-    const cts = new vscode.CancellationTokenSource();
-    this.currentRuns.add(cts);
-    const timeout = setTimeout(() => cts.cancel(), this.cfg.perFileTimeoutMs);
-
-    try {
-      const language = languageForExtension(path.extname(file.relPath));
-      const outline = (await this.workspaceIndex.getOutline().catch(() => undefined))?.text;
-      const importSpecifier = computeImportSpecifier(file.relPath, this.cfg.outputDir);
-      const messages: ChatMessage[] = [
-        { role: 'system', content: BACKGROUND_SYSTEM_PROMPT },
-        {
-          role: 'user',
-          content: buildAnalysisUserMessage({
-            relativePath: file.relPath.replace(/\\/g, '/'),
-            language,
-            contents: file.contents,
-            workspaceOutline: outline,
-            importSpecifier
-          })
-        }
-      ];
-
-      const startedAt = Date.now();
-      const client = new OpenAIClient(llm, this.logger);
-      let raw = '';
-      try {
-        for await (const chunk of client.streamChat(messages, [], cts.token)) {
-          if (chunk.contentDelta) raw += chunk.contentDelta;
-        }
-      } catch (err) {
-        if (cts.token.isCancellationRequested) {
-          this.activity('event', `Analysis cancelled mid-stream: ${file.relPath}`);
-          return false;
-        }
-        this.logger.warn(`BackgroundExplorer LLM error on ${file.relPath}`, String(err));
-        this.activity('error', `LLM error on ${file.relPath}: ${truncate(String(err), 200)}`);
-        return false;
-      }
-
-      if (cts.token.isCancellationRequested) {
-        this.activity('event', `Analysis cancelled after stream: ${file.relPath}`);
-        return false;
-      }
-
-      const elapsedMs = Date.now() - startedAt;
-      const parsed = parseAnalysis(raw);
-      if (!parsed) {
-        this.activity('error', `Could not parse JSON for ${file.relPath} (LLM did not follow schema).`);
-        // Still mark processed so we don't loop on a model that won't comply.
-      }
-
-      // Persist outputs.
-      const outDir = path.join(root, this.cfg.outputDir);
-      let bugCount = 0;
-      let testCount = 0;
-      const writtenTests: Array<{ absPath: string; language: string; topic: string }> = [];
-      if (parsed && !parsed.skip) {
-        await writeFileSafe(
-          path.join(outDir, 'docs', file.relPath + '.md'),
-          renderDocMarkdown(file.relPath, parsed)
-        );
-        if (parsed.bugs.length > 0) {
-          await this.queueBugsAppend(
-            path.join(outDir, 'bugs.md'),
-            renderBugsMarkdown(file.relPath, parsed)
-          );
-          bugCount = parsed.bugs.length;
-          this.activity('event', `Recorded ${bugCount} suspected bug${bugCount === 1 ? '' : 's'} in ${file.relPath}.`);
-        }
-        // For Python projects, drop a conftest.py once so the auto-runner can
-        // import workspace-rooted modules (e.g. `from src.foo import ...`).
-        if (parsed.uncertainties.some((u) => u.language?.toLowerCase().startsWith('py'))) {
-          await ensurePyConftest(outDir);
-        }
-        for (const u of parsed.uncertainties) {
-          const fname = sanitiseFilename(u.filename) || defaultTestFilename(file.relPath, u.language);
-          const testPath = path.join(outDir, 'tests', file.relPath + '.d', fname);
-          await writeFileSafe(testPath, renderTestFile(file.relPath, u));
-          writtenTests.push({ absPath: testPath, language: u.language, topic: u.topic });
-          testCount++;
-        }
-        if (testCount > 0) {
-          this.activity('event', `Generated ${testCount} test${testCount === 1 ? '' : 's'} for uncertainties in ${file.relPath}.`);
-        }
-      }
-
-      this.activity(
-        'event',
-        `Analysed ${file.relPath} in ${(elapsedMs / 1000).toFixed(1)}s — ${bugCount} bug${bugCount === 1 ? '' : 's'}, ${testCount} test${testCount === 1 ? '' : 's'}.`
-      );
-
-      state.files[file.relPath] = {
-        hash: file.hash,
-        lastProcessedAt: Date.now(),
-        bugs: bugCount,
-        uncertainties: testCount,
-        version: STATE_VERSION
-      };
-      state.filesProcessed = (state.filesProcessed ?? 0) + 1;
-      state.bugsFound = (state.bugsFound ?? 0) + bugCount;
-      state.testsGenerated = (state.testsGenerated ?? 0) + testCount;
-
-      // Refresh aggregate counters in the live status.
-      this.status.filesProcessed = state.filesProcessed;
-      this.status.bugsFound = state.bugsFound;
-      this.status.testsGenerated = state.testsGenerated ?? 0;
-
-      // Auto-run generated tests when configured. Each result is recorded
-      // both alongside the test file and in the rolling verifications log.
-      if (this.cfg.runGeneratedTests && writtenTests.length > 0) {
-        await this.runAndRecordTests(root, file.relPath, writtenTests, state);
-      } else if (writtenTests.length > 0) {
-        this.activity('event', `Auto-run disabled — review tests under ${path.posix.join(this.cfg.outputDir, 'tests', file.relPath.replace(/\\/g, '/') + '.d')}/.`);
-      }
-
-      // Update the index README + state at the end so partial failures still
-      // leave on-disk artefacts consistent with state.json.
-      await writeFileSafe(path.join(outDir, 'README.md'), renderIndexReadme(state, this.cfg, llm, this.activityTail));
-
-      return true;
-    } finally {
-      clearTimeout(timeout);
-      cts.dispose();
-      this.currentRuns.delete(cts);
-    }
-  }
-
   /**
    * Execute each generated test file and write a per-test result file
    * (`<test>.result.md`), a workspace-level verifications log, and update
@@ -1143,25 +1168,6 @@ export class BackgroundExplorer implements vscode.Disposable {
   }
 
   /* ------------------------ file scanning ------------------------ */
-
-  private async pickNextFile(
-    root: string,
-    state: ExplorerState
-  ): Promise<{ absPath: string; relPath: string; contents: string; hash: string } | undefined> {
-    const candidates = await this.collectCandidates(root);
-    // Process never-seen files first, then those whose hash changed, in
-    // alphabetical order so progress is predictable.
-    const fresh: typeof candidates = [];
-    const changed: typeof candidates = [];
-    for (const c of candidates) {
-      const prior = state.files[c.relPath];
-      if (!prior) fresh.push(c);
-      else if (prior.hash !== c.hash) changed.push(c);
-    }
-    fresh.sort((a, b) => a.relPath.localeCompare(b.relPath));
-    changed.sort((a, b) => a.relPath.localeCompare(b.relPath));
-    return fresh[0] ?? changed[0];
-  }
 
   private async collectCandidates(
     root: string
@@ -1248,7 +1254,11 @@ export class BackgroundExplorer implements vscode.Disposable {
           testsSkipped: parsed.testsSkipped ?? 0,
           brief: typeof parsed.brief === 'string' ? parsed.brief : undefined,
           topics: Array.isArray(parsed.topics) ? sanitizeTopics(parsed.topics) : undefined,
-          briefLayoutHash: typeof parsed.briefLayoutHash === 'string' ? parsed.briefLayoutHash : undefined
+          briefLayoutHash: typeof parsed.briefLayoutHash === 'string' ? parsed.briefLayoutHash : undefined,
+          fileSummaries:
+            parsed.fileSummaries && typeof parsed.fileSummaries === 'object'
+              ? sanitizeFileSummaries(parsed.fileSummaries as Record<string, unknown>)
+              : undefined
         };
       }
     } catch {
@@ -1327,15 +1337,14 @@ export class BackgroundExplorer implements vscode.Disposable {
 }
 
 /* ------------------------------------------------------------------ */
-/* JSON parsing                                                        */
+/* Shared analysis types                                               */
 /* ------------------------------------------------------------------ */
 
-interface AnalysisBug {
-  line: number | null;
-  severity: 'low' | 'medium' | 'high';
-  title: string;
-  description: string;
-}
+/**
+ * Shape of an "uncertainty" — a behaviour the model wants to verify with a
+ * generated unit test. Used by the topic-investigation pass; the parser is
+ * defined alongside `parseTopicResult`.
+ */
 interface AnalysisUncertainty {
   topic: string;
   rationale: string;
@@ -1344,143 +1353,10 @@ interface AnalysisUncertainty {
   filename: string;
   test_code: string;
 }
-interface AnalysisResult {
-  skip: boolean;
-  summary: string;
-  doc: string;
-  bugs: AnalysisBug[];
-  uncertainties: AnalysisUncertainty[];
-}
-
-function parseAnalysis(raw: string): AnalysisResult | undefined {
-  if (!raw) return undefined;
-  // Strip ```json fences if present, then locate the outermost JSON object.
-  let text = raw.trim();
-  text = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start < 0 || end <= start) return undefined;
-  const candidate = text.slice(start, end + 1);
-  let obj: unknown;
-  try {
-    obj = JSON.parse(candidate);
-  } catch {
-    return undefined;
-  }
-  if (!obj || typeof obj !== 'object') return undefined;
-  const o = obj as Record<string, unknown>;
-  const bugs: AnalysisBug[] = Array.isArray(o.bugs)
-    ? o.bugs
-        .map((b) => {
-          if (!b || typeof b !== 'object') return undefined;
-          const r = b as Record<string, unknown>;
-          const sev = String(r.severity ?? 'low').toLowerCase();
-          return {
-            line: typeof r.line === 'number' ? r.line : null,
-            severity: (sev === 'high' || sev === 'medium' ? sev : 'low') as AnalysisBug['severity'],
-            title: String(r.title ?? '').slice(0, 200),
-            description: String(r.description ?? '').slice(0, 4000)
-          };
-        })
-        .filter((b): b is AnalysisBug => !!b && (!!b.title || !!b.description))
-    : [];
-  const uncertainties: AnalysisUncertainty[] = Array.isArray(o.uncertainties)
-    ? o.uncertainties
-        .map((u) => {
-          if (!u || typeof u !== 'object') return undefined;
-          const r = u as Record<string, unknown>;
-          return {
-            topic: String(r.topic ?? '').slice(0, 300),
-            rationale: String(r.rationale ?? '').slice(0, 2000),
-            language: String(r.language ?? '').toLowerCase(),
-            framework: String(r.framework ?? ''),
-            filename: String(r.filename ?? ''),
-            test_code: String(r.test_code ?? '')
-          };
-        })
-        .filter((u): u is AnalysisUncertainty => !!u && !!u.test_code)
-    : [];
-  return {
-    skip: o.skip === true,
-    summary: String(o.summary ?? '').slice(0, 2000),
-    doc: String(o.doc ?? '').slice(0, 20000),
-    bugs,
-    uncertainties
-  };
-}
 
 /* ------------------------------------------------------------------ */
 /* Output rendering                                                    */
 /* ------------------------------------------------------------------ */
-
-function renderDocMarkdown(relPath: string, a: AnalysisResult): string {
-  const lines: string[] = [];
-  lines.push(`# ${relPath}`);
-  lines.push('');
-  lines.push(`_Generated by BurstCode background explorer at ${new Date().toISOString()}_`);
-  lines.push('');
-  if (a.summary) {
-    lines.push('## Summary');
-    lines.push('');
-    lines.push(a.summary.trim());
-    lines.push('');
-  }
-  if (a.doc) {
-    lines.push('## Details');
-    lines.push('');
-    lines.push(a.doc.trim());
-    lines.push('');
-  }
-  if (a.bugs.length > 0) {
-    lines.push('## Potential Issues');
-    lines.push('');
-    for (const b of a.bugs) {
-      const where = b.line ? `line ${b.line}` : 'unspecified';
-      lines.push(`- **[${b.severity.toUpperCase()}] ${b.title}** (${where}) — ${b.description}`);
-    }
-    lines.push('');
-  }
-  if (a.uncertainties.length > 0) {
-    lines.push('## Uncertainties / Generated Tests');
-    lines.push('');
-    for (const u of a.uncertainties) {
-      lines.push(`- **${u.topic}** — ${u.rationale} _(${u.language}/${u.framework})_`);
-    }
-    lines.push('');
-  }
-  return lines.join('\n');
-}
-
-function renderBugsMarkdown(relPath: string, a: AnalysisResult): string {
-  const lines: string[] = [];
-  lines.push(`## ${relPath} — ${new Date().toISOString()}`);
-  lines.push('');
-  for (const b of a.bugs) {
-    const where = b.line ? `line ${b.line}` : 'unspecified';
-    lines.push(`- **[${b.severity.toUpperCase()}] ${b.title}** (${where})`);
-    if (b.description) lines.push(`  - ${b.description.split('\n').join('\n    ')}`);
-  }
-  lines.push('');
-  return lines.join('\n');
-}
-
-function renderTestFile(relPath: string, u: AnalysisUncertainty): string {
-  const banner =
-    `// BurstCode background-generated test for: ${relPath}\n` +
-    `// Topic: ${u.topic}\n` +
-    `// Rationale: ${u.rationale}\n` +
-    `// Framework: ${u.framework}\n` +
-    `// NOTE: this test was machine-generated for verification of an\n` +
-    `// uncertainty; review and adjust imports/paths before running.\n\n`;
-  const isPython = u.language.startsWith('py');
-  const isGo = u.language === 'go';
-  const commentBanner = isPython
-    ? banner.replace(/^\/\//gm, '#')
-    : isGo
-      ? banner
-      : banner;
-  return commentBanner + u.test_code.trim() + '\n';
-}
 
 function renderIndexReadme(
   state: ExplorerState,
@@ -1651,18 +1527,6 @@ function sanitiseFilename(name: string): string {
   return name.trim().replace(/[\\/:*?"<>|]+/g, '_').slice(0, 120);
 }
 
-function defaultTestFilename(relPath: string, language: string): string {
-  const base = path.basename(relPath, path.extname(relPath));
-  const lang = (language || '').toLowerCase();
-  if (lang.startsWith('py')) return `test_${base}.py`;
-  if (lang === 'go') return `${base}_test.go`;
-  if (lang === 'rust') return `${base}_test.rs`;
-  if (lang === 'java' || lang === 'kotlin') return `${base}Test.${lang === 'kotlin' ? 'kt' : 'java'}`;
-  if (lang === 'csharp') return `${base}Tests.cs`;
-  // Default: TS/JS-style .test.ts
-  return `${base}.test.ts`;
-}
-
 function displayEndpoint(baseURL: string): string {
   try {
     const u = new URL(baseURL);
@@ -1674,24 +1538,6 @@ function displayEndpoint(baseURL: string): string {
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
-}
-
-/**
- * Compute the relative import specifier the model should use inside any
- * generated TS/JS test for `srcRelPath`. The test will live at
- * `<outputDir>/tests/<srcRelPath>.d/<filename>`, so we walk back to the
- * workspace root and forward into the source file (without extension).
- *
- * Always returns POSIX-style separators because module specifiers in
- * TS/JS code use `/` regardless of host OS.
- */
-function computeImportSpecifier(srcRelPath: string, outputDir: string): string {
-  const posixSrc = srcRelPath.replace(/\\/g, '/');
-  const testDir = `${outputDir.replace(/\\/g, '/')}/tests/${posixSrc}.d`;
-  const rel = path.posix.relative(testDir, posixSrc);
-  // Strip a known JS/TS-style extension so the import works under both
-  // bundlers and Node-with-extension-resolution.
-  return rel.replace(/\.(ts|tsx|js|jsx|mjs|cjs)$/i, '');
 }
 
 /**
@@ -1725,11 +1571,6 @@ async function readFileOrEmpty(absPath: string): Promise<string> {
 /* Topic-driven helpers                                                */
 /* ------------------------------------------------------------------ */
 
-interface PlannerOutput {
-  brief: string;
-  topics: Array<{ id: string; title: string; rationale: string; hints: string[] }>;
-}
-
 interface TopicAnalysisResult {
   skip: boolean;
   summary: string;
@@ -1755,6 +1596,149 @@ function slugifyTopicId(s: string, fallback: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 64);
   return slug || fallback;
+}
+
+/** Defensive-deserialise the per-file summaries map loaded from disk. */
+function sanitizeFileSummaries(obj: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof k !== 'string' || !k) continue;
+    if (typeof v !== 'string') continue;
+    // Cap each summary so a misbehaving model can't bloat state.json.
+    out[k.replace(/\\/g, '/')] = v.slice(0, 4000);
+  }
+  return out;
+}
+
+/** Parsed shape of a batched-full-scan LLM reply. */
+interface BatchFileDoc {
+  path: string;
+  summary: string;
+  doc: string;
+}
+interface BatchOutput {
+  file_docs: BatchFileDoc[];
+  topics: Array<{ id: string; title: string; rationale: string; hints: string[] }>;
+  batch_summary: string;
+}
+
+/** Parse a batched-full-scan reply. Returns undefined if unparseable. */
+function parseBatchOutput(raw: string): BatchOutput | undefined {
+  const candidate = extractJsonObject(raw);
+  if (!candidate) return undefined;
+  let obj: unknown;
+  try {
+    obj = JSON.parse(candidate);
+  } catch {
+    return undefined;
+  }
+  if (!obj || typeof obj !== 'object') return undefined;
+  const o = obj as Record<string, unknown>;
+  const fileDocs: BatchFileDoc[] = Array.isArray(o.file_docs)
+    ? o.file_docs
+        .map((fd): BatchFileDoc | undefined => {
+          if (!fd || typeof fd !== 'object') return undefined;
+          const r = fd as Record<string, unknown>;
+          const p = typeof r.path === 'string' ? r.path.trim() : '';
+          if (!p) return undefined;
+          return {
+            path: p,
+            summary: typeof r.summary === 'string' ? r.summary.slice(0, 2000) : '',
+            doc: typeof r.doc === 'string' ? r.doc.slice(0, 16_000) : ''
+          };
+        })
+        .filter((fd): fd is BatchFileDoc => !!fd)
+    : [];
+  const seenTopicIds = new Set<string>();
+  const topics: BatchOutput['topics'] = Array.isArray(o.topics)
+    ? o.topics
+        .map((t, i): BatchOutput['topics'][number] | undefined => {
+          if (!t || typeof t !== 'object') return undefined;
+          const r = t as Record<string, unknown>;
+          const title = typeof r.title === 'string' ? r.title.trim().slice(0, 240) : '';
+          if (!title) return undefined;
+          const idRaw = typeof r.id === 'string' ? r.id : title;
+          let id = slugifyTopicId(idRaw, `topic-${i + 1}`);
+          let n = 2;
+          while (seenTopicIds.has(id)) id = `${slugifyTopicId(idRaw, `topic-${i + 1}`)}-${n++}`;
+          seenTopicIds.add(id);
+          return {
+            id,
+            title,
+            rationale: typeof r.rationale === 'string' ? r.rationale.slice(0, 2000) : '',
+            hints: Array.isArray(r.hints)
+              ? r.hints.filter((h): h is string => typeof h === 'string').slice(0, 16)
+              : []
+          };
+        })
+        .filter((t): t is BatchOutput['topics'][number] => !!t)
+    : [];
+  // We require at least one valid file_doc; a reply that omits all docs
+  // (only topics, or nothing) is treated as a parse failure so the host
+  // doesn't accept a no-op batch. Without this, a misbehaving model could
+  // keep returning topics-only and the same batch would silently re-run
+  // every cycle without ever writing a doc.
+  if (fileDocs.length === 0) return undefined;
+  return {
+    file_docs: fileDocs,
+    topics,
+    batch_summary: typeof o.batch_summary === 'string' ? o.batch_summary.slice(0, 2000) : ''
+  };
+}
+
+/** Render the per-file Markdown document produced by a batched scan. */
+function renderFileDocMarkdown(relPath: string, fd: BatchFileDoc): string {
+  const lines: string[] = [];
+  lines.push(`# ${relPath}`);
+  lines.push('');
+  lines.push(`_Generated by BurstCode background explorer at ${new Date().toISOString()}_`);
+  lines.push('');
+  if (fd.summary) {
+    lines.push('## Summary');
+    lines.push('');
+    lines.push(fd.summary.trim());
+    lines.push('');
+  }
+  if (fd.doc) {
+    lines.push('## Details');
+    lines.push('');
+    lines.push(fd.doc.trim());
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Build the body of the project brief deterministically from accumulated
+ * per-file summaries. Files are grouped by their top-level directory so the
+ * brief reads as "what each module is" rather than a flat alphabetical
+ * dump. Pure function — no LLM call.
+ */
+function renderProjectBriefBody(summaries: Record<string, string>): string {
+  const entries = Object.entries(summaries).filter(([k, v]) => k && v);
+  if (entries.length === 0) return '';
+  // Group by top-level directory (or "(root)" for files at the repo root).
+  const groups = new Map<string, Array<{ rel: string; summary: string }>>();
+  for (const [rel, summary] of entries) {
+    const top = rel.includes('/') ? rel.split('/')[0] : '(root)';
+    const arr = groups.get(top) ?? [];
+    arr.push({ rel, summary });
+    groups.set(top, arr);
+  }
+  const sortedGroups = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const lines: string[] = [];
+  lines.push(`This project contains **${entries.length}** documented source file${entries.length === 1 ? '' : 's'} across ${sortedGroups.length} top-level area${sortedGroups.length === 1 ? '' : 's'}. Per-file documentation lives under \`docs/\`.`);
+  lines.push('');
+  for (const [top, files] of sortedGroups) {
+    lines.push(`## ${top}`);
+    lines.push('');
+    files.sort((a, b) => a.rel.localeCompare(b.rel));
+    for (const f of files) {
+      lines.push(`- \`${f.rel}\` — ${f.summary.replace(/\s+/g, ' ').trim()}`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n').trim();
 }
 
 /** Defensive-deserialise an array of topics loaded from disk. */
@@ -1787,25 +1771,6 @@ function sanitizeTopics(arr: unknown[]): TopicState[] {
       lastError: typeof r.lastError === 'string' ? r.lastError : undefined,
       attempts: typeof r.attempts === 'number' ? r.attempts : undefined
     });
-  }
-  return out;
-}
-
-/** Pick the first pending topic in plan order; returns undefined if all done. */
-function pickNextPendingTopic(state: ExplorerState): TopicState | undefined {
-  return (state.topics ?? []).find((t) => t.status === 'pending');
-}
-
-/**
- * Pick up to `n` pending topics in plan order. Used to dispatch a parallel
- * batch in a single cycle. Returns an empty array when nothing is pending.
- */
-function pickPendingTopics(state: ExplorerState, n: number): TopicState[] {
-  const out: TopicState[] = [];
-  for (const t of state.topics ?? []) {
-    if (t.status !== 'pending') continue;
-    out.push(t);
-    if (out.length >= n) break;
   }
   return out;
 }
@@ -1888,50 +1853,6 @@ function extractJsonObject(raw: string): string | undefined {
     }
   }
   return best;
-}
-
-function parseBriefAndTopics(raw: string): PlannerOutput | undefined {
-  const candidate = extractJsonObject(raw);
-  if (!candidate) return undefined;
-  let obj: unknown;
-  try {
-    obj = JSON.parse(candidate);
-  } catch {
-    return undefined;
-  }
-  if (!obj || typeof obj !== 'object') return undefined;
-  const o = obj as Record<string, unknown>;
-  const brief = typeof o.brief === 'string' ? o.brief.slice(0, 16_000) : '';
-  if (!brief) return undefined;
-  const seen = new Set<string>();
-  const topics: PlannerOutput['topics'] = Array.isArray(o.topics)
-    ? o.topics
-        .map((t, i): PlannerOutput['topics'][number] | undefined => {
-          if (!t || typeof t !== 'object') return undefined;
-          const r = t as Record<string, unknown>;
-          const title = typeof r.title === 'string' ? r.title.trim().slice(0, 240) : '';
-          if (!title) return undefined;
-          const idRaw = typeof r.id === 'string' ? r.id : title;
-          let id = slugifyTopicId(idRaw, `topic-${i + 1}`);
-          // Ensure uniqueness within the planner output.
-          let n = 2;
-          while (seen.has(id)) {
-            id = `${slugifyTopicId(idRaw, `topic-${i + 1}`)}-${n++}`;
-          }
-          seen.add(id);
-          return {
-            id,
-            title,
-            rationale: typeof r.rationale === 'string' ? r.rationale.slice(0, 2000) : '',
-            hints: Array.isArray(r.hints)
-              ? r.hints.filter((h): h is string => typeof h === 'string').slice(0, 16)
-              : []
-          };
-        })
-        .filter((t): t is PlannerOutput['topics'][number] => !!t)
-    : [];
-  if (topics.length === 0) return undefined;
-  return { brief, topics };
 }
 
 function parseTopicResult(raw: string): TopicAnalysisResult | undefined {
