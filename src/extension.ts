@@ -91,10 +91,34 @@ export function activate(context: vscode.ExtensionContext): void {
       const section = key.slice(0, dot);
       const prop = key.slice(dot + 1);
       const cfg = vscode.workspace.getConfiguration(section);
+      // Flip the value at the scope that is CURRENTLY winning so the merged
+      // (effective) value actually changes. Writing blindly to Global would
+      // be silently overridden whenever a workspace / folder setting pins
+      // the same key (e.g. `.vscode/settings.json`), which is exactly how
+      // toggles like `burstcode.shell.autoApprove` end up stuck "on" in the
+      // UI while the agent keeps prompting.
+      const inspected = cfg.inspect<boolean>(prop);
       const current = cfg.get<boolean>(prop) ?? false;
-      await cfg.update(prop, !current, vscode.ConfigurationTarget.Global);
+      const next = !current;
+      let target: vscode.ConfigurationTarget = vscode.ConfigurationTarget.Global;
+      if (inspected?.workspaceFolderValue !== undefined) {
+        target = vscode.ConfigurationTarget.WorkspaceFolder;
+      } else if (inspected?.workspaceValue !== undefined) {
+        target = vscode.ConfigurationTarget.Workspace;
+      }
+      try {
+        await cfg.update(prop, next, target);
+      } catch (err) {
+        // WorkspaceFolder can fail when no folder is open; fall back to Global.
+        if (target !== vscode.ConfigurationTarget.Global) {
+          await cfg.update(prop, next, vscode.ConfigurationTarget.Global);
+          target = vscode.ConfigurationTarget.Global;
+        } else {
+          throw err;
+        }
+      }
       vscode.window.setStatusBarMessage(
-        `BurstCode: ${key} = ${!current ? 'on' : 'off'}`,
+        `BurstCode: ${key} = ${next ? 'on' : 'off'}`,
         2000
       );
     }),

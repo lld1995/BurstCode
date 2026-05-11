@@ -17,6 +17,7 @@ export interface AgentEvent {
     | 'tool-call-end'
     | 'iteration-start'
     | 'auto-continue'
+    | 'auto-resume'
     | 'context-usage'
     | 'context-compressed'
     | 'stuck-detected'
@@ -82,6 +83,14 @@ export interface AgentOptions {
   autoContinueOnLength: boolean;
   /** Cap on consecutive auto-continues (resets whenever the model makes progress via a tool call). */
   maxAutoContinues: number;
+  /**
+   * Auto-retry the in-flight turn when the LLM stream is interrupted by a
+   * transient error (network drop, server reset, HTTP 5xx, abort, ...).
+   * When false, the agent ends the run with reason 'error' as before.
+   */
+  autoResumeOnStreamError: boolean;
+  /** Cap on consecutive auto-resumes (resets after any successful streaming turn). */
+  maxAutoResumes: number;
   /**
    * System prompt for this run. Built freshly per user request by the host so
    * it can embed an up-to-date workspace outline. When omitted the agent
@@ -200,31 +209,95 @@ export class AgentLoop {
       >();
       let finishReason: string | undefined;
 
-      try {
-        for await (const chunk of this.client.streamChat(compressed, this.toolDefs(), cancellation)) {
-          if (chunk.contentDelta) {
-            assistantText += chunk.contentDelta;
-            yield { type: 'assistant-delta', payload: chunk.contentDelta };
+      // Auto-resume on transient stream errors. We retry the whole turn
+      // (same compressed messages) and reset the per-attempt accumulators so
+      // the next streaming pass starts from a clean slate. The webview also
+      // discards any partial assistant bubble on receipt of `auto-resume` so
+      // the user does not see duplicated text.
+      const maxResumes = this.options.autoResumeOnStreamError
+        ? Math.max(0, this.options.maxAutoResumes)
+        : 0;
+      let resumeAttempt = 0;
+      let streamOk = false;
+      while (!streamOk) {
+        // Reset per-attempt streaming state.
+        assistantText = '';
+        reasoningText = '';
+        toolCallAccumulator.clear();
+        finishReason = undefined;
+
+        try {
+          for await (const chunk of this.client.streamChat(compressed, this.toolDefs(), cancellation)) {
+            if (chunk.contentDelta) {
+              assistantText += chunk.contentDelta;
+              yield { type: 'assistant-delta', payload: chunk.contentDelta };
+            }
+            if (chunk.reasoningDelta) {
+              reasoningText += chunk.reasoningDelta;
+              yield { type: 'reasoning-delta', payload: chunk.reasoningDelta };
+            }
+            if (chunk.toolCallDelta) {
+              const idx = chunk.toolCallDelta.index;
+              const entry =
+                toolCallAccumulator.get(idx) ?? { id: undefined, name: '', arguments: '' };
+              if (chunk.toolCallDelta.id) entry.id = chunk.toolCallDelta.id;
+              if (chunk.toolCallDelta.name) entry.name = chunk.toolCallDelta.name;
+              if (chunk.toolCallDelta.argumentsDelta) entry.arguments += chunk.toolCallDelta.argumentsDelta;
+              toolCallAccumulator.set(idx, entry);
+            }
+            if (chunk.finishReason) finishReason = chunk.finishReason;
           }
-          if (chunk.reasoningDelta) {
-            reasoningText += chunk.reasoningDelta;
-            yield { type: 'reasoning-delta', payload: chunk.reasoningDelta };
+          streamOk = true;
+        } catch (err) {
+          // User-driven cancellation: don't retry, end cleanly so the run
+          // surfaces the 'cancelled' reason rather than a noisy error.
+          if (cancellation.isCancellationRequested) {
+            this.logger.info(`LLM stream cancelled by user: ${String(err)}`);
+            yield { type: 'done', payload: { reason: 'cancelled' } };
+            return;
           }
-          if (chunk.toolCallDelta) {
-            const idx = chunk.toolCallDelta.index;
-            const entry =
-              toolCallAccumulator.get(idx) ?? { id: undefined, name: '', arguments: '' };
-            if (chunk.toolCallDelta.id) entry.id = chunk.toolCallDelta.id;
-            if (chunk.toolCallDelta.name) entry.name = chunk.toolCallDelta.name;
-            if (chunk.toolCallDelta.argumentsDelta) entry.arguments += chunk.toolCallDelta.argumentsDelta;
-            toolCallAccumulator.set(idx, entry);
+          if (resumeAttempt >= maxResumes) {
+            this.logger.error('LLM stream error', String(err));
+            const detail = String(err);
+            const suffix =
+              maxResumes > 0
+                ? ` (after ${resumeAttempt} auto-resume${resumeAttempt === 1 ? '' : 's'})`
+                : '';
+            yield { type: 'error', payload: `Stream interrupted${suffix}: ${detail}` };
+            return;
           }
-          if (chunk.finishReason) finishReason = chunk.finishReason;
+          resumeAttempt++;
+          const delayMs = Math.min(500 * 2 ** (resumeAttempt - 1), 4000);
+          this.logger.warn(
+            `LLM stream interrupted (attempt ${resumeAttempt}/${maxResumes}); resuming in ${delayMs}ms: ${String(err)}`
+          );
+          yield {
+            type: 'auto-resume',
+            payload: {
+              attempt: resumeAttempt,
+              max: maxResumes,
+              error: String(err),
+              delayMs
+            }
+          };
+          // Cancellable sleep before the next attempt.
+          const cancelled = await new Promise<boolean>((resolve) => {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const sub = cancellation.onCancellationRequested(() => {
+              if (timer !== undefined) clearTimeout(timer);
+              sub.dispose();
+              resolve(true);
+            });
+            timer = setTimeout(() => {
+              sub.dispose();
+              resolve(false);
+            }, delayMs);
+          });
+          if (cancelled) {
+            yield { type: 'done', payload: { reason: 'cancelled' } };
+            return;
+          }
         }
-      } catch (err) {
-        this.logger.error('LLM stream error', String(err));
-        yield { type: 'error', payload: String(err) };
-        return;
       }
 
       const toolCalls = Array.from(toolCallAccumulator.entries())

@@ -648,6 +648,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       requireConfirmBeforeEdit: agentCfg.get<boolean>('requireConfirmBeforeEdit') ?? true,
       autoContinueOnLength: agentCfg.get<boolean>('autoContinueOnLength') ?? true,
       maxAutoContinues: agentCfg.get<number>('maxAutoContinues') ?? 3,
+      autoResumeOnStreamError: agentCfg.get<boolean>('autoResumeOnStreamError') ?? true,
+      maxAutoResumes: agentCfg.get<number>('maxAutoResumes') ?? 3,
       maxStuckRepeats: agentCfg.get<number>('maxStuckRepeats') ?? 2,
       askUser,
       systemPrompt
@@ -678,6 +680,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             break;
           case 'auto-continue':
             this.post({ type: 'auto-continue', payload: event.payload });
+            break;
+          case 'auto-resume':
+            this.post({ type: 'auto-resume', payload: event.payload });
             break;
           case 'context-usage':
             this.post({ type: 'context-usage', payload: event.payload });
@@ -2190,6 +2195,31 @@ window.addEventListener('message', (e) => {
       setStatus('continue', 'Auto-continuing ' + msg.payload.count + '/' + msg.payload.max + '...');
       break;
     }
+    case 'auto-resume': {
+      // Stream was interrupted mid-turn. Discard any partial assistant /
+      // reasoning bubble so the retry's fresh stream doesn't duplicate text,
+      // then drop a visible pill explaining what's happening (the previous
+      // UX was "the chat silently stopped with no reason").
+      clearEmptyState();
+      if (activeAssistantEl && activeAssistantEl.parentNode) {
+        activeAssistantEl.parentNode.removeChild(activeAssistantEl);
+      }
+      if (activeReasoningEl && activeReasoningEl.parentNode) {
+        activeReasoningEl.parentNode.removeChild(activeReasoningEl);
+      }
+      activeAssistantEl = null;
+      activeReasoningEl = null;
+      const attempt = (msg.payload && msg.payload.attempt) || 1;
+      const max = (msg.payload && msg.payload.max) || 1;
+      const errText = (msg.payload && msg.payload.error) ? String(msg.payload.error) : 'stream interrupted';
+      const pill = document.createElement('div');
+      pill.className = 'iter-pill';
+      pill.innerHTML = '<span class="pill" title="' + escapeHtml(errText) + '">↻ auto-resume ' + attempt + '/' + max + '</span>';
+      log.appendChild(pill);
+      scrollToBottom();
+      setStatus('continue', 'Stream interrupted, resuming ' + attempt + '/' + max + '...');
+      break;
+    }
     case 'reasoning-delta': {
       if (!activeReasoningEl) {
         activeReasoningEl = addReasoningMsg('', { open: true, streaming: true });
@@ -2511,9 +2541,12 @@ window.addEventListener('message', (e) => {
         proposed_edit_done: 'Done · edit proposed',
         cancelled: 'Cancelled',
         max_iterations: 'Stopped: max iterations reached',
-        length: 'Stopped: output truncated'
+        length: 'Stopped: output truncated',
+        stuck: 'Stopped: agent appeared stuck (no askUser)',
+        'aborted-stuck': 'Stopped: aborted after repeated tool-calls'
       };
-      setStatus(reason === 'cancelled' || reason === 'max_iterations' ? 'error' : 'done', labels[reason] || ('Done (' + reason + ')'));
+      const errorish = reason === 'cancelled' || reason === 'max_iterations' || reason === 'stuck' || reason === 'aborted-stuck';
+      setStatus(errorish ? 'error' : 'done', labels[reason] || ('Done (' + reason + ')'));
       break;
     }
     case 'models': {

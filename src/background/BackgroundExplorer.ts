@@ -915,6 +915,8 @@ export class BackgroundExplorer implements vscode.Disposable {
         requireConfirmBeforeEdit: true,
         autoContinueOnLength: true,
         maxAutoContinues: 2,
+        autoResumeOnStreamError: true,
+        maxAutoResumes: 3,
         systemPrompt: BACKGROUND_TOPIC_SYSTEM_PROMPT
       });
 

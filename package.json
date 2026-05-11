@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -265,6 +265,16 @@
           "type": "number",
           "default": 3,
           "description": "Maximum number of consecutive auto-continues before giving up. Resets whenever the model successfully calls a tool."
+        },
+        "burstcode.agent.autoResumeOnStreamError": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the LLM stream is interrupted by a transient error (network drop, server reset, HTTP 5xx, etc.), automatically retry the in-flight turn instead of ending the run with an error."
+        },
+        "burstcode.agent.maxAutoResumes": {
+          "type": "number",
+          "default": 3,
+          "description": "Maximum number of consecutive auto-resumes after a stream interruption before surfacing the error. The counter resets after a successful streaming turn."
         },
         "burstcode.agent.maxStuckRepeats": {
           "type": "number",
