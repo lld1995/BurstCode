@@ -19,6 +19,13 @@ export interface SystemPromptInput {
   lessonsBlock?: string;
   /** True when the lessons block was truncated due to size. */
   lessonsTruncated?: boolean;
+  /**
+   * Plan carried over from earlier turns in the same session. Surfaced to the
+   * model so it can decide each turn whether to keep, refine or REPLACE it.
+   * Without this signal the model tends to silently reuse a stale plan or
+   * skip planning entirely on follow-up complex requests.
+   */
+  currentPlan?: Array<{ id: string; content: string; status: string }>;
 }
 
 const HEADER = `You are BurstCode, an autonomous coding agent embedded in VS Code.
@@ -93,10 +100,19 @@ const PROTOCOL = `WORKING PROTOCOL:
      • Trust the <workspace_layout> embedded below — it is freshly-built and reflects the
        current on-disk structure. Don't call workspace_outline for paths that are already shown.
 
-3. DECIDE whether to plan.
+3. DECIDE whether to plan — RE-EVALUATE EVERY TURN, not just at session start.
    - Complex / multi-file / multi-step changes → call update_plan with concrete ordered steps,
-     mark the first one in_progress, update as you go.
+     mark the first one in_progress, update as you go (flip steps to completed / add new
+     steps via further update_plan calls — always submit the FULL plan).
    - Trivial single-edit tasks → skip update_plan.
+   - FOLLOW-UP TURNS in the same session: do NOT assume an earlier plan still applies. If
+     a <current_plan> block is shown below, treat it as historical state. When the user's
+     new request is a SUBSTANTIVELY NEW non-trivial task (not just a tweak to the previous
+     one), call update_plan again with a fresh ordered plan for THIS request — that REPLACES
+     the old plan. When the new request is a small follow-up to the previous task, you may
+     extend the existing plan instead (re-submit it with new / updated steps). Either way,
+     the user should see a plan that reflects the CURRENT request, not a stale one from
+     several turns ago. The presence of <current_plan> is never a reason to skip planning.
 
 4. BEFORE modifying any strongly-typed file (.cs / .py / .ts / .vue / .axaml), confirm
    blast radius via find_references_by_name on the symbol you plan to change so you
@@ -250,6 +266,15 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): string {
     ? '\n(Note: lessons block was truncated — older lessons may not appear here.)'
     : '';
   sections.push(`<lessons_learned>\n${lessonsBody}\n</lessons_learned>${lessonsTrunc}`);
+
+  if (input.currentPlan && input.currentPlan.length > 0) {
+    const planLines = input.currentPlan
+      .map((s, i) => `${i + 1}. [${s.status}] ${s.content}`)
+      .join('\n');
+    sections.push(
+      `<current_plan>\n${planLines}\n</current_plan>\n(This plan was published on an earlier turn in this session. Per PROTOCOL step 3, decide whether to REPLACE it with a fresh update_plan call for the current request, extend it, or skip planning if the new request is trivial.)`
+    );
+  }
 
   sections.push(PROTOCOL);
   sections.push(LESSONS_PROTOCOL);

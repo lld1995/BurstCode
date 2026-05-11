@@ -437,10 +437,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async buildSystemPromptForRun(): Promise<string> {
     const lessonsRender = renderLessonsBlock(this.lessons.list());
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const currentPlan = this.currentSession?.plan;
     if (!root) {
       return buildSystemPrompt({
         lessonsBlock: lessonsRender.text,
-        lessonsTruncated: lessonsRender.truncated
+        lessonsTruncated: lessonsRender.truncated,
+        currentPlan
       });
     }
     try {
@@ -454,14 +456,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         workspaceOutline: outline.text,
         outlineTruncated: outline.truncated,
         lessonsBlock: lessonsRender.text,
-        lessonsTruncated: lessonsRender.truncated
+        lessonsTruncated: lessonsRender.truncated,
+        currentPlan
       });
     } catch (err) {
       this.logger.warn('Failed to build workspace outline', String(err));
       return buildSystemPrompt({
         workspaceRoot: root,
         lessonsBlock: lessonsRender.text,
-        lessonsTruncated: lessonsRender.truncated
+        lessonsTruncated: lessonsRender.truncated,
+        currentPlan
       });
     }
   }
