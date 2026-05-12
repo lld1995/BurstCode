@@ -861,7 +861,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /* Note: no scroll-behavior:smooth so that auto-follow detection (which
      compares scrollTop against scrollHeight on every scroll event) is not
      fooled by intermediate frames of a smooth-scroll animation. */
-  #log { flex: 1; overflow-y: auto; padding: 16px 14px 8px; }
+  #log { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; overflow-anchor: none; padding: 16px 14px 8px; }
   #log .turn { margin-bottom: 18px; max-width: 100%; }
   #log .turn:last-child { margin-bottom: 8px; }
 
@@ -1308,17 +1308,29 @@ let currentIter = 0;
 // stop forcing scroll so they can read freely; once they come back to the
 // bottom edge, auto-follow resumes.
 let autoScroll = true;
+let pendingScrollFrame = 0;
+let pendingScrollForce = false;
 const SCROLL_BOTTOM_THRESHOLD = 24;
 function isLogAtBottom() {
   return log.scrollHeight - log.scrollTop - log.clientHeight <= SCROLL_BOTTOM_THRESHOLD;
 }
 log.addEventListener('scroll', () => { autoScroll = isLogAtBottom(); }, { passive: true });
+function scheduleScrollToBottom(force) {
+  pendingScrollForce = pendingScrollForce || force;
+  if (pendingScrollFrame) return;
+  pendingScrollFrame = requestAnimationFrame(() => {
+    pendingScrollFrame = 0;
+    const shouldScroll = pendingScrollForce || autoScroll;
+    pendingScrollForce = false;
+    if (shouldScroll) log.scrollTop = log.scrollHeight;
+  });
+}
 function scrollToBottom() {
-  if (autoScroll) log.scrollTop = log.scrollHeight;
+  if (autoScroll) scheduleScrollToBottom(false);
 }
 function forceScrollToBottom() {
   autoScroll = true;
-  log.scrollTop = log.scrollHeight;
+  scheduleScrollToBottom(true);
 }
 
 function fmtElapsed(ms) {
