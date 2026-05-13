@@ -37,6 +37,38 @@ const AUTO_COMPRESS_TARGET_RATIO = 0.4;
  * the 2nd repeat (i.e. 3 identical turns in a row) escalates to askUser.
  */
 const DEFAULT_MAX_STUCK_REPEATS = 2;
+const DEFAULT_MAX_PREMATURE_STOP_CONTINUES = 5;
+
+function looksIncompleteAfterTools(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  if (trimmed.length < 80) return true;
+  const lower = trimmed.toLowerCase();
+  return [
+    'i need to',
+    'i should',
+    "i'll",
+    'next i',
+    'still need',
+    'need to continue',
+    'not finished',
+    'not complete',
+    'todo',
+    '还需要',
+    '尚未',
+    '未完成',
+    '没解决',
+    '需要继续',
+    '下一步',
+    '我将',
+    '我会',
+    '待办'
+  ].some((marker) => lower.includes(marker));
+}
+
+function buildPrematureStopPrompt(reason: string): string {
+  return `[auto-continue] You stopped before the task was clearly complete (${reason}). Re-check the user's original request and all tool results. If anything remains unresolved, continue by calling the appropriate tools or proposing edits. Only finish when you can give a concrete final answer that directly answers the question or states exactly what was completed.`;
+}
 
 /**
  * Canonicalize a tool-call batch into a stable string so two turns that
@@ -109,6 +141,8 @@ export interface AgentOptions {
    * self-correction nudge; askUser fires once `consecutiveRepeats >= this`.
    */
   maxStuckRepeats?: number;
+  autoContinueOnPrematureStop?: boolean;
+  maxPrematureStopContinues?: number;
 }
 
 export class AgentLoop {
@@ -149,6 +183,13 @@ export class AgentLoop {
     }
 
     let consecutiveAutoContinues = 0;
+    let consecutivePrematureStopContinues = 0;
+    let sawToolCallsThisRun = false;
+    const autoContinueOnPrematureStop = this.options.autoContinueOnPrematureStop ?? true;
+    const maxPrematureStopContinues = Math.max(
+      0,
+      this.options.maxPrematureStopContinues ?? DEFAULT_MAX_PREMATURE_STOP_CONTINUES
+    );
 
     // Stuck-detection state: signature of the previous turn's tool-call batch
     // and the number of consecutive turns we've seen the SAME signature. Reset
@@ -319,6 +360,53 @@ export class AgentLoop {
             }
           : {})
       } as ChatMessage;
+      if (toolCalls.length === 0 && finishReason === 'tool_calls') {
+        if (
+          autoContinueOnPrematureStop &&
+          consecutivePrematureStopContinues < maxPrematureStopContinues
+        ) {
+          consecutivePrematureStopContinues++;
+          messages.push({
+            role: 'user',
+            content: buildPrematureStopPrompt('finish_reason=tool_calls but no valid tool call was received')
+          });
+          yield {
+            type: 'auto-continue',
+            payload: { count: consecutivePrematureStopContinues, max: maxPrematureStopContinues }
+          };
+          continue;
+        }
+        const detail =
+          'Model ended with finish_reason=tool_calls, but no valid tool call was received. The run cannot continue safely because the tool-call stream was empty or malformed.';
+        this.logger.error(detail);
+        yield { type: 'assistant-message', payload: { text: assistantText, toolCalls: 0 } };
+        yield { type: 'error', payload: detail };
+        return;
+      }
+      if (toolCalls.length === 0 && finishReason !== 'length' && assistantText.trim().length === 0) {
+        if (
+          sawToolCallsThisRun &&
+          autoContinueOnPrematureStop &&
+          consecutivePrematureStopContinues < maxPrematureStopContinues
+        ) {
+          consecutivePrematureStopContinues++;
+          messages.push({
+            role: 'user',
+            content: buildPrematureStopPrompt(`empty assistant turn, finish_reason=${finishReason ?? 'missing'}`)
+          });
+          yield {
+            type: 'auto-continue',
+            payload: { count: consecutivePrematureStopContinues, max: maxPrematureStopContinues }
+          };
+          continue;
+        }
+        const detail =
+          `Model ended without a user-visible answer or a tool call (finish_reason=${finishReason ?? 'missing'}).`;
+        this.logger.error(detail);
+        yield { type: 'assistant-message', payload: { text: assistantText, toolCalls: 0 } };
+        yield { type: 'error', payload: detail };
+        return;
+      }
       messages.push(assistantMsg);
       yield { type: 'assistant-message', payload: { text: assistantText, toolCalls: toolCalls.length } };
 
@@ -344,12 +432,32 @@ export class AgentLoop {
           };
           continue;
         }
+        if (
+          finishReason !== 'length' &&
+          sawToolCallsThisRun &&
+          autoContinueOnPrematureStop &&
+          consecutivePrematureStopContinues < maxPrematureStopContinues &&
+          looksIncompleteAfterTools(assistantText)
+        ) {
+          consecutivePrematureStopContinues++;
+          messages.push({
+            role: 'user',
+            content: buildPrematureStopPrompt(`assistant final answer looked incomplete, finish_reason=${finishReason ?? 'missing'}`)
+          });
+          yield {
+            type: 'auto-continue',
+            payload: { count: consecutivePrematureStopContinues, max: maxPrematureStopContinues }
+          };
+          continue;
+        }
         yield { type: 'done', payload: { reason: finishReason ?? 'stop' } };
         return;
       }
 
       // Tool calls were emitted: making real progress, reset the auto-continue budget.
+      sawToolCallsThisRun = true;
       consecutiveAutoContinues = 0;
+      consecutivePrematureStopContinues = 0;
 
       // Iterate the same filtered `toolCalls` array we used to build
       // assistantMsg.tool_calls so the tool_call_id we attach to each tool

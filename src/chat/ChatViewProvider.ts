@@ -655,6 +655,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       autoResumeOnStreamError: agentCfg.get<boolean>('autoResumeOnStreamError') ?? true,
       maxAutoResumes: agentCfg.get<number>('maxAutoResumes') ?? 3,
       maxStuckRepeats: agentCfg.get<number>('maxStuckRepeats') ?? 2,
+      autoContinueOnPrematureStop: agentCfg.get<boolean>('autoContinueOnPrematureStop') ?? true,
+      maxPrematureStopContinues: agentCfg.get<number>('maxPrematureStopContinues') ?? 5,
       askUser,
       systemPrompt
     });

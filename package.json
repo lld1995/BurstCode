@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -280,6 +280,16 @@
           "type": "number",
           "default": 2,
           "description": "Number of CONSECUTIVE identical tool-call turns that must be observed before escalating to an interactive prompt. The 1st repeat (2 identical turns) always injects an automatic self-correction nudge; once the counter reaches this value (default: 3 identical turns) the agent asks you to continue, give a hint, or stop."
+        },
+        "burstcode.agent.autoContinueOnPrematureStop": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the model stops after tool use without a clear final answer, automatically continue the run instead of silently ending."
+        },
+        "burstcode.agent.maxPrematureStopContinues": {
+          "type": "number",
+          "default": 5,
+          "description": "Maximum number of automatic continuations after suspicious early stops in one user request."
         },
         "burstcode.lsp.maxWaitMs": {
           "type": "number",
