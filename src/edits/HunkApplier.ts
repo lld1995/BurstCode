@@ -601,8 +601,12 @@ function applyHunkToText(text: string, h: ProposedHunk, eol: string): string {
 }
 
 function hunkToRange(doc: vscode.TextDocument, h: ProposedHunk): vscode.Range {
-  const start = Math.max(0, h.startLine - 1);
-  const endLineIdx = Math.min(doc.lineCount - 1, h.endLine - 1);
+  const maxLine = Math.max(0, doc.lineCount - 1);
+  const start = Math.max(0, Math.min(maxLine, h.startLine - 1));
+  if (h.startLine > h.endLine) {
+    return new vscode.Range(start, 0, start, 0);
+  }
+  const endLineIdx = Math.max(0, Math.min(maxLine, h.endLine - 1));
   const endChar = doc.lineAt(endLineIdx).text.length;
   return new vscode.Range(start, 0, endLineIdx, endChar);
 }

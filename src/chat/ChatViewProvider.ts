@@ -117,7 +117,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.html = this.renderHtml(webviewView.webview);
 
-    webviewView.webview.onDidReceiveMessage((msg: InboundMessage) => this.handleMessage(msg));
+    webviewView.webview.onDidReceiveMessage((msg: InboundMessage) => {
+      void this.handleMessage(msg).catch((err) => {
+        const message = String((err as Error)?.message ?? err);
+        this.logger.error('Webview message failed', message);
+        this.post({ type: 'action-error', payload: { action: msg.type, message } });
+      });
+    });
     // Send the initial model list once the webview is ready.
     this.broadcastModels();
     this.broadcastSessions();
@@ -2342,6 +2348,15 @@ window.addEventListener('message', (e) => {
         log.appendChild(flash);
         scrollToBottom();
       }
+      break;
+    }
+    case 'action-error': {
+      const p = msg.payload || {};
+      if (String(p.action || '').indexOf('edits') >= 0) {
+        pendingAcceptBtn.disabled = false;
+        pendingRejectBtn.disabled = false;
+      }
+      addErrorMsg('⚠ ' + (p.message || 'Action failed'));
       break;
     }
     case 'ask-user': {
