@@ -39,6 +39,81 @@ const AUTO_COMPRESS_TARGET_RATIO = 0.4;
 const DEFAULT_MAX_STUCK_REPEATS = 2;
 const DEFAULT_MAX_PREMATURE_STOP_CONTINUES = 5;
 
+type AccumulatedToolCall = { id?: string; name: string; arguments: string };
+
+function decodeDsmlText(text: string): string {
+  return text
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&#(\d+);/g, (_, n: string) => {
+      const code = Number(n);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n: string) => {
+      const code = Number.parseInt(n, 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+    });
+}
+
+function parseDsmlAttributes(raw: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const re = /([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw))) {
+    attrs[m[1]] = decodeDsmlText(m[2] ?? m[3] ?? '');
+  }
+  return attrs;
+}
+
+function coerceDsmlParameter(value: string, attrs: Record<string, string>): unknown {
+  const decoded = decodeDsmlText(value);
+  if (attrs.string === 'true') return decoded;
+  const trimmed = decoded.trim();
+  if (!trimmed) return decoded;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return decoded;
+  }
+}
+
+function extractDsmlToolCalls(text: string): { text: string; calls: AccumulatedToolCall[] } {
+  const calls: AccumulatedToolCall[] = [];
+  const dsml = '[|｜]DSML[|｜]';
+  const blockRe = new RegExp(`<${dsml}tool_calls\\b[^>]*>([\\s\\S]*?)<\\/${dsml}tool_calls>`, 'g');
+  const invokeRe = new RegExp(`<${dsml}invoke\\b([^>]*)>([\\s\\S]*?)<\\/${dsml}invoke>`, 'g');
+  const paramRe = new RegExp(`<${dsml}parameter\\b([^>]*)>([\\s\\S]*?)<\\/${dsml}parameter>`, 'g');
+
+  let cleaned = text;
+  let block: RegExpExecArray | null;
+  while ((block = blockRe.exec(text))) {
+    let invoke: RegExpExecArray | null;
+    while ((invoke = invokeRe.exec(block[1]))) {
+      const invokeAttrs = parseDsmlAttributes(invoke[1]);
+      const name = invokeAttrs.name;
+      if (!name) continue;
+      const args: Record<string, unknown> = {};
+      let param: RegExpExecArray | null;
+      while ((param = paramRe.exec(invoke[2]))) {
+        const paramAttrs = parseDsmlAttributes(param[1]);
+        const paramName = paramAttrs.name;
+        if (!paramName) continue;
+        args[paramName] = coerceDsmlParameter(param[2], paramAttrs);
+      }
+      calls.push({ name, arguments: JSON.stringify(args) });
+    }
+  }
+
+  if (calls.length > 0) {
+    cleaned = cleaned.replace(blockRe, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd();
+  }
+
+  return { text: cleaned, calls };
+}
+
 function looksIncompleteAfterTools(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return true;
@@ -341,10 +416,17 @@ export class AgentLoop {
         }
       }
 
-      const toolCalls = Array.from(toolCallAccumulator.entries())
+      let toolCalls = Array.from(toolCallAccumulator.entries())
         .sort((a, b) => a[0] - b[0])
         .map(([, v]) => v)
         .filter((v) => v.name);
+      const inlineDsml = extractDsmlToolCalls(assistantText);
+      if (inlineDsml.calls.length > 0) {
+        assistantText = inlineDsml.text;
+        if (toolCalls.length === 0) {
+          toolCalls = inlineDsml.calls;
+        }
+      }
 
       const assistantMsg: ChatMessage = {
         role: 'assistant',

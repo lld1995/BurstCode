@@ -2289,6 +2289,19 @@ window.addEventListener('message', (e) => {
         activeReasoningEl.open = false;
         activeReasoningEl = null;
       }
+      if (activeAssistantEl && msg.payload && typeof msg.payload.text === 'string') {
+        const finalText = msg.payload.text;
+        if (finalText.trim().length === 0) {
+          activeAssistantEl.remove();
+        } else {
+          activeAssistantEl.dataset.raw = finalText;
+          const mdEl = activeAssistantEl.querySelector('.md');
+          if (mdEl) {
+            mdEl.innerHTML = renderMarkdown(finalText);
+            bindCodeCopy(mdEl);
+          }
+        }
+      }
       activeAssistantEl = null;
       break;
     case 'tool-call-start': {
