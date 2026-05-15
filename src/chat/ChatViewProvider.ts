@@ -258,6 +258,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return this.currentSession;
   }
 
+  private ensureSystemMessageSlot(session: Session): void {
+    if (session.messages.some((m) => m.role === 'system')) return;
+    session.messages.unshift({ role: 'system', content: '' });
+    session.checkpoints = (session.checkpoints ?? []).map((c) => ({
+      ...c,
+      messageIndex: c.messageIndex + 1
+    }));
+  }
+
   private async persistCurrentSession(): Promise<void> {
     if (!this.currentSession) return;
     this.currentSession.updatedAt = Date.now();
@@ -511,7 +520,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const session = this.currentSession;
     session.messages = session.messages.slice(0, messageIndex);
-    session.checkpoints = (session.checkpoints ?? []).filter((c) => c.messageIndex < messageIndex);
+    session.checkpoints = (session.checkpoints ?? []).filter((c) => c.ref !== ref && c.messageIndex < messageIndex);
     session.plan = [];
     await this.persistCurrentSession();
 
@@ -546,6 +555,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.currentRun = cts;
 
     const session = this.ensureSessionForUserText(userText);
+    this.ensureSystemMessageSlot(session);
     const messageIndex = session.messages.length;
     session.messages.push({ role: 'user', content: userText });
 
@@ -1318,19 +1328,36 @@ let currentIter = 0;
 let autoScroll = true;
 let pendingScrollFrame = 0;
 let pendingScrollForce = false;
-const SCROLL_BOTTOM_THRESHOLD = 24;
+let lastManualScrollAt = 0;
+const SCROLL_BOTTOM_THRESHOLD = 48;
 function isLogAtBottom() {
   return log.scrollHeight - log.scrollTop - log.clientHeight <= SCROLL_BOTTOM_THRESHOLD;
 }
-log.addEventListener('scroll', () => { autoScroll = isLogAtBottom(); }, { passive: true });
+function markManualScrollIntent() {
+  lastManualScrollAt = Date.now();
+}
+log.addEventListener('wheel', markManualScrollIntent, { passive: true });
+log.addEventListener('touchmove', markManualScrollIntent, { passive: true });
+log.addEventListener('pointerdown', markManualScrollIntent, { passive: true });
+log.addEventListener('scroll', () => {
+  const atBottom = isLogAtBottom();
+  if (Date.now() - lastManualScrollAt < 800 || atBottom) autoScroll = atBottom;
+}, { passive: true });
 function scheduleScrollToBottom(force) {
   pendingScrollForce = pendingScrollForce || force;
   if (pendingScrollFrame) return;
   pendingScrollFrame = requestAnimationFrame(() => {
     pendingScrollFrame = 0;
-    const shouldScroll = pendingScrollForce || autoScroll;
+    const didForce = pendingScrollForce;
+    const shouldScroll = didForce || autoScroll;
     pendingScrollForce = false;
-    if (shouldScroll) log.scrollTop = log.scrollHeight;
+    if (shouldScroll) {
+      log.scrollTop = log.scrollHeight;
+      requestAnimationFrame(() => {
+        if (didForce || autoScroll) log.scrollTop = log.scrollHeight;
+        autoScroll = isLogAtBottom();
+      });
+    }
   });
 }
 function scrollToBottom() {
@@ -2303,6 +2330,7 @@ window.addEventListener('message', (e) => {
         }
       }
       activeAssistantEl = null;
+      scrollToBottom();
       break;
     case 'tool-call-start': {
       clearEmptyState();
@@ -2345,6 +2373,7 @@ window.addEventListener('message', (e) => {
         const names = Array.from(runningTools.values()).map((t) => t.name).join(', ');
         setStatus('tool', 'Running ' + names + '...');
       }
+      scrollToBottom();
       break;
     }
     case 'pending-edits': {

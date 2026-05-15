@@ -119,7 +119,13 @@ export function buildTranscript(
 ): TranscriptEntry[] {
   const entries: TranscriptEntry[] = [];
   const refByIndex = new Map<number, string>();
-  for (const c of checkpoints ?? []) refByIndex.set(c.messageIndex, c.ref);
+  for (const c of checkpoints ?? []) {
+    const idx =
+      messages[c.messageIndex]?.role === 'system' && messages[c.messageIndex + 1]?.role === 'user'
+        ? c.messageIndex + 1
+        : c.messageIndex;
+    refByIndex.set(idx, c.ref);
+  }
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m.role === 'system') continue;

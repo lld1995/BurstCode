@@ -114,15 +114,79 @@ function extractDsmlToolCalls(text: string): { text: string; calls: AccumulatedT
   return { text: cleaned, calls };
 }
 
-function looksIncompleteAfterTools(text: string): boolean {
+function hasOpenFence(text: string): boolean {
+  const matches = text.match(/```/g);
+  return !!matches && matches.length % 2 === 1;
+}
+
+function asksUserQuestion(text: string): boolean {
+  const trimmed = text.trim();
+  const lower = trimmed.toLowerCase();
+  return (
+    /[?？]\s*(?:[`'")\]}）】]*)$/.test(trimmed) ||
+    /[?？]/.test(trimmed.slice(-240)) ||
+    [
+      'which would you prefer',
+      'what would you like',
+      'do you want me to',
+      'should i',
+      'please confirm',
+      '请确认',
+      '你希望',
+      '你想',
+      '是否需要',
+      '要不要',
+      '需要我'
+    ].some((marker) => lower.includes(marker))
+  );
+}
+
+function hasConclusiveSignal(text: string): boolean {
+  const trimmed = text.trim();
+  const lower = trimmed.toLowerCase();
+  if (!trimmed) return false;
+  if (
+    [
+      'done',
+      'completed',
+      'fixed',
+      'implemented',
+      'updated',
+      'verified',
+      'summary',
+      'conclusion',
+      'root cause',
+      '已完成',
+      '完成了',
+      '已修复',
+      '修复了',
+      '已更新',
+      '已经',
+      '总结',
+      '结论',
+      '原因是',
+      '可以了',
+      '验证通过',
+      '处理好了'
+    ].some((marker) => lower.includes(marker))
+  ) {
+    return true;
+  }
+  return /[.!。！]\s*(?:[`'")\]}）】]*)$/.test(trimmed);
+}
+
+function looksIncompleteFinalAnswer(text: string, afterTools: boolean): boolean {
   const trimmed = text.trim();
   if (!trimmed) return true;
-  if (trimmed.length < 80) return true;
   const lower = trimmed.toLowerCase();
-  return [
+  if (hasOpenFence(trimmed)) return true;
+  if (/[:：,，;；\-—…]\s*(?:[`'")\]}）】]*)$/.test(trimmed)) return true;
+  const hasIncompleteMarker = [
     'i need to',
     'i should',
     "i'll",
+    'i will',
+    'let me',
     'next i',
     'still need',
     'need to continue',
@@ -137,12 +201,18 @@ function looksIncompleteAfterTools(text: string): boolean {
     '下一步',
     '我将',
     '我会',
+    '我需要',
+    '接下来',
+    '继续',
     '待办'
   ].some((marker) => lower.includes(marker));
+  if (hasIncompleteMarker) return true;
+  if (afterTools && !hasConclusiveSignal(trimmed) && !asksUserQuestion(trimmed)) return true;
+  return false;
 }
 
 function buildPrematureStopPrompt(reason: string): string {
-  return `[auto-continue] You stopped before the task was clearly complete (${reason}). Re-check the user's original request and all tool results. If anything remains unresolved, continue by calling the appropriate tools or proposing edits. Only finish when you can give a concrete final answer that directly answers the question or states exactly what was completed.`;
+  return `[auto-continue] You stopped before the task was clearly complete (${reason}). Re-check the user's original request and all tool results. If anything remains unresolved, continue by calling the appropriate tools or proposing edits. Only finish when you can give a concrete final answer that directly answers the question or states exactly what was completed, or ask the user a clear question if you are blocked.`;
 }
 
 /**
@@ -467,7 +537,6 @@ export class AgentLoop {
       }
       if (toolCalls.length === 0 && finishReason !== 'length' && assistantText.trim().length === 0) {
         if (
-          sawToolCallsThisRun &&
           autoContinueOnPrematureStop &&
           consecutivePrematureStopContinues < maxPrematureStopContinues
         ) {
@@ -516,10 +585,9 @@ export class AgentLoop {
         }
         if (
           finishReason !== 'length' &&
-          sawToolCallsThisRun &&
           autoContinueOnPrematureStop &&
           consecutivePrematureStopContinues < maxPrematureStopContinues &&
-          looksIncompleteAfterTools(assistantText)
+          looksIncompleteFinalAnswer(assistantText, sawToolCallsThisRun)
         ) {
           consecutivePrematureStopContinues++;
           messages.push({
