@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -290,6 +290,26 @@
           "type": "number",
           "default": 5,
           "description": "Maximum number of automatic continuations after suspicious early stops in one user request."
+        },
+        "burstcode.agent.subagentMaxIterations": {
+          "type": "number",
+          "default": 8,
+          "description": "Maximum tool-calling iterations per launched sub-agent."
+        },
+        "burstcode.agent.maxConcurrentSubagents": {
+          "type": "number",
+          "default": 4,
+          "description": "Maximum number of sub-agents that may run concurrently inside one foreground agent request."
+        },
+        "burstcode.agent.maxSubagentTasksPerCall": {
+          "type": "number",
+          "default": 8,
+          "description": "Maximum number of tasks accepted by one launch_subagent tool call."
+        },
+        "burstcode.agent.enableWriteSubagents": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow launch_subagent to run independent write tasks that can call propose_edit within explicit allowedFiles scopes."
         },
         "burstcode.lsp.maxWaitMs": {
           "type": "number",

@@ -25,6 +25,7 @@ import { buildEditTools, AskUserSpec } from '../agent/tools/edits';
 import { buildPlanTool, PlanStep } from '../agent/tools/plan';
 import { buildLessonTools } from '../agent/tools/lessons';
 import { buildShellTools } from '../agent/tools/shell';
+import { buildSubagentTool } from '../agent/tools/subagent';
 import { LessonStore, renderLessonsBlock } from '../memory/LessonStore';
 import { CheckpointInfo, GitCheckpoint } from '../git/GitCheckpoint';
 import {
@@ -637,14 +638,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       void this.persistCurrentSession();
     };
 
+    const systemPrompt = await systemPromptPromise;
+    const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
+    const coreReadTools: Tool[] = [readFileTool, listDirTool, grepSearchTool, workspaceOutlineTool];
+    const lspTools = buildLspTools(bridge, this.depGuard);
+    const editTools = buildEditTools(this.applier, askUser);
+    const subagentTool = buildSubagentTool({
+      clientFactory: () => new OpenAIClient(llmCfg, this.logger),
+      logger: this.logger,
+      applier: this.applier,
+      readTools: [...coreReadTools, ...lspTools],
+      writeTools: editTools.filter((t) => t.name === 'propose_edit'),
+      systemPrompt,
+      contextWindow: llmCfg.contextWindow,
+      maxIterations: agentCfg.get<number>('subagentMaxIterations') ?? 8,
+      maxConcurrent: Math.max(1, agentCfg.get<number>('maxConcurrentSubagents') ?? 4),
+      maxTasksPerCall: Math.max(1, agentCfg.get<number>('maxSubagentTasksPerCall') ?? 8),
+      enableWrites: agentCfg.get<boolean>('enableWriteSubagents') ?? true
+    });
+
     const tools: Tool[] = [
-      readFileTool,
-      listDirTool,
-      grepSearchTool,
-      workspaceOutlineTool,
-      ...buildLspTools(bridge, this.depGuard),
+      ...coreReadTools,
+      ...lspTools,
+      subagentTool,
       ...buildLangTools(),
-      ...buildEditTools(this.applier, askUser),
+      ...editTools,
       ...buildShellTools({ askUser }),
       buildPlanTool(onPlanUpdate),
       ...buildLessonTools(this.lessons, (list) => {
@@ -658,10 +676,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       })
     ];
 
-    // The outline build started above, in parallel with the git checkpoint.
-    const systemPrompt = await systemPromptPromise;
-
-    const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
     const agent = new AgentLoop(client, tools, this.applier, this.logger, {
       contextWindow: llmCfg.contextWindow,
       maxIterations: agentCfg.get<number>('maxIterations') ?? 25,

@@ -670,8 +670,10 @@ export class AgentLoop {
 
       // Walk the prepared list, grouping contiguous parallel-safe calls into
       // batches that are executed concurrently. Unsafe tools (ask_user,
-      // propose_edit, update_plan, ...) run alone and in order so their UI
-      // / shared-state side effects stay deterministic.
+      // update_plan, record_lesson, run_shell, ...) run alone and in order
+      // so their UI / shared-state side effects stay deterministic.
+      // propose_edit is parallel-safe: HunkApplier serializes per-file
+      // mutations internally, so concurrent file writes do queue up safely.
       let cursor = 0;
       while (cursor < prepared.length) {
         if (cancellation.isCancellationRequested) break;

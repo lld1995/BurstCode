@@ -102,6 +102,28 @@ export class HunkApplier implements vscode.Disposable {
   private decisionJournal: DecisionRecord[] = [];
   /** Latest user-facing summary passed to `proposeEdits`. */
   private latestSummary?: string;
+  /**
+   * Per-file mutex chain. Concurrent `proposeEdits` calls (e.g. multiple
+   * propose_edit tool calls dispatched in parallel by the agent loop, or
+   * sub-agents running fan-out writes) targeting the SAME file are serialized
+   * through this map so `loadOriginal` / `modifiedContent` recomputation
+   * never interleave. Calls touching DIFFERENT files keep running in
+   * parallel — that is the whole point of unlocking propose_edit.
+   */
+  private readonly fileLocks = new Map<string, Promise<void>>();
+  /**
+   * One-shot guard for the per-cycle "preamble" work (git checkpoint + first
+   * diff editor open). Concurrent callers entering an empty pending set all
+   * `await` the same promise so we don't create duplicate checkpoints or
+   * spam multiple diff tabs. Cleared whenever the pending set drains so the
+   * next propose_edit cycle starts a fresh checkpoint.
+   */
+  private cycleInitPromise: Promise<void> | null = null;
+  /**
+   * True once the diff editor for the first newly-queued file in the current
+   * cycle has been opened. Reset together with `cycleInitPromise`.
+   */
+  private diffOpenedThisCycle = false;
   private readonly stateEmitter = new vscode.EventEmitter<PendingState>();
   /** Fires whenever pending edits are added, accepted, or rejected. */
   readonly onPendingStateChange = this.stateEmitter.event;
@@ -198,95 +220,165 @@ export class HunkApplier implements vscode.Disposable {
   async proposeEdits(files: ProposedEditFile[], summary: string): Promise<void> {
     if (files.length === 0) return;
     this.latestSummary = summary;
-    // Only checkpoint when a fresh review cycle is starting (no pending edits
-    // yet). Subsequent propose_edit calls within the same cycle share the
-    // same rollback point so we don't create checkpoint spam.
-    if (this.gitCheckpoint && this.pending.size === 0) {
-      try {
-        await this.gitCheckpoint.createCheckpoint(`pre-edit • ${summary}`);
-      } catch (err) {
-        this.logger.warn('Pre-edit checkpoint failed', String(err));
-      }
-    }
+    // One-shot per-cycle preamble (checkpoint). Concurrent callers all await
+    // the same promise so we never create duplicate checkpoints or open
+    // multiple diff tabs even when the agent dispatches several propose_edit
+    // calls in parallel.
+    await this.ensureCycleInit(summary);
 
+    // Process every file under its own lock. Different files run concurrently
+    // (the parallelism win); same-file calls serialize so loadOriginal +
+    // modifiedContent recomputation stay consistent.
     let firstNewlyQueuedUri: vscode.Uri | undefined;
-    for (const f of files) {
-      const uri = this.resolveUri(f.path);
-      const key = uri.toString();
-      let entry = this.pending.get(key);
-      if (!entry) {
-        const loaded = await this.loadOriginal(uri);
-        const proposedUri = this.diffPreview.registerProposed(uri, loaded.content);
-        entry = {
-          uri,
-          proposedUri,
-          originalContent: loaded.content,
-          modifiedContent: loaded.content,
-          hunks: [],
-          eol: loaded.eol,
-          isNewFile: loaded.isNewFile,
-          lastSummary: summary
-        };
-        this.pending.set(key, entry);
-        if (!firstNewlyQueuedUri) firstNewlyQueuedUri = uri;
-      } else {
-        entry.lastSummary = summary;
-      }
-
-      const stamp = Date.now();
-      const newPending: PendingHunk[] = f.hunks.map((h, i) => ({
-        id: `${key}::${stamp}::${i}`,
-        fileUri: uri,
-        hunk: h,
-        status: 'pending'
-      }));
-      // Drop existing PENDING hunks whose ranges overlap any newly-queued one.
-      // Already-accepted hunks are kept (they will be applied alongside the
-      // new ones when the file is finally flushed).
-      entry.hunks = entry.hunks.filter((existing) => {
-        if (existing.status !== 'pending') return true;
-        return !newPending.some((nh) => hunksOverlap(existing.hunk, nh.hunk));
-      });
-      entry.hunks.push(...newPending);
-
-      // Recompute modified content from the cached original + every
-      // pending/accepted hunk, applied bottom-up so ranges stay valid.
-      const stack = entry.hunks
-        .filter((h) => h.status === 'pending' || h.status === 'accepted')
-        .map((h) => h.hunk)
-        .sort((a, b) => b.startLine - a.startLine);
-      let modified = entry.originalContent;
-      for (const h of stack) modified = applyHunkToText(modified, h, entry.eol);
-      entry.modifiedContent = modified;
-      // Re-register with the new content; this fires onDidChange on the diff
-      // provider and existing diff editors refresh in place.
-      this.diffPreview.registerProposed(uri, modified);
-    }
+    await Promise.all(
+      files.map((f) =>
+        this.withFileLock(this.resolveUri(f.path).toString(), async () => {
+          const queuedNew = await this.processFile(f, summary);
+          if (queuedNew && !firstNewlyQueuedUri) firstNewlyQueuedUri = queuedNew;
+        })
+      )
+    );
 
     this.codeLensProvider.refresh();
-    // First-time queueing of a file opens a diff so the user notices; later
-    // calls just update content without spawning new editors.
-    if (firstNewlyQueuedUri) {
+    // Open a diff editor for the first newly-queued file in this CYCLE (not
+    // just this call). Subsequent files quietly accumulate in the banner —
+    // users can click into them from there. `diffOpenedThisCycle` makes this
+    // safe under concurrency.
+    if (firstNewlyQueuedUri && !this.diffOpenedThisCycle) {
+      this.diffOpenedThisCycle = true;
       const entry = this.pending.get(firstNewlyQueuedUri.toString());
       if (entry) {
-        if (entry.isNewFile) {
-          // Nothing exists on disk yet — a 2-pane diff would render "File not
-          // found" on the right. Show the proposed virtual document directly;
-          // CodeLenses still work because the diff-preview scheme is
-          // registered with the CodeLens provider.
-          await vscode.window.showTextDocument(entry.proposedUri, { preview: true });
-        } else {
-          await vscode.commands.executeCommand(
-            'vscode.diff',
-            entry.proposedUri,
-            entry.uri,
-            `BurstCode • ${path.basename(entry.uri.fsPath)} (Proposed ↔ Current)`
-          );
+        try {
+          if (entry.isNewFile) {
+            // Nothing exists on disk yet — a 2-pane diff would render "File
+            // not found" on the right. Show the proposed virtual document
+            // directly; CodeLenses still work because the diff-preview
+            // scheme is registered with the CodeLens provider.
+            await vscode.window.showTextDocument(entry.proposedUri, { preview: true });
+          } else {
+            await vscode.commands.executeCommand(
+              'vscode.diff',
+              entry.proposedUri,
+              entry.uri,
+              `BurstCode • ${path.basename(entry.uri.fsPath)} (Proposed ↔ Current)`
+            );
+          }
+        } catch (err) {
+          this.logger.warn('Failed to open initial diff editor', String(err));
         }
       }
     }
     this.logger.info('Proposed edits queued', { files: files.length, summary });
     this.emitState();
+  }
+
+  /**
+   * Run `fn` exclusively per `key`. Subsequent calls with the same key chain
+   * onto the previous one; failures don't poison the chain (we swallow them
+   * in the chained `then` so the next waiter still gets a turn). The map
+   * entry is cleaned up once the chain we just appended drains.
+   */
+  private async withFileLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.fileLocks.get(key) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    // Store a forgiving handle so concurrent waiters never see a rejected
+    // promise; the real result is still surfaced to the caller below.
+    const handle = next.then(
+      () => undefined,
+      () => undefined
+    );
+    this.fileLocks.set(key, handle);
+    try {
+      return await next;
+    } finally {
+      // If nobody chained after us, drop the entry to avoid an unbounded map.
+      if (this.fileLocks.get(key) === handle) {
+        this.fileLocks.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Lazily run the per-cycle preamble exactly once across all concurrent
+   * `proposeEdits` callers. The promise is cleared in `flushFileIfDone` once
+   * the pending set drains, which is what defines a "cycle" for us.
+   */
+  private ensureCycleInit(summary: string): Promise<void> {
+    if (this.cycleInitPromise) return this.cycleInitPromise;
+    this.cycleInitPromise = (async () => {
+      if (this.gitCheckpoint && this.pending.size === 0) {
+        try {
+          await this.gitCheckpoint.createCheckpoint(`pre-edit • ${summary}`);
+        } catch (err) {
+          this.logger.warn('Pre-edit checkpoint failed', String(err));
+        }
+      }
+    })();
+    return this.cycleInitPromise;
+  }
+
+  /**
+   * Queue a single file's hunks. Returns the file's source URI when the file
+   * was NEWLY queued (i.e. did not already have a PendingFile entry) so the
+   * caller can decide whether to open a diff editor for it. Must be called
+   * under that file's lock.
+   */
+  private async processFile(
+    f: ProposedEditFile,
+    summary: string
+  ): Promise<vscode.Uri | undefined> {
+    const uri = this.resolveUri(f.path);
+    const key = uri.toString();
+    let entry = this.pending.get(key);
+    let newlyQueued: vscode.Uri | undefined;
+    if (!entry) {
+      const loaded = await this.loadOriginal(uri);
+      const proposedUri = this.diffPreview.registerProposed(uri, loaded.content);
+      entry = {
+        uri,
+        proposedUri,
+        originalContent: loaded.content,
+        modifiedContent: loaded.content,
+        hunks: [],
+        eol: loaded.eol,
+        isNewFile: loaded.isNewFile,
+        lastSummary: summary
+      };
+      this.pending.set(key, entry);
+      newlyQueued = uri;
+    } else {
+      entry.lastSummary = summary;
+    }
+
+    const stamp = Date.now();
+    const newPending: PendingHunk[] = f.hunks.map((h, i) => ({
+      id: `${key}::${stamp}::${i}`,
+      fileUri: uri,
+      hunk: h,
+      status: 'pending'
+    }));
+    // Drop existing PENDING hunks whose ranges overlap any newly-queued one.
+    // Already-accepted hunks are kept (they will be applied alongside the
+    // new ones when the file is finally flushed).
+    entry.hunks = entry.hunks.filter((existing) => {
+      if (existing.status !== 'pending') return true;
+      return !newPending.some((nh) => hunksOverlap(existing.hunk, nh.hunk));
+    });
+    entry.hunks.push(...newPending);
+
+    // Recompute modified content from the cached original + every
+    // pending/accepted hunk, applied bottom-up so ranges stay valid.
+    const stack = entry.hunks
+      .filter((h) => h.status === 'pending' || h.status === 'accepted')
+      .map((h) => h.hunk)
+      .sort((a, b) => b.startLine - a.startLine);
+    let modified = entry.originalContent;
+    for (const h of stack) modified = applyHunkToText(modified, h, entry.eol);
+    entry.modifiedContent = modified;
+    // Re-register with the new content; this fires onDidChange on the diff
+    // provider and existing diff editors refresh in place.
+    this.diffPreview.registerProposed(uri, modified);
+    return newlyQueued;
   }
 
   /** Open the diff editor for the first file with pending hunks (Review button). */
@@ -456,6 +548,12 @@ export class HunkApplier implements vscode.Disposable {
     this.diffPreview.unregister(file.proposedUri);
     this.pending.delete(file.uri.toString());
     this.codeLensProvider.refresh();
+    // Cycle ended — clear the per-cycle guards so the NEXT propose_edit run
+    // creates a fresh checkpoint and is allowed to open one diff editor.
+    if (this.pending.size === 0) {
+      this.cycleInitPromise = null;
+      this.diffOpenedThisCycle = false;
+    }
     for (const l of this.listeners) {
       try {
         l({ fileUri: file.uri, allDone: this.pending.size === 0 });

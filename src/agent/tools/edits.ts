@@ -24,8 +24,12 @@ export type AskUserFn = (spec: AskUserSpec) => Promise<string>;
 export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[] {
   const proposeEdit: Tool = {
     name: 'propose_edit',
-    // Mutates HunkApplier state and may open a diff editor; serialize.
-    parallelSafe: false,
+    // Concurrent-safe: HunkApplier serializes per-file mutations through an
+    // internal mutex, deduplicates the pre-edit git checkpoint, and only
+    // opens a diff editor for the first newly-queued file in a review cycle.
+    // Different files therefore queue in parallel within a single assistant
+    // turn (and across concurrent sub-agent runs).
+    parallelSafe: true,
     schema: {
       type: 'function',
       function: {
