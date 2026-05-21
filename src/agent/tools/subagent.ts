@@ -4,7 +4,7 @@ import { AgentLoop, AgentOptions } from '../AgentLoop';
 import { ChatMessage, OpenAIClient } from '../../llm/OpenAIClient';
 import { HunkApplier } from '../../edits/HunkApplier';
 import { Logger } from '../../util/Logger';
-import { Tool, ToolResult } from './types';
+import { Tool, ToolResult, ToolContext } from './types';
 
 interface SubagentTask {
   id: string;
@@ -31,14 +31,31 @@ export interface SubagentToolOptions {
 
 export function buildSubagentTool(options: SubagentToolOptions): Tool {
   let active = 0;
-  const waiters: Array<() => void> = [];
+  const waiters: Array<(value: void) => void> = [];
 
-  async function acquire(): Promise<void> {
+  async function acquire(cancellation?: vscode.CancellationToken): Promise<void> {
     if (active < options.maxConcurrent) {
       active++;
       return;
     }
-    await new Promise<void>((resolve) => waiters.push(resolve));
+    // If cancellation is already requested, bail immediately.
+    if (cancellation?.isCancellationRequested) {
+      throw new Error('Subagent acquire cancelled');
+    }
+    await new Promise<void>((resolve, reject) => {
+      waiters.push(resolve);
+      // If a cancellation token is provided, set up a listener so that
+      // stuck sub-agents don't leak semaphore slots.
+      if (cancellation) {
+        const sub = cancellation.onCancellationRequested(() => {
+          // Remove ourselves from the waiter queue.
+          const idx = waiters.indexOf(resolve);
+          if (idx !== -1) waiters.splice(idx, 1);
+          sub.dispose();
+          reject(new Error('Subagent acquire cancelled'));
+        });
+      }
+    });
   }
 
   function release(): void {
@@ -50,8 +67,8 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
     active = Math.max(0, active - 1);
   }
 
-  async function withPermit<T>(fn: () => Promise<T>): Promise<T> {
-    await acquire();
+  async function withPermit<T>(fn: () => Promise<T>, cancellation?: vscode.CancellationToken): Promise<T> {
+    await acquire(cancellation);
     try {
       return await fn();
     } finally {
@@ -114,7 +131,7 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
           while (running < perCallLimit && cursor < tasks.length) {
             const idx = cursor++;
             running++;
-            withPermit(() => runTask(tasks[idx], options, ctx.cancellation))
+            withPermit(() => runTask(tasks[idx], options, ctx.cancellation), ctx.cancellation)
               .then((result) => {
                 results[idx] = result;
               })

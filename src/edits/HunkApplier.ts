@@ -280,7 +280,20 @@ export class HunkApplier implements vscode.Disposable {
    */
   private async withFileLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.fileLocks.get(key) ?? Promise.resolve();
-    const next = prev.then(fn, fn);
+    // Safety timeout: if fn() never resolves (e.g. loadOriginal blocked by
+    // another extension), the lock chain doesn't block all subsequent edits
+    // to this file forever. 30s is well above any normal file operation.
+    const LOCK_TIMEOUT_MS = 30_000;
+    const timedFn = async (): Promise<T> => {
+      const result = await Promise.race([
+        fn(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`withFileLock timed out after ${LOCK_TIMEOUT_MS}ms`)), LOCK_TIMEOUT_MS)
+        )
+      ]);
+      return result;
+    };
+    const next = prev.then(timedFn, timedFn);
     // Store a forgiving handle so concurrent waiters never see a rejected
     // promise; the real result is still surfaced to the caller below.
     const handle = next.then(

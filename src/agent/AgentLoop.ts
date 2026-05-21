@@ -411,9 +411,34 @@ export class AgentLoop {
         reasoningText = '';
         toolCallAccumulator.clear();
         finishReason = undefined;
-
         try {
-          for await (const chunk of this.client.streamChat(compressed, this.toolDefs(), cancellation)) {
+          // Overall timeout for the LLM stream: if chunks stop arriving for
+          // 120s, treat it as a stream error and either retry or surface it.
+          // This prevents the for-await from hanging forever on a half-open
+          // connection or a slow LLM.
+          const STREAM_TIMEOUT_MS = 120_000;
+          // Sentinel distinguishes a real iterator end from a timeout expiry.
+          // Using { done: true } for both would silently treat timeout as
+          // normal completion (the timeout throw below would be dead code).
+          const STREAM_TIMEOUT_SENTINEL = Symbol('stream-timeout');
+          const streamIter = this.client.streamChat(compressed, this.toolDefs(), cancellation)[Symbol.asyncIterator]();
+          let streamDone = false;
+          while (!streamDone) {
+            if (cancellation.isCancellationRequested) break;
+            const result = await Promise.race([
+              streamIter.next(),
+              new Promise<typeof STREAM_TIMEOUT_SENTINEL>((resolve) =>
+                setTimeout(() => resolve(STREAM_TIMEOUT_SENTINEL), STREAM_TIMEOUT_MS)
+              )
+            ]);
+            if (result === STREAM_TIMEOUT_SENTINEL) {
+              throw new Error(`LLM stream timed out after ${STREAM_TIMEOUT_MS}ms`);
+            }
+            if (result.done) {
+              streamDone = true;
+              break;
+            }
+            const chunk = result.value;
             if (chunk.contentDelta) {
               assistantText += chunk.contentDelta;
               yield { type: 'assistant-delta', payload: chunk.contentDelta };
@@ -432,6 +457,10 @@ export class AgentLoop {
               toolCallAccumulator.set(idx, entry);
             }
             if (chunk.finishReason) finishReason = chunk.finishReason;
+          }
+          if (cancellation.isCancellationRequested) {
+            yield { type: 'done', payload: { reason: 'cancelled' } };
+            return;
           }
           streamOk = true;
         } catch (err) {
@@ -694,7 +723,6 @@ export class AgentLoop {
         while (end < prepared.length && !isUnsafe(prepared[end])) end++;
         const batchStart = cursor;
         const batchSize = end - batchStart;
-
         // Dispatch every call in the batch immediately and stream their
         // tool-call-end events to the UI as each one resolves (out of
         // dispatch order — whichever finishes first speaks first), so the
@@ -702,9 +730,13 @@ export class AgentLoop {
         const completionQueue: number[] = []; // batch-relative indices
         let inFlight = batchSize;
         let resolveWaiter: (() => void) | null = null;
+        let batchSettled = false;
         for (let bi = 0; bi < batchSize; bi++) {
           const absIdx = batchStart + bi;
           executeOne(prepared[absIdx]).then((res) => {
+            // After batch timeout, batchSettled=true: discard the late result
+            // rather than overwriting the sentinel and confusing callers.
+            if (batchSettled && results[absIdx] !== undefined) return;
             results[absIdx] = res;
             completionQueue.push(bi);
             inFlight--;
@@ -713,7 +745,13 @@ export class AgentLoop {
             r?.();
           });
         }
-        while (inFlight > 0 || completionQueue.length > 0) {
+        // Safety timeout: if any executeOne promise never resolves (e.g. LSP
+        // call hangs, shell subprocess zombie), we don't hang forever. 30s
+        // is well above any normal tool execution.
+        const BATCH_SAFETY_TIMEOUT_MS = 30_000;
+        const batchDeadline = Date.now() + BATCH_SAFETY_TIMEOUT_MS;
+        while ((inFlight > 0 || completionQueue.length > 0) && !batchSettled) {
+          if (cancellation.isCancellationRequested) break;
           while (completionQueue.length > 0) {
             const bi = completionQueue.shift() as number;
             const c = prepared[batchStart + bi];
@@ -724,9 +762,45 @@ export class AgentLoop {
             };
           }
           if (inFlight > 0) {
+            const remaining = batchDeadline - Date.now();
+            if (remaining <= 0) {
+              batchSettled = true;
+              break;
+            }
             await new Promise<void>((r) => {
-              resolveWaiter = r;
+              // Race between the next tool completing and the safety timeout.
+              const timer = setTimeout(() => {
+                resolveWaiter = null;
+                r();
+              }, Math.min(remaining, 5000));
+              const prevResolve = resolveWaiter;
+              resolveWaiter = () => {
+                clearTimeout(timer);
+                prevResolve?.();
+                r();
+              };
             });
+          }
+        }
+        if (batchSettled) {
+          this.logger.warn(
+            `Batch safety timeout after ${BATCH_SAFETY_TIMEOUT_MS}ms; ${inFlight} tool(s) still in flight`
+          );
+          // Mark remaining in-flight results as timed out so downstream code
+          // (tool reply push) sees a non-null entry.
+          for (let bi = 0; bi < batchSize; bi++) {
+            const absIdx = batchStart + bi;
+            if (results[absIdx] === undefined) {
+              results[absIdx] = {
+                content: `[tool timed out after ${BATCH_SAFETY_TIMEOUT_MS}ms]`,
+                isError: true
+              };
+              const c = prepared[absIdx];
+              yield {
+                type: 'tool-call-end',
+                payload: { name: c.name, id: c.callId, result: results[absIdx].content, isError: true, meta: undefined }
+              };
+            }
           }
         }
         cursor = end;

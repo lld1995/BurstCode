@@ -311,13 +311,21 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
         const timer = setTimeout(() => {
           timedOut = true;
           killTree();
+          // Belt-and-braces: even if killTree fails to kill a zombie process
+          // (e.g. cmd.exe -> npm install -> node.exe with inherited pipe),
+          // force-resolve so the agent doesn't hang. 5s is enough for
+          // taskkill/SIGTERM to finish in normal cases.
+          setTimeout(() => {
+            if (!settled) {
+              forcedExit = true;
+              proc.emit('close', null, 'SIGTERM');
+            }
+          }, 5000);
         }, timeoutMs);
 
         const cancelSub = ctx.cancellation.onCancellationRequested(() => {
           killTree();
-          // Belt-and-braces: even if 'close' fails to fire because some
-          // descendant kept a pipe handle alive, force-resolve so the UI
-          // unblocks. 5s is enough for taskkill to finish in normal cases.
+          // Belt-and-braces: same forced-resolve as the timeout path above.
           setTimeout(() => {
             if (!settled) {
               forcedExit = true;

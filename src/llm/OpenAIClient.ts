@@ -382,6 +382,10 @@ export class OpenAIClient {
     // simply ignore unknown fields, so this is safe to send unconditionally.
     const safeMessages = normalizeReasoningContent(messages);
 
+    // Some models (e.g. claude-* via OpenAI-compatible endpoints) reject the
+    // temperature field entirely — omit it for those model families.
+    const supportsTemperature = !this.config.model.startsWith('claude-');
+
     try {
       const stream = await this.client.chat.completions.create(
         {
@@ -389,7 +393,7 @@ export class OpenAIClient {
           messages: safeMessages,
           tools: tools.length ? tools : undefined,
           tool_choice: tools.length ? 'auto' : undefined,
-          temperature: this.config.temperature,
+          ...(supportsTemperature ? { temperature: this.config.temperature } : {}),
           stream: true
         },
         { signal: ac.signal }
