@@ -391,9 +391,11 @@ export class OpenAIClient {
     // simply ignore unknown fields, so this is safe to send unconditionally.
     const safeMessages = normalizeReasoningContent(messages);
 
-    // Some models (e.g. claude-* via OpenAI-compatible endpoints) reject the
-    // temperature field entirely — omit it for those model families.
-    const supportsTemperature = !this.config.model.startsWith('claude-');
+    // Some models (e.g. claude-* via OpenAI-compatible endpoints, or the same
+    // models accessed via OpenRouter as "anthropic/claude-*") reject the
+    // temperature field entirely. Match on any model name that contains "claude"
+    // regardless of prefix so both direct and proxied names are covered.
+    const supportsTemperature = !this.config.model.toLowerCase().includes('claude');
 
     try {
       const stream = await this.client.chat.completions.create(
