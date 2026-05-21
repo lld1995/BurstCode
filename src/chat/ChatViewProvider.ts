@@ -893,7 +893,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /* Note: no scroll-behavior:smooth so that auto-follow detection (which
      compares scrollTop against scrollHeight on every scroll event) is not
      fooled by intermediate frames of a smooth-scroll animation. */
-  #log { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; overflow-anchor: none; padding: 16px 14px 8px; }
+  #log { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; overflow-anchor: none; padding: 16px 14px 60px; }
   #log .turn { margin-bottom: 18px; max-width: 100%; }
   #log .turn:last-child { margin-bottom: 8px; }
 
@@ -1365,13 +1365,19 @@ function scheduleScrollToBottom(force) {
     const didForce = pendingScrollForce;
     const shouldScroll = didForce || autoScroll;
     pendingScrollForce = false;
-    if (shouldScroll) {
-      log.scrollTop = log.scrollHeight;
-      requestAnimationFrame(() => {
-        if (didForce || autoScroll) log.scrollTop = log.scrollHeight;
-        autoScroll = isLogAtBottom();
-      });
-    }
+    if (!shouldScroll) return;
+    // First pass: capture the current scrollHeight.
+    const h0 = log.scrollHeight;
+    log.scrollTop = h0;
+    // Second pass (next frame): if scrollHeight grew, scroll again so the
+    // bottom content is truly visible. This fixes the "scrollbar moved but
+    // content didn't" race caused by async layout.
+    requestAnimationFrame(() => {
+      const h1 = log.scrollHeight;
+      if (h1 > h0) log.scrollTop = h1;
+      else if (didForce || autoScroll) log.scrollTop = log.scrollHeight;
+      autoScroll = isLogAtBottom();
+    });
   });
 }
 function scrollToBottom() {
