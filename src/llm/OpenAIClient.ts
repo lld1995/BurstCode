@@ -159,7 +159,16 @@ async function writeProfilePatch(
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined) continue;
     const value = Array.isArray(v) ? v.slice() : v;
-    await cfg.update(`${scope}.${k}`, value, vscode.ConfigurationTarget.Global);
+    // Write to whichever scope is currently winning so that a workspace-level
+    // override isn't silently shadowed by a Global write that never takes effect.
+    const inspected = cfg.inspect(`${scope}.${k}`);
+    const target =
+      inspected?.workspaceFolderValue !== undefined
+        ? vscode.ConfigurationTarget.WorkspaceFolder
+        : inspected?.workspaceValue !== undefined
+        ? vscode.ConfigurationTarget.Workspace
+        : vscode.ConfigurationTarget.Global;
+    await cfg.update(`${scope}.${k}`, value, target);
   }
 }
 

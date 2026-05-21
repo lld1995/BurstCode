@@ -678,7 +678,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const agent = new AgentLoop(client, tools, this.applier, this.logger, {
       contextWindow: llmCfg.contextWindow,
-      maxIterations: agentCfg.get<number>('maxIterations') ?? 25,
+      maxIterations: agentCfg.get<number>('maxIterations') ?? 50,
       requireConfirmBeforeEdit: agentCfg.get<boolean>('requireConfirmBeforeEdit') ?? true,
       autoContinueOnLength: agentCfg.get<boolean>('autoContinueOnLength') ?? true,
       maxAutoContinues: agentCfg.get<number>('maxAutoContinues') ?? 3,

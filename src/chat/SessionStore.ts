@@ -131,10 +131,16 @@ export function buildTranscript(
     if (m.role === 'system') continue;
     if (m.role === 'user') {
       const text = typeof m.content === 'string' ? m.content : '';
-      // Skip the auto-generated `(System note) ...` lines we inject between
-      // turns to inform the next model run; they would otherwise show up as
-      // ordinary user bubbles.
-      if (text && !text.startsWith('(System note)')) {
+      // Skip internal messages injected by the agent loop that were never
+      // shown to the user as real input: system notes, auto-continue nudges,
+      // stuck-detector corrections, and length-truncation continue prompts.
+      const isInternal =
+        !text ||
+        text.startsWith('(System note)') ||
+        text.startsWith('[auto-continue]') ||
+        text.startsWith('[stuck-detector]') ||
+        text.startsWith('Your previous response was cut off');
+      if (!isInternal) {
         entries.push({
           kind: 'user',
           text,

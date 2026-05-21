@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.21",
+  "version": "0.1.22",
 
   "publisher": "burstcode",
   "repository": {
@@ -250,7 +250,7 @@
         },
         "burstcode.agent.maxIterations": {
           "type": "number",
-          "default": 25,
+          "default": 50,
           "description": "Maximum tool-calling iterations per user request."
         },
         "burstcode.agent.requireConfirmBeforeEdit": {
