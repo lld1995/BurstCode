@@ -258,9 +258,9 @@ export class HunkApplier implements vscode.Disposable {
           } else {
             await vscode.commands.executeCommand(
               'vscode.diff',
-              entry.proposedUri,
               entry.uri,
-              `BurstCode • ${path.basename(entry.uri.fsPath)} (Proposed ↔ Current)`
+              entry.proposedUri,
+              `BurstCode • ${path.basename(entry.uri.fsPath)} (Current ↔ Proposed)`
             );
           }
         } catch (err) {
@@ -414,9 +414,9 @@ export class HunkApplier implements vscode.Disposable {
     }
     await vscode.commands.executeCommand(
       'vscode.diff',
-      entry.proposedUri,
       entry.uri,
-      `BurstCode • ${path.basename(entry.uri.fsPath)} (Proposed ↔ Current)`
+      entry.proposedUri,
+      `BurstCode • ${path.basename(entry.uri.fsPath)} (Current ↔ Proposed)`
     );
   }
 

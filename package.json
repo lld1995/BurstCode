@@ -2,7 +2,8 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.19",
+  "version": "0.1.20",
+
   "publisher": "burstcode",
   "repository": {
     "type": "git",
