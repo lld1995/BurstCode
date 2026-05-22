@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { ChatMessage, OpenAIClient, ToolDef } from '../llm/OpenAIClient';
 import { Tool, ToolResult } from './tools/types';
 import { FALLBACK_SYSTEM_PROMPT } from './prompts';
-import { compressMessages, defaultCompressorConfig } from '../context/Compressor';
+import { compressMessages, defaultCompressorConfig, normalizeToolResult } from '../context/Compressor';
 import { estimateMessagesTokens } from '../llm/tokenizer';
 import { Logger } from '../util/Logger';
 import { HunkApplier } from '../edits/HunkApplier';
@@ -15,6 +15,7 @@ export interface AgentEvent {
     | 'reasoning-delta'
     | 'tool-call-start'
     | 'tool-call-end'
+    | 'tool-progress'
     | 'iteration-start'
     | 'auto-continue'
     | 'auto-resume'
@@ -37,7 +38,7 @@ const AUTO_COMPRESS_TARGET_RATIO = 0.4;
  * the 2nd repeat (i.e. 3 identical turns in a row) escalates to askUser.
  */
 const DEFAULT_MAX_STUCK_REPEATS = 2;
-const DEFAULT_MAX_PREMATURE_STOP_CONTINUES = 5;
+const DEFAULT_MAX_PREMATURE_STOP_CONTINUES = 2;
 
 type AccumulatedToolCall = { id?: string; name: string; arguments: string };
 
@@ -384,7 +385,9 @@ export class AgentLoop {
 
       const compressed = compressMessages(messages, {
         ...defaultCompressorConfig,
-        contextWindow: this.options.contextWindow
+        contextWindow: this.options.contextWindow,
+        inputBudgetRatio: 0.6,
+        keepLastN: 3
       });
 
       let assistantText = '';
@@ -685,8 +688,12 @@ export class AgentLoop {
         try {
           return await c.tool.execute(c.parsed, {
             cancellation,
-            emitProgress: () => {
-              /* no-op */
+            callId: c.callId,
+            emitProgress: (message: string) => {
+              progressQueue.push({ callId: c.callId, name: c.name, message });
+              const r = resolveWaiter;
+              resolveWaiter = null;
+              r?.();
             }
           });
         } catch (err) {
@@ -695,7 +702,11 @@ export class AgentLoop {
       };
 
       const isUnsafe = (c: PreparedCall): boolean => !!c.tool && c.tool.parallelSafe === false;
+      const hasNoTimeout = (c: PreparedCall): boolean => !!c.tool && c.tool.noTimeout === true;
       const results: ToolResult[] = new Array(prepared.length);
+      const progressQueue: Array<{ callId: string; name: string; message: string }> = [];
+      // Hoisted so emitProgress (inside executeOne) can wake the batch drain loop.
+      let resolveWaiter: (() => void) | null = null;
 
       // Walk the prepared list, grouping contiguous parallel-safe calls into
       // batches that are executed concurrently. Unsafe tools (ask_user,
@@ -710,6 +721,10 @@ export class AgentLoop {
           const c = prepared[cursor];
           const result = await executeOne(c);
           results[cursor] = result;
+          while (progressQueue.length > 0) {
+            const p = progressQueue.shift()!;
+            yield { type: 'tool-progress', payload: { id: p.callId, name: p.name, message: p.message } };
+          }
           yield {
             type: 'tool-call-end',
             payload: { name: c.name, id: c.callId, result: result.content, isError: !!result.isError, meta: result.meta }
@@ -729,7 +744,7 @@ export class AgentLoop {
         // user sees individual yellow dots flip green as work completes.
         const completionQueue: number[] = []; // batch-relative indices
         let inFlight = batchSize;
-        let resolveWaiter: (() => void) | null = null;
+        resolveWaiter = null;
         let batchSettled = false;
         for (let bi = 0; bi < batchSize; bi++) {
           const absIdx = batchStart + bi;
@@ -746,12 +761,18 @@ export class AgentLoop {
           });
         }
         // Safety timeout: if any executeOne promise never resolves (e.g. LSP
-        // call hangs, shell subprocess zombie), we don't hang forever. 30s
-        // is well above any normal tool execution.
-        const BATCH_SAFETY_TIMEOUT_MS = 30_000;
-        const batchDeadline = Date.now() + BATCH_SAFETY_TIMEOUT_MS;
-        while ((inFlight > 0 || completionQueue.length > 0) && !batchSettled) {
+        // call hangs, shell subprocess zombie), we don't hang forever. Tools
+        // that declare noTimeout:true (e.g. launch_subagent) are excluded
+        // because they manage their own lifetime / cancellation.
+        const batchHasNoTimeout = prepared.slice(batchStart, end).some((c) => hasNoTimeout(c));
+        const BATCH_SAFETY_TIMEOUT_MS = batchHasNoTimeout ? 0 : 30_000;
+        const batchDeadline = BATCH_SAFETY_TIMEOUT_MS > 0 ? Date.now() + BATCH_SAFETY_TIMEOUT_MS : Infinity;
+        while ((inFlight > 0 || completionQueue.length > 0 || progressQueue.length > 0) && !batchSettled) {
           if (cancellation.isCancellationRequested) break;
+          while (progressQueue.length > 0) {
+            const p = progressQueue.shift()!;
+            yield { type: 'tool-progress', payload: { id: p.callId, name: p.name, message: p.message } };
+          }
           while (completionQueue.length > 0) {
             const bi = completionQueue.shift() as number;
             const c = prepared[batchStart + bi];
@@ -761,18 +782,19 @@ export class AgentLoop {
               payload: { name: c.name, id: c.callId, result: res.content, isError: !!res.isError, meta: res.meta }
             };
           }
-          if (inFlight > 0) {
+          if (inFlight > 0 || progressQueue.length > 0) {
             const remaining = batchDeadline - Date.now();
             if (remaining <= 0) {
               batchSettled = true;
               break;
             }
             await new Promise<void>((r) => {
-              // Race between the next tool completing and the safety timeout.
+              // Race between the next tool completing/reporting progress and the safety timeout.
+              const waitMs = BATCH_SAFETY_TIMEOUT_MS > 0 ? Math.min(remaining, 5000) : 5000;
               const timer = setTimeout(() => {
                 resolveWaiter = null;
                 r();
-              }, Math.min(remaining, 5000));
+              }, waitMs);
               const prevResolve = resolveWaiter;
               resolveWaiter = () => {
                 clearTimeout(timer);
@@ -808,14 +830,17 @@ export class AgentLoop {
 
       // Push tool replies back into conversation memory in ORIGINAL order so
       // every tool message lines up with its assistant tool_calls entry.
+      // normalizeToolResult applies per-tool content reductions before storage
+      // so the messages array stays lean from the start (grep caps, file caps, etc).
       for (let i = 0; i < prepared.length; i++) {
         const c = prepared[i];
         const result = results[i];
         if (!result) continue; // can happen if cancelled mid-batch
+        const storedContent = normalizeToolResult(c.name, result.content);
         messages.push({
           role: 'tool',
           tool_call_id: c.callId,
-          content: result.content
+          content: storedContent
         } as ChatMessage);
       }
       // propose_edit is non-blocking: the model gets a "queued" tool reply and

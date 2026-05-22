@@ -12,90 +12,160 @@ export interface CompressorConfig {
 
 export const defaultCompressorConfig: CompressorConfig = {
   contextWindow: 32768,
-  inputBudgetRatio: 0.7,
-  keepLastN: 4
+  inputBudgetRatio: 0.65,
+  keepLastN: 3
 };
 
 /**
+ * Tiered char limits for tool/assistant messages by exchange distance from the
+ * current turn (one "exchange" = one assistant turn + its tool replies).
+ *
+ *  Zone 0 — last keepLastN exchanges         → full (no cap)
+ *  Zone 1 — keepLastN+1 .. keepLastN*3       → 1200 chars
+ *  Zone 2 — keepLastN*3+1 .. keepLastN*6     → 300 chars
+ *  Zone 3 — older                            → 80 chars  (just the first line)
+ *
+ * These apply unconditionally on every compressMessages call so context stays
+ * lean even when we are well under the token budget.
+ */
+const ZONE_CAPS = [Infinity, 1200, 300, 80] as const;
+
+function zoneFor(exchangeDistance: number, keepLastN: number): 0 | 1 | 2 | 3 {
+  if (exchangeDistance < keepLastN) return 0;
+  if (exchangeDistance < keepLastN * 3) return 1;
+  if (exchangeDistance < keepLastN * 6) return 2;
+  return 3;
+}
+
+/**
  * Layered compression strategy:
- *  1. Always keep system message + last `keepLastN` exchanges in full.
- *  2. For older tool/assistant messages, summarize their content.
- *  3. For the "context" assistant attachments embedded in tool outputs, drop low-priority items.
+ *  1. Always keep system message + last `keepLastN` exchanges in full (zone 0).
+ *  2. Unconditionally compress older tool/assistant content by zone (distance-based).
+ *  3. Budget-overflow: drop oldest non-system messages as a last resort.
  */
 export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig): ChatMessage[] {
-  const budget = Math.floor(cfg.contextWindow * cfg.inputBudgetRatio);
-  let current = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
-  if (current <= budget) {
-    // Even when we're under budget, scrub any orphan tool/tool_calls that may
-    // have leaked in from a previous interrupted run or persisted session.
-    return sanitizeToolPairing(messages);
-  }
-
   const result = [...messages];
-
-  // Keep system + last keepLastN messages, compress others.
   const systemIdx = result.findIndex((m) => m.role === 'system');
-  const tailStart = Math.max(systemIdx + 1, result.length - cfg.keepLastN * 2);
 
-  for (let i = systemIdx + 1; i < tailStart && current > budget; i++) {
-    const msg = result[i];
-    if (!msg) continue;
+  // ── Pass 1: unconditional distance-based tiered compression ──────────────
+  // Walk backwards counting "exchange" boundaries (each user message or the
+  // start of an assistant+tool group increments the exchange counter).
+  // tool/assistant messages in zone ≥ 1 are capped at their zone's char limit.
+  // Old reasoning_content (chain-of-thought from thinking models) is also
+  // stripped — replayed thinking is dead weight; the model only needs the
+  // CURRENT turn's reasoning to continue. We replace with '' instead of
+  // deleting because DashScope-thinking strictly requires the field to exist.
+  let exchangeDistance = 0;
+  for (let i = result.length - 1; i > systemIdx; i--) {
+    const m = result[i];
+    if (m.role === 'user') {
+      exchangeDistance++;
+      continue;
+    }
+    if (m.role === 'system') continue;
+    // assistant or tool message
+    const zone = zoneFor(exchangeDistance, cfg.keepLastN);
+
+    // Strip old reasoning_content + truncate tool_calls.arguments from any
+    // assistant message past zone 0. Recent thinking and recent tool args
+    // belong in zone 0 (full). Older ones are historical clutter — the
+    // function NAME is enough to remind the model "I called grep_search 8
+    // turns ago", the verbose args body is dead weight.
+    if (zone > 0 && m.role === 'assistant') {
+      type Mut = ChatMessage & {
+        reasoning_content?: unknown;
+        tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
+      };
+      const am = m as Mut;
+      let mutated: Mut | null = null;
+      if (typeof am.reasoning_content === 'string' && am.reasoning_content.length > 0) {
+        mutated = { ...am, reasoning_content: '' };
+      }
+      if (am.tool_calls && am.tool_calls.length > 0) {
+        const argsCap = ZONE_CAPS[zone];
+        const trimmed = am.tool_calls.map((tc) => {
+          const argStr = typeof tc.function.arguments === 'string' ? tc.function.arguments : '';
+          if (argStr.length <= argsCap) return tc;
+          // Keep arguments as valid JSON to satisfy strict server validators.
+          const placeholder = JSON.stringify({ _truncated: `${argStr.length} chars` });
+          return { ...tc, function: { ...tc.function, arguments: placeholder } };
+        });
+        const anyChanged = trimmed.some((tc, idx) => tc !== am.tool_calls![idx]);
+        if (anyChanged) {
+          mutated = { ...(mutated ?? am), tool_calls: trimmed };
+        }
+      }
+      if (mutated) {
+        result[i] = mutated as unknown as ChatMessage;
+      }
+    }
+
+    if (zone === 0) continue;
+    const cap = ZONE_CAPS[zone];
+    const msg = result[i]; // may have been rewritten by reasoning strip above
     const original = stringifyContent(msg.content);
-    const originalTokens = estimateTokens(original);
-    if (originalTokens < 200) continue; // skip small ones
-    const summarized = summarizeText(original, 400);
-    const newTokens = estimateTokens(summarized);
-    if (newTokens >= originalTokens) continue;
+    if (original.length <= cap) continue;
+    const summarized = summarizeText(original, cap);
     result[i] = { ...msg, content: summarized } as ChatMessage;
-    current -= originalTokens - newTokens;
   }
 
-  // Last-resort: drop oldest non-system messages until under budget.
+  // ── Pass 2: budget-overflow drop (last resort) ────────────────────────────
+  const budget = Math.floor(cfg.contextWindow * cfg.inputBudgetRatio);
+  let current = estimateMessagesTokens(result as Array<{ role: string; content: unknown }>);
+
+  // Drop oldest non-system, non-protected messages until under budget.
+  const protected_ = result.length - cfg.keepLastN * 2;
   while (current > budget) {
-    const idx = result.findIndex((m, i) => i > systemIdx && i < result.length - cfg.keepLastN * 2);
+    const idx = result.findIndex((m, i) => i > systemIdx && i < protected_);
     if (idx < 0) break;
     const removed = result.splice(idx, 1)[0];
     current -= estimateTokens(stringifyContent(removed.content));
   }
 
-  // Final pass: when the tail window itself is what blew the budget (e.g. a
-  // single recent tool reply containing a huge file/grep dump), summarize big
-  // `tool` / `assistant` messages inside the tail too. We preserve the very
-  // last assistant turn and the most recent user message untouched so the
-  // in-flight turn isn't corrupted; everything earlier in the tail is fair
-  // game. Replacing only `content` keeps tool_call_id pairing intact, so
-  // sanitizeToolPairing below still validates.
-  if (current > budget) {
-    const lastUserIdx = (() => {
-      for (let i = result.length - 1; i > systemIdx; i--) {
-        if (result[i].role === 'user') return i;
-      }
-      return -1;
-    })();
-    // Keep last assistant turn (and its tool replies) verbatim: that's
-    // everything after the most recent user message.
-    const protectedFrom = lastUserIdx >= 0 ? lastUserIdx : result.length - 1;
-    for (let i = systemIdx + 1; i < protectedFrom && current > budget; i++) {
-      const msg = result[i];
-      if (!msg) continue;
-      if (msg.role === 'user' || msg.role === 'system') continue;
-      const original = stringifyContent(msg.content);
-      const originalTokens = estimateTokens(original);
-      if (originalTokens < 200) continue;
-      // Aggressive summary (200 chars) since we're already over budget.
-      const summarized = summarizeText(original, 200);
-      const newTokens = estimateTokens(summarized);
-      if (newTokens >= originalTokens) continue;
-      result[i] = { ...msg, content: summarized } as ChatMessage;
-      current -= originalTokens - newTokens;
-    }
-  }
-
   // Removing/summarizing oldest messages may have orphaned a `tool` reply
   // whose owning `assistant(tool_calls)` was dropped (or vice versa). Strip
-  // those orphans so the request validates against the OpenAI schema:
-  // every tool message must immediately follow an assistant tool_calls.
+  // those orphans so the request validates against the OpenAI schema.
   return sanitizeToolPairing(result);
+}
+
+/**
+ * Normalize a raw tool result string before storing it in the messages array.
+ * Applies tool-type-specific reductions so the stored content is already lean
+ * before the compressor ever sees it.
+ */
+export function normalizeToolResult(toolName: string, content: string): string {
+  // Nothing to compress
+  if (content.length < 200) return content;
+
+  // grep_search: strip matched file paths that are purely informational after
+  // the model has already seen them; keep only the first 60 match lines.
+  if (toolName === 'grep_search') {
+    const lines = content.split('\n');
+    if (lines.length > 62) {
+      const header = lines[0];
+      const kept = lines.slice(1, 61);
+      return `${header}\n${kept.join('\n')}\n...[${lines.length - 61} more lines omitted]`;
+    }
+    return content;
+  }
+
+  // read_file: cap at 4000 chars (tighter than AgentLoop's 6000 global cap)
+  if (toolName === 'read_file') {
+    if (content.length > 4000) {
+      return content.slice(0, 4000) + `\n...[truncated ${content.length - 4000} chars]`;
+    }
+    return content;
+  }
+
+  // list_dir / workspace_outline: cap at 1500 chars
+  if (toolName === 'list_dir' || toolName === 'workspace_outline') {
+    if (content.length > 1500) {
+      return content.slice(0, 1500) + `\n...[truncated]`;
+    }
+    return content;
+  }
+
+  return content;
 }
 
 /**

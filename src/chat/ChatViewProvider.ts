@@ -711,6 +711,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           case 'tool-call-end':
             this.post({ type: 'tool-call-end', payload: event.payload });
             break;
+          case 'tool-progress':
+            this.post({ type: 'tool-progress', payload: event.payload });
+            break;
           case 'iteration-start':
             this.post({ type: 'iteration', payload: event.payload });
             break;
@@ -2359,7 +2362,7 @@ window.addEventListener('message', (e) => {
       det.dataset.running = 'true';
       det.open = false;
       const sum = document.createElement('summary');
-      sum.textContent = '🔧 ' + msg.payload.name + '(' + JSON.stringify(msg.payload.args).slice(0, 200) + ') · running...';
+      sum.textContent = '\u{1F527} ' + msg.payload.name + '(' + JSON.stringify(msg.payload.args).slice(0, 200) + ') \u00b7 running...';
       det.appendChild(sum);
       log.appendChild(det);
       const key = msg.payload.id || msg.payload.name + Date.now();
@@ -2367,6 +2370,30 @@ window.addEventListener('message', (e) => {
       runningTools.set(key, { name: msg.payload.name, startedAt: Date.now() });
       const names = Array.from(runningTools.values()).map((t) => t.name).join(', ');
       setStatus('tool', 'Running ' + names + '...');
+      scrollToBottom();
+      break;
+    }
+    case 'tool-progress': {
+      const progKey = msg.payload && msg.payload.id;
+      let progDet = progKey ? toolElements.get(progKey) : null;
+      if (!progDet) {
+        const items = Array.from(toolElements.values());
+        progDet = items[items.length - 1] || null;
+      }
+      if (progDet) {
+        let progPre = progDet.querySelector('.tool-progress-log');
+        if (!progPre) {
+          progPre = document.createElement('pre');
+          progPre.className = 'tool-progress-log';
+          progDet.appendChild(progPre);
+          progDet.open = true;
+        }
+        const line = String((msg.payload && msg.payload.message) || '');
+        progPre.textContent = (progPre.textContent ? progPre.textContent + '\n' : '') + line;
+        if (progPre.textContent.length > 8000) {
+          progPre.textContent = '...' + progPre.textContent.slice(-7500);
+        }
+      }
       scrollToBottom();
       break;
     }

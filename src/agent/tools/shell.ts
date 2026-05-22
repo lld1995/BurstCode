@@ -113,49 +113,19 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
       function: {
         name: 'run_shell',
         description:
-          'Execute a shell command on the user\'s machine and return its stdout, stderr, and exit code. ' +
-          'Use this to build / test / lint / run scripts, inspect environment state (e.g. `node -v`, `git status`), ' +
-          'or to run a script you previously wrote into the workspace via propose_edit. ' +
-          'On Windows the default shell is PowerShell; on macOS / Linux it is bash. Pick `shell` explicitly when you need ' +
-          'cmd-only syntax (e.g. `dir`, `set`) or POSIX-only (`sh`). The tool BLOCKS until the process exits or the ' +
-          'configured timeout fires. By default the user is prompted to approve each command — keep commands short and ' +
-          'self-explanatory so they can decide quickly. SAFETY: the command runs with the same privileges as VS Code, so ' +
-          'avoid destructive commands unless the user explicitly asked for them. Output is truncated to a configurable ' +
-          'byte cap; if you need a full transcript redirect to a file inside the workspace and read it back with read_file.',
+          'Execute a shell command and return stdout, stderr, exit code. Use for build/test/lint/run scripts or environment probes (node -v, git status). User approval gate unless auto-approved. See PROTOCOL step 11 for safety rules.',
         parameters: {
           type: 'object',
           properties: {
-            command: {
-              type: 'string',
-              description:
-                'The full command line to execute, exactly as you would type it into the chosen shell. Use quoting ' +
-                'appropriate for that shell (PowerShell: backtick / single quotes; cmd: caret / double quotes; ' +
-                'bash/sh: backslash / single quotes).'
-            },
+            command: { type: 'string', description: 'Full command line, quoted for the chosen shell.' },
             shell: {
               type: 'string',
               enum: ['auto', 'cmd', 'powershell', 'pwsh', 'bash', 'sh'],
-              description:
-                'Which shell to invoke. `auto` (default) = powershell on Windows, bash elsewhere. Use `cmd` for ' +
-                'Windows-only batch syntax, `pwsh` for cross-platform PowerShell 7+, `bash` / `sh` on POSIX.'
+              description: 'auto=pwsh on Win / bash elsewhere. Override only for shell-specific syntax.'
             },
-            cwd: {
-              type: 'string',
-              description:
-                'Working directory for the command. Workspace-relative or absolute. Defaults to the workspace root.'
-            },
-            timeoutMs: {
-              type: 'number',
-              description:
-                'Hard timeout in milliseconds. The process is killed and the call returns isError=true when it elapses. ' +
-                'Defaults to burstcode.shell.defaultTimeoutMs (60s). Hard cap: 600000 (10 minutes).'
-            },
-            reason: {
-              type: 'string',
-              description:
-                'One-sentence explanation shown to the user in the approval prompt — e.g. "list installed npm globals" ' +
-                'or "build the C# project to verify the change compiles". Improves the chance the user clicks Allow.'
-            }
+            cwd: { type: 'string', description: 'Working dir (relative or absolute). Defaults to workspace root.' },
+            timeoutMs: { type: 'number', description: 'Hard timeout in ms (default 60000, cap 600000).' },
+            reason: { type: 'string', description: 'One-sentence justification shown in the approval prompt.' }
           },
           required: ['command']
         }

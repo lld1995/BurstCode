@@ -17,6 +17,8 @@ export interface ToolSchema {
 export interface ToolContext {
   cancellation: vscode.CancellationToken;
   emitProgress(message: string): void;
+  /** Tool call id of the parent call (set by AgentLoop when executing). */
+  callId?: string;
 }
 
 export interface ToolResult {
@@ -38,5 +40,11 @@ export interface Tool {
    * to `false` so the agent loop serializes them.
    */
   readonly parallelSafe?: boolean;
+  /**
+   * When true, the batch safety timeout in AgentLoop does not apply to this
+   * tool. Use for long-running orchestration tools (e.g. launch_subagent)
+   * that manage their own cancellation and run time.
+   */
+  readonly noTimeout?: boolean;
   execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
 }

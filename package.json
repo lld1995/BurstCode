@@ -2,8 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.23",
-
+  "version": "0.1.24",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -250,7 +249,7 @@
         },
         "burstcode.agent.maxIterations": {
           "type": "number",
-          "default": 50,
+          "default": 30,
           "description": "Maximum tool-calling iterations per user request."
         },
         "burstcode.agent.requireConfirmBeforeEdit": {
@@ -264,7 +263,7 @@
         },
         "burstcode.agent.maxAutoContinues": {
           "type": "number",
-          "default": 3,
+          "default": 2,
           "description": "Maximum number of consecutive auto-continues before giving up. Resets whenever the model successfully calls a tool."
         },
         "burstcode.agent.autoResumeOnStreamError": {
@@ -274,7 +273,7 @@
         },
         "burstcode.agent.maxAutoResumes": {
           "type": "number",
-          "default": 3,
+          "default": 2,
           "description": "Maximum number of consecutive auto-resumes after a stream interruption before surfacing the error. The counter resets after a successful streaming turn."
         },
         "burstcode.agent.maxStuckRepeats": {
@@ -289,7 +288,7 @@
         },
         "burstcode.agent.maxPrematureStopContinues": {
           "type": "number",
-          "default": 5,
+          "default": 2,
           "description": "Maximum number of automatic continuations after suspicious early stops in one user request."
         },
         "burstcode.agent.subagentMaxIterations": {

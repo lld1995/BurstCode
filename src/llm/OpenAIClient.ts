@@ -404,6 +404,12 @@ export class OpenAIClient {
           messages: safeMessages,
           tools: tools.length ? tools : undefined,
           tool_choice: tools.length ? 'auto' : undefined,
+          // Encourage the model to batch independent tool calls into a single
+          // assistant message. OpenAI GPT-4o / o-series default to true but
+          // some OpenAI-compatible backends (DashScope, certain vLLM builds,
+          // OpenRouter proxies) need this set explicitly to actually emit
+          // multiple tool_calls per turn. Unknown servers ignore the field.
+          parallel_tool_calls: tools.length ? true : undefined,
           ...(supportsTemperature ? { temperature: this.config.temperature } : {}),
           stream: true
         },

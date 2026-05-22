@@ -79,12 +79,13 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
   return {
     name: 'launch_subagent',
     parallelSafe: true,
+    noTimeout: true,
     schema: {
       type: 'function',
       function: {
         name: 'launch_subagent',
         description:
-          'Run multiple focused sub-agents concurrently. Use this to speed up independent code understanding tasks and independent per-file writing tasks. For write tasks, set mode="write", independent=true, and allowedFiles to the exact file paths that sub-agent may edit. Do not use write mode when tasks share unsettled interfaces or need to coordinate implementation details; first define the interface contract in the parent turn, then fan out independent files.',
+          'Run focused sub-agents concurrently for independent fan-out tasks. Write tasks require mode="write", independent=true, allowedFiles. See BATCH_PROTOCOL for when to prefer this over inline tool batching.',
         parameters: {
           type: 'object',
           properties: {
@@ -122,6 +123,8 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
       let cursor = 0;
       let running = 0;
 
+      ctx.emitProgress(`Starting ${tasks.length} sub-agent task(s): ${tasks.map((t) => t.id).join(', ')}`);
+
       await new Promise<void>((resolve) => {
         const pump = () => {
           if (ctx.cancellation.isCancellationRequested) {
@@ -131,12 +134,18 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
           while (running < perCallLimit && cursor < tasks.length) {
             const idx = cursor++;
             running++;
-            withPermit(() => runTask(tasks[idx], options, ctx.cancellation), ctx.cancellation)
+            ctx.emitProgress(`[${tasks[idx].id}] starting (${tasks[idx].mode})`);
+            withPermit(
+              () => runTask(tasks[idx], options, ctx.cancellation, (msg) => ctx.emitProgress(`[${tasks[idx].id}] ${msg}`)),
+              ctx.cancellation
+            )
               .then((result) => {
                 results[idx] = result;
+                ctx.emitProgress(`[${tasks[idx].id}] done`);
               })
               .catch((err) => {
                 results[idx] = `[${tasks[idx].id}] error\n${String(err)}`;
+                ctx.emitProgress(`[${tasks[idx].id}] error: ${String(err).slice(0, 120)}`);
               })
               .finally(() => {
                 running--;
@@ -187,7 +196,8 @@ function parseTask(raw: unknown): SubagentTask | undefined {
 async function runTask(
   task: SubagentTask,
   options: SubagentToolOptions,
-  cancellation: vscode.CancellationToken
+  cancellation: vscode.CancellationToken,
+  onProgress?: (msg: string) => void
 ): Promise<string> {
   if (task.mode === 'write') {
     if (!options.enableWrites) return `[${task.id}] rejected\nWrite sub-agents are disabled by settings.`;
@@ -224,10 +234,17 @@ async function runTask(
     if (event.type === 'assistant-message') {
       const payload = event.payload as { text?: unknown } | undefined;
       lastAssistant = String(payload?.text ?? '').trim() || lastAssistant;
+    } else if (event.type === 'tool-call-start') {
+      const payload = event.payload as { name?: unknown } | undefined;
+      onProgress?.(`  → ${String(payload?.name ?? 'tool')}`);
     } else if (event.type === 'tool-call-end') {
       toolCalls++;
-      const payload = event.payload as { isError?: unknown } | undefined;
+      const payload = event.payload as { name?: unknown; isError?: unknown } | undefined;
       if (payload?.isError) errors++;
+      onProgress?.(`  ✓ ${String(payload?.name ?? 'tool')}${payload?.isError ? ' (error)' : ''}`);
+    } else if (event.type === 'tool-progress') {
+      const payload = event.payload as { message?: unknown } | undefined;
+      onProgress?.(String(payload?.message ?? ''));
     } else if (event.type === 'done') {
       const payload = event.payload as { reason?: unknown } | undefined;
       doneReason = String(payload?.reason ?? doneReason);

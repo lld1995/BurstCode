@@ -73,7 +73,7 @@ export const defaultOutlineOptions: OutlineOptions = {
   excludeFilePatterns: [/\.log$/i, /\.lock$/i, /\.map$/i, /\.min\.(js|css)$/i, /^\.DS_Store$/],
   maxEntriesPerDir: 30,
   collapseShown: 8,
-  maxBytes: 6000,
+  maxBytes: 4000,
   honorRootGitignore: true
 };
 
