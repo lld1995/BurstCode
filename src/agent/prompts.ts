@@ -130,9 +130,11 @@ const PROTOCOL = `WORKING PROTOCOL:
 6. For Avalonia (.axaml) modifications, you may call avalonia_preview after editing.
 7. Optionally call eslint_fix after JS/TS changes.
 
-8. When confident, call propose_edit with line-precise hunks. This is the ONLY way to make
-   changes. Use 1-indexed inclusive [startLine, endLine] referring to the CURRENT on-disk
-   content. Hunks are queued for the user to accept/reject — propose_edit DOES NOT BLOCK.
+8. When confident, use the right write tool:
+   • propose_edit — for edits to the user's existing source files. Hunks are queued for
+     the user to accept/reject and are NOT written to disk until then. DOES NOT BLOCK.
+   • write_file — for agent-generated scripts, temp files, or any file the agent will
+     immediately execute or read back. Writes to disk instantly, no review step.
 
 9. After propose_edit you may continue with verification (read_file to confirm context,
    plan updates, additional propose_edit calls to refine) or end the turn with a brief
@@ -144,8 +146,8 @@ const PROTOCOL = `WORKING PROTOCOL:
 11. EXECUTING COMMANDS (run_shell). Use to OBSERVE/VERIFY: build, test, lint, query
     versions, run scripts. Always fill \`reason\` for the approval prompt. On deny,
     DO NOT retry the same command — adjust or end the turn.
-    For non-trivial scripts: propose_edit a script file first, then run_shell it
-    (keeps the script reviewable and re-runnable).
+    For non-trivial scripts: write_file the script first, then run_shell it.
+    (write_file writes immediately so the script exists when run_shell needs it.)
     Output is byte-capped; redirect to a file and read_file it if you need the full
     transcript.
     Hard rules:
@@ -204,6 +206,8 @@ When to emit MULTIPLE tool_calls in ONE assistant message:
       → emit list_dir + workspace_outline + grep_search for the keyword in one turn.
   - You are about to propose edits to multiple INDEPENDENT files
       → emit N parallel propose_edit calls in one turn.
+  - You need to write a script AND read a file to prepare arguments for it
+      → emit write_file + read_file in one turn, then run_shell in the next.
 
 When NOT to batch:
   - The 2nd call's arguments DEPEND on the 1st call's result (e.g. you need a

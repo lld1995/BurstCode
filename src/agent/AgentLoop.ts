@@ -120,95 +120,60 @@ function hasOpenFence(text: string): boolean {
   return !!matches && matches.length % 2 === 1;
 }
 
-function asksUserQuestion(text: string): boolean {
+/**
+ * Detects responses that are nothing but a short statement of intent to act,
+ * with no execution and no result.
+ *
+ * We anchor the regexes to the BEGINNING of the LAST sentence and gate the
+ * check on a small total length so we don't false-positive on long answers
+ * that legitimately contain phrases like "I'll", "let me", "接下来", "继续"
+ * in benign positions (e.g. "Let me know if you have questions", "您可以
+ * 继续使用此功能", "接下来您可以…").
+ */
+function endsWithIntentToActOnly(text: string): boolean {
   const trimmed = text.trim();
-  const lower = trimmed.toLowerCase();
-  return (
-    /[?？]\s*(?:[`'")\]}）】]*)$/.test(trimmed) ||
-    /[?？]/.test(trimmed.slice(-240)) ||
-    [
-      'which would you prefer',
-      'what would you like',
-      'do you want me to',
-      'should i',
-      'please confirm',
-      '请确认',
-      '你希望',
-      '你想',
-      '是否需要',
-      '要不要',
-      '需要我'
-    ].some((marker) => lower.includes(marker))
-  );
+  if (!trimmed || trimmed.length > 160) return false;
+  const sentences = trimmed.split(/(?<=[.!。！?？])\s+/);
+  const last = (sentences[sentences.length - 1] ?? trimmed).trim().toLowerCase();
+  if (!last) return false;
+  const intentRe: RegExp[] = [
+    /^i'?ll\s/i,
+    /^i will\s/i,
+    /^i'?m going to\s/i,
+    /^i am going to\s/i,
+    /^let me\s/i,
+    /^i need to\s/i,
+    /^i should\s/i,
+    /^next i'?ll\s/i,
+    /^next i will\s/i,
+    /^now i'?ll\s/i,
+    /^now i will\s/i,
+    /^(?:我将|我会|我需要|让我|接下来我|下一步我|现在我|我打算|我准备)/
+  ];
+  return intentRe.some((re) => re.test(last));
 }
 
-function hasConclusiveSignal(text: string): boolean {
-  const trimmed = text.trim();
-  const lower = trimmed.toLowerCase();
-  if (!trimmed) return false;
-  if (
-    [
-      'done',
-      'completed',
-      'fixed',
-      'implemented',
-      'updated',
-      'verified',
-      'summary',
-      'conclusion',
-      'root cause',
-      '已完成',
-      '完成了',
-      '已修复',
-      '修复了',
-      '已更新',
-      '已经',
-      '总结',
-      '结论',
-      '原因是',
-      '可以了',
-      '验证通过',
-      '处理好了'
-    ].some((marker) => lower.includes(marker))
-  ) {
-    return true;
-  }
-  return /[.!。！]\s*(?:[`'")\]}）】]*)$/.test(trimmed);
-}
-
-function looksIncompleteFinalAnswer(text: string, afterTools: boolean): boolean {
+/**
+ * Decide whether the model's final assistant turn looks truncated mid-thought
+ * rather than a genuine finished answer. Intentionally CONSERVATIVE: only
+ * fire on strong, unambiguous signs of truncation. Soft heuristics like
+ * "after tools the response must end with a period or contain '完成'" were
+ * removed because they fired on many legitimately-complete answers (e.g.
+ * Chinese sentences not ending in 。, code blocks as the final element,
+ * markdown tables, file/symbol references, polite closers).
+ */
+function looksIncompleteFinalAnswer(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return true;
-  const lower = trimmed.toLowerCase();
+  // Truncated mid code block.
   if (hasOpenFence(trimmed)) return true;
-  if (/[:：,，;；\-—…]\s*(?:[`'")\]}）】]*)$/.test(trimmed)) return true;
-  const hasIncompleteMarker = [
-    'i need to',
-    'i should',
-    "i'll",
-    'i will',
-    'let me',
-    'next i',
-    'still need',
-    'need to continue',
-    'not finished',
-    'not complete',
-    'todo',
-    '还需要',
-    '尚未',
-    '未完成',
-    '没解决',
-    '需要继续',
-    '下一步',
-    '我将',
-    '我会',
-    '我需要',
-    '接下来',
-    '继续',
-    '待办'
-  ].some((marker) => lower.includes(marker));
-  if (hasIncompleteMarker) return true;
-  if (afterTools && !hasConclusiveSignal(trimmed) && !asksUserQuestion(trimmed)) return true;
+  // Explicit "to be continued" — trailing ellipsis with no follow-up.
+  if (/(?:…|\.{3})\s*$/.test(trimmed)) return true;
+  // Dangling list/clause punctuation: a real answer almost never ends like this.
+  // Dashes (- —) and sentence-ending periods are intentionally excluded.
+  if (/[:：,，;；]\s*(?:[`'")\]}）】]*)$/.test(trimmed)) return true;
+  // Short responses that read as pure plans without any execution result.
+  if (endsWithIntentToActOnly(trimmed)) return true;
   return false;
 }
 
@@ -330,7 +295,6 @@ export class AgentLoop {
 
     let consecutiveAutoContinues = 0;
     let consecutivePrematureStopContinues = 0;
-    let sawToolCallsThisRun = false;
     const autoContinueOnPrematureStop = this.options.autoContinueOnPrematureStop ?? true;
     const maxPrematureStopContinues = Math.max(
       0,
@@ -619,7 +583,7 @@ export class AgentLoop {
           finishReason !== 'length' &&
           autoContinueOnPrematureStop &&
           consecutivePrematureStopContinues < maxPrematureStopContinues &&
-          looksIncompleteFinalAnswer(assistantText, sawToolCallsThisRun)
+          looksIncompleteFinalAnswer(assistantText)
         ) {
           consecutivePrematureStopContinues++;
           messages.push({
@@ -637,7 +601,6 @@ export class AgentLoop {
       }
 
       // Tool calls were emitted: making real progress, reset the auto-continue budget.
-      sawToolCallsThisRun = true;
       consecutiveAutoContinues = 0;
       consecutivePrematureStopContinues = 0;
 

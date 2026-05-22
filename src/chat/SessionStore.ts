@@ -2,11 +2,24 @@ import * as vscode from 'vscode';
 import { ChatMessage } from '../llm/OpenAIClient';
 import { PlanStep } from '../agent/tools/plan';
 
+/**
+ * High-level lifecycle state of an agent session. Drives the status badge
+ * rendered in the chat history list and gates whether the user can resume /
+ * cancel the run from the panel.
+ */
+export type SessionStatus =
+  | 'idle'        // never run, or run finished and we forgot the exact reason
+  | 'running'     // an AgentLoop is currently driving this session
+  | 'completed'   // last run finished normally (stop / tool_calls / proposed_edit_done)
+  | 'stopped'     // last run was cancelled by the user / hit max iters / stuck
+  | 'error';      // last run threw / surfaced an error event
+
 export interface SessionMeta {
   id: string;
   title: string;
   createdAt: number;
   updatedAt: number;
+  status?: SessionStatus;
 }
 
 /**
@@ -31,6 +44,10 @@ export interface Session extends SessionMeta {
   messages: ChatMessage[];
   plan?: PlanStep[];
   checkpoints?: SessionCheckpoint[];
+}
+
+export function isTerminalStatus(s: SessionStatus | undefined): boolean {
+  return s === 'completed' || s === 'stopped' || s === 'error' || s === 'idle' || !s;
 }
 
 const KEY_INDEX = 'burstcode.sessions.index';
@@ -59,7 +76,8 @@ export class SessionStore {
       id: session.id,
       title: session.title,
       createdAt: session.createdAt,
-      updatedAt: session.updatedAt
+      updatedAt: session.updatedAt,
+      status: session.status
     };
     const without = idx.filter((m) => m.id !== session.id);
     without.unshift(meta);

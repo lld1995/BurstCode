@@ -16,7 +16,7 @@ import { LspBridge } from '../lsp/LspBridge';
 import { estimateMessagesTokens } from '../llm/tokenizer';
 import { AgentLoop } from '../agent/AgentLoop';
 import { Tool } from '../agent/tools/types';
-import { buildReadFileTool, listDirTool, grepSearchTool, workspaceOutlineTool } from '../agent/tools/core';
+import { buildReadFileTool, buildWriteFileTool, listDirTool, grepSearchTool, workspaceOutlineTool } from '../agent/tools/core';
 import { WorkspaceIndex } from '../context/WorkspaceIndex';
 import { buildSystemPrompt } from '../agent/prompts';
 import { buildLspTools } from '../agent/tools/lsp';
@@ -31,6 +31,7 @@ import { CheckpointInfo, GitCheckpoint } from '../git/GitCheckpoint';
 import {
   Session,
   SessionCheckpoint,
+  SessionStatus,
   SessionStore,
   buildTranscript,
   createSessionId,
@@ -48,13 +49,98 @@ interface OutboundMessage {
   payload?: unknown;
 }
 
+/**
+ * Snapshot of an in-flight agent run for a single session. Kept in memory so
+ * the webview can replay the streaming UI when the user switches AWAY and
+ * then back to a running session.
+ *
+ * What we capture:
+ *   - `iter`                  current iteration index (0-based) emitted by AgentLoop
+ *   - `assistantText`         accumulated assistant-delta bytes not yet finalized
+ *   - `reasoningText`         accumulated reasoning-delta bytes not yet finalized
+ *   - `runningTools`          tool calls currently in-flight (id -> snapshot)
+ *   - `toolProgress`          last-N progress lines per running tool id
+ *   - `iterPills` / `autoPills`/`resumePills`  small banner pills emitted by the loop
+ *   - `plan`                  latest plan steps (also persisted on the Session)
+ *   - `pendingAsk`            an open ask-user prompt (if any)
+ *   - `lastStatus`            most recent status label so the bottom pill stays in sync
+ */
+interface RunningToolSnap {
+  id: string;
+  name: string;
+  args: unknown;
+  startedAt: number;
+}
+
+interface PillSnap {
+  kind: 'iteration' | 'auto-continue' | 'auto-resume';
+  payload: unknown;
+}
+
+interface PendingAskSnap {
+  id: string;
+  question: string;
+  inputType: 'single' | 'multi' | 'text';
+  options?: Array<{ label: string; description?: string }>;
+  allowCustomText?: boolean;
+  placeholder?: string;
+}
+
+interface SessionLive {
+  iter: number;
+  assistantText: string;
+  reasoningText: string;
+  runningTools: Map<string, RunningToolSnap>;
+  toolProgress: Map<string, string[]>;
+  pills: PillSnap[];
+  lastStatus?: { state: string; label: string };
+  pendingAsk?: PendingAskSnap;
+}
+
+function emptyLive(): SessionLive {
+  return {
+    iter: 0,
+    assistantText: '',
+    reasoningText: '',
+    runningTools: new Map(),
+    toolProgress: new Map(),
+    pills: []
+  };
+}
+
+interface RunContext {
+  sessionId: string;
+  session: Session;
+  cts: vscode.CancellationTokenSource;
+  live: SessionLive;
+  /** Pending askUser promise — resolved by the webview message. */
+  pendingAsk?: { resolve: (value: string) => void; id: string; spec: PendingAskSnap };
+}
+
+/** Workspace-state key for the persisted browser-style open-tab working set. */
+const KEY_OPEN_TABS = 'burstcode.chat.openTabs';
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'burstcode.chatView';
 
   private view?: vscode.WebviewView;
   private currentSession?: Session;
-  private currentRun?: vscode.CancellationTokenSource;
-  private pendingAskUser?: { resolve: (value: string) => void; id: string };
+  /**
+   * Per-session in-flight run contexts. Multiple sessions can be running
+   * concurrently; the webview only renders events for the session that is
+   * currently visible, but the backend keeps live snapshots so switching
+   * back to a still-running session replays the in-flight state.
+   */
+  private readonly runs = new Map<string, RunContext>();
+  /**
+   * Browser-style "open tab" working set. Distinct from the history list:
+   * history is every persisted session, openTabIds is the subset the user
+   * has explicitly pulled into the foreground tab strip. Closing a tab
+   * removes the id here but does NOT delete the underlying session \u2014 the
+   * user can re-open it from the history overlay later. Persisted across
+   * reloads so opened tabs survive a VS Code restart.
+   */
+  private openTabIds = new Set<string>();
   private configSub?: vscode.Disposable;
   private pendingEditsSub?: vscode.Disposable;
   private readonly sessions: SessionStore;
@@ -72,6 +158,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   ) {
     this.sessions = new SessionStore(context.workspaceState);
     this.lessons = new LessonStore(context.workspaceState);
+    // Restore the open-tab working set. Filter out any ids whose session has
+    // since been deleted so we never render orphan tabs.
+    const persisted = context.workspaceState.get<string[]>(KEY_OPEN_TABS) ?? [];
+    const validIds = new Set(this.sessions.list().map((m) => m.id));
+    for (const id of persisted) {
+      if (validIds.has(id)) this.openTabIds.add(id);
+    }
     this.configSub = vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('burstcode.llm')) {
         this.broadcastModels();
@@ -100,9 +193,92 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** True while a chat-driven agent run is active. Used by BackgroundExplorer to defer idle work. */
+  /** True while ANY chat-driven agent run is active. Used by BackgroundExplorer to defer idle work. */
   isBusy(): boolean {
-    return !!this.currentRun;
+    return this.runs.size > 0;
+  }
+
+  /** Run context for the currently-visible session, if any. */
+  private currentRun(): RunContext | undefined {
+    return this.currentSession ? this.runs.get(this.currentSession.id) : undefined;
+  }
+
+  /** Resolve the effective status (live runs override the persisted field). */
+  private effectiveStatus(sessionId: string, persisted?: SessionStatus): SessionStatus | undefined {
+    if (this.runs.has(sessionId)) return 'running';
+    return persisted;
+  }
+
+  /** Mark a session as "open" in the foreground tab strip. Idempotent. */
+  private openTab(id: string): void {
+    if (!id) return;
+    if (this.openTabIds.has(id)) return;
+    this.openTabIds.add(id);
+    void this.persistOpenTabs();
+  }
+
+  /** Remove a session from the tab strip. Does NOT delete it from history. */
+  private closeTab(id: string): void {
+    if (!this.openTabIds.delete(id)) return;
+    void this.persistOpenTabs();
+    // If the closed tab was the active one, fall back to another open tab
+    // (most-recently-updated) so the user lands on a real session rather
+    // than a blank panel. If nothing is left open, drop to empty state.
+    if (this.currentSession?.id === id) {
+      const fallback = this.pickFallbackTab(id);
+      if (fallback) {
+        void this.loadSession(fallback);
+      } else {
+        this.currentSession = undefined;
+        this.post({ type: 'reset' });
+        this.broadcastContextUsage();
+        this.broadcastSessions();
+      }
+    } else {
+      this.broadcastSessions();
+    }
+  }
+
+  /**
+   * Bulk close. If `keep` is provided, every tab EXCEPT that id is removed;
+   * otherwise all tabs are closed. Batches the work to avoid one persist /
+   * broadcast roundtrip per removed tab.
+   */
+  private closeAllTabs(keep?: string): void {
+    let changed = false;
+    for (const id of Array.from(this.openTabIds)) {
+      if (keep && id === keep) continue;
+      if (this.openTabIds.delete(id)) changed = true;
+    }
+    if (!changed) return;
+    void this.persistOpenTabs();
+    // Reconcile the active session with what's still open.
+    const activeId = this.currentSession?.id;
+    if (activeId && !this.openTabIds.has(activeId)) {
+      if (keep && this.openTabIds.has(keep)) {
+        void this.loadSession(keep);
+        return;
+      }
+      // Nothing meaningful left to show \u2014 reset to the empty state.
+      this.currentSession = undefined;
+      this.post({ type: 'reset' });
+      this.broadcastContextUsage();
+    }
+    this.broadcastSessions();
+  }
+
+  /** Pick the most recently-updated open tab other than `exclude`. */
+  private pickFallbackTab(exclude: string): string | undefined {
+    const candidates = this.sessions.list().filter((s) => s.id !== exclude && this.openTabIds.has(s.id));
+    return candidates[0]?.id;
+  }
+
+  private async persistOpenTabs(): Promise<void> {
+    try {
+      await this.context.workspaceState.update(KEY_OPEN_TABS, Array.from(this.openTabIds));
+    } catch (err) {
+      this.logger.warn('Failed to persist open tabs', String(err));
+    }
   }
 
   private broadcastPendingEdits(state: PendingState): void {
@@ -137,11 +313,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private broadcastSessions(): void {
     if (!this.view) return;
+    const raw = this.sessions.list();
+    // Overlay live status from the in-memory runs map so a session that just
+    // started (but hasn't been persisted yet) still shows up as 'running' in
+    // the history list. Persisted status is the source of truth otherwise.
+    const sessions = raw.map((s) => ({
+      ...s,
+      status: this.effectiveStatus(s.id, s.status) ?? 'idle'
+    }));
+    // A session that just started its FIRST run won't be in the persisted
+    // index yet (we save lazily). Surface it anyway so the user sees the
+    // running pill immediately.
+    for (const [id, ctx] of this.runs.entries()) {
+      if (!sessions.find((s) => s.id === id)) {
+        sessions.unshift({
+          id,
+          title: ctx.session.title,
+          createdAt: ctx.session.createdAt,
+          updatedAt: Date.now(),
+          status: 'running'
+        });
+      }
+    }
     this.post({
       type: 'sessions',
       payload: {
-        sessions: this.sessions.list(),
-        activeId: this.currentSession?.id
+        sessions,
+        activeId: this.currentSession?.id,
+        // The tab strip filters by this set; the history overlay ignores it
+        // and shows every persisted session.
+        openIds: Array.from(this.openTabIds)
       }
     });
   }
@@ -211,17 +412,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async loadSession(id: string): Promise<void> {
-    if (this.currentRun) {
-      vscode.window.showWarningMessage('BurstCode: finish or stop the current request before switching sessions.');
-      return;
-    }
-    const s = this.sessions.get(id);
+    // Prefer the live session held by an active run (its messages array is
+    // the one the AgentLoop is currently mutating). Falls back to disk for
+    // idle sessions.
+    const live = this.runs.get(id)?.session;
+    const s = live ?? this.sessions.get(id);
     if (!s) {
       vscode.window.showWarningMessage('BurstCode: session not found.');
       this.broadcastSessions();
       return;
     }
     this.currentSession = s;
+    // Loading a session always promotes it into the tab strip — the user
+    // explicitly wanted to look at it.
+    this.openTab(s.id);
     this.post({ type: 'reset' });
     this.post({
       type: 'load-session',
@@ -229,20 +433,78 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         id: s.id,
         title: s.title,
         transcript: buildTranscript(s.messages, s.checkpoints),
-        plan: s.plan ?? []
+        plan: s.plan ?? [],
+        status: this.effectiveStatus(s.id, s.status) ?? 'idle'
       }
     });
+    // If a run is still in flight for this session, replay the in-memory
+    // live snapshot so the user sees streaming text / running tools / iter
+    // pills they would have seen if they'd never switched away.
+    const ctx = this.runs.get(id);
+    if (ctx) {
+      this.post({ type: 'live-state-replay', payload: this.serializeLive(ctx) });
+    }
     this.broadcastSessions();
     this.broadcastContextUsage();
   }
 
+  /** Build a JSON-safe snapshot of the in-flight run state for replay. */
+  private serializeLive(ctx: RunContext): unknown {
+    const live = ctx.live;
+    const runningTools = Array.from(live.runningTools.entries()).map(([id, t]) => ({
+      id,
+      name: t.name,
+      args: t.args,
+      startedAt: t.startedAt,
+      progress: live.toolProgress.get(id) ?? []
+    }));
+    return {
+      sessionId: ctx.sessionId,
+      iter: live.iter,
+      assistantText: live.assistantText,
+      reasoningText: live.reasoningText,
+      runningTools,
+      pills: live.pills,
+      lastStatus: live.lastStatus,
+      pendingAsk: live.pendingAsk
+    };
+  }
+
   private async deleteSession(id: string): Promise<void> {
+    // Refuse to delete a session that is still running — cancel it first.
+    if (this.runs.has(id)) {
+      vscode.window.showWarningMessage('BurstCode: stop this session before deleting it.');
+      return;
+    }
+    // Confirm via a VS Code native modal. We can't rely on the webview's
+    // `confirm()` since it is silently a no-op inside vscode webviews —
+    // calling it returns undefined and the delete path was being skipped.
+    const meta = this.sessions.list().find((s) => s.id === id);
+    const title = meta?.title ?? 'this chat';
+    const choice = await vscode.window.showWarningMessage(
+      `Delete chat "${title}"? This cannot be undone.`,
+      { modal: true },
+      'Delete'
+    );
+    if (choice !== 'Delete') return;
     await this.sessions.delete(id);
+    // Also evict from the tab working set so we don't leave an orphan tab
+    // pointing at a now-deleted session.
+    if (this.openTabIds.delete(id)) {
+      void this.persistOpenTabs();
+    }
     if (this.currentSession?.id === id) {
       this.currentSession = undefined;
       this.post({ type: 'reset' });
     }
     this.broadcastSessions();
+  }
+
+  /** Cancel the run for a specific session (e.g. from history's stop button). */
+  private cancelSession(id: string): void {
+    const ctx = this.runs.get(id);
+    if (!ctx) return;
+    ctx.cts.cancel();
   }
 
   private ensureSessionForUserText(userText: string): Session {
@@ -256,6 +518,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       messages: [],
       plan: []
     };
+    // Brand-new chats auto-join the tab strip.
+    this.openTab(this.currentSession.id);
     return this.currentSession;
   }
 
@@ -285,8 +549,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.runAgent(String((msg.payload as { text: string })?.text ?? ''));
         break;
       case 'cancel':
-        this.currentRun?.cancel();
+        this.currentRun()?.cts.cancel();
         break;
+      case 'cancel-session': {
+        const sid = String((msg.payload as { id?: string })?.id ?? '').trim();
+        if (sid) this.cancelSession(sid);
+        break;
+      }
+      case 'close-tab': {
+        const sid = String((msg.payload as { id?: string })?.id ?? '').trim();
+        if (sid) this.closeTab(sid);
+        break;
+      }
+      case 'close-all-tabs':
+        this.closeAllTabs();
+        break;
+      case 'close-other-tabs': {
+        const sid = String((msg.payload as { id?: string })?.id ?? '').trim();
+        if (sid) this.closeAllTabs(sid);
+        break;
+      }
       case 'accept-all-edits':
         await this.applier.acceptAll();
         break;
@@ -307,10 +589,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.rollbackToCheckpoint(String(payload.ref ?? ''), Number(payload.messageIndex ?? -1));
         break;
       }
-      case 'ask-user-response':
-        this.pendingAskUser?.resolve(String((msg.payload as { answer: string })?.answer ?? ''));
-        this.pendingAskUser = undefined;
+      case 'ask-user-response': {
+        const payload = (msg.payload ?? {}) as { answer?: string; sessionId?: string; id?: string };
+        const answer = String(payload.answer ?? '');
+        const askId = String(payload.id ?? '');
+        // Find which session's pending ask this belongs to. Prefer the
+        // explicit sessionId (sent by the webview when answering), then fall
+        // back to matching by ask id (older messages), then the current view.
+        const target =
+          (payload.sessionId && this.runs.get(payload.sessionId)) ||
+          (askId
+            ? Array.from(this.runs.values()).find((r) => r.pendingAsk?.id === askId)
+            : undefined) ||
+          this.currentRun();
+        if (target?.pendingAsk) {
+          target.pendingAsk.resolve(answer);
+          target.pendingAsk = undefined;
+          target.live.pendingAsk = undefined;
+        }
         break;
+      }
       case 'reset':
         this.newChat();
         break;
@@ -428,14 +726,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       case 'delete-lesson': {
         const id = String((msg.payload as { id?: string })?.id ?? '').trim();
-        if (id) await this.lessons.remove(id);
+        if (!id) break;
+        // Confirm via VS Code modal (webview confirm() is a no-op).
+        const choice = await vscode.window.showWarningMessage(
+          'Delete this lesson? This cannot be undone.',
+          { modal: true },
+          'Delete'
+        );
+        if (choice !== 'Delete') break;
+        await this.lessons.remove(id);
         this.broadcastLessons();
         break;
       }
-      case 'clear-lessons':
+      case 'clear-lessons': {
+        const count = this.lessons.list().length;
+        if (count === 0) break;
+        const choice = await vscode.window.showWarningMessage(
+          `Delete all ${count} lessons? This cannot be undone.`,
+          { modal: true },
+          'Delete All'
+        );
+        if (choice !== 'Delete All') break;
         await this.lessons.clear();
         this.broadcastLessons();
         break;
+      }
       default:
         this.logger.warn('Unknown webview message', msg.type);
     }
@@ -496,7 +811,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       vscode.window.showWarningMessage('BurstCode: nothing to roll back to.');
       return;
     }
-    if (this.currentRun) {
+    if (this.currentRun()) {
       vscode.window.showWarningMessage('BurstCode: stop the current request before rolling back.');
       return;
     }
@@ -541,8 +856,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async runAgent(userText: string): Promise<void> {
     if (!userText.trim()) return;
-    if (this.currentRun) {
-      vscode.window.showWarningMessage('BurstCode: a request is already running.');
+    // Only block when THIS session is already running. Other sessions can
+    // run concurrently in the background.
+    const session = this.ensureSessionForUserText(userText);
+    if (this.runs.has(session.id)) {
+      vscode.window.showWarningMessage('BurstCode: this session already has a request running.');
       return;
     }
 
@@ -551,11 +869,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Allocate (and publish) the cancellation source FIRST, before any of
     // the slow setup work below. Otherwise a user clicking Stop while we are
     // still building the system prompt or creating the git checkpoint would
-    // hit `this.currentRun?.cancel()` on `undefined` and have no effect.
+    // miss the in-flight setup phase.
     const cts = new vscode.CancellationTokenSource();
-    this.currentRun = cts;
+    const ctx: RunContext = {
+      sessionId: session.id,
+      session,
+      cts,
+      live: emptyLive()
+    };
+    this.runs.set(session.id, ctx);
+    session.status = 'running';
+    this.broadcastSessions();
 
-    const session = this.ensureSessionForUserText(userText);
+    // Capture which session this run targets — this stays fixed for the
+    // entire run even if the user switches the foreground view away.
+    const isActive = (): boolean => this.currentSession?.id === session.id;
+    const postLive = (msg: OutboundMessage): void => {
+      if (isActive()) this.post(msg);
+    };
+
     this.ensureSystemMessageSlot(session);
     const messageIndex = session.messages.length;
     session.messages.push({ role: 'user', content: userText });
@@ -589,12 +921,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       session.checkpoints = [...(session.checkpoints ?? []), entry];
     }
 
-    this.post({
+    postLive({
       type: 'user-message',
       payload: { text: userText, messageIndex, checkpointRef }
     });
-    this.broadcastContextUsage();
-    void this.persistCurrentSession();
+    if (isActive()) this.broadcastContextUsage();
+    void this.persistSession(session);
 
     const llmCfg = readLLMConfig();
     const client = new OpenAIClient(llmCfg, this.logger);
@@ -605,24 +937,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const askUser = (spec: AskUserSpec): Promise<string> => {
       return new Promise<string>((resolve) => {
         const id = `ask_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        this.pendingAskUser = { resolve, id };
-        this.post({
+        const askSpec: PendingAskSnap = {
+          id,
+          question: spec.question,
+          inputType: spec.inputType,
+          options: spec.options,
+          allowCustomText: !!spec.allowCustomText,
+          placeholder: spec.placeholder
+        };
+        ctx.pendingAsk = { resolve, id, spec: askSpec };
+        ctx.live.pendingAsk = askSpec;
+        postLive({
           type: 'ask-user',
-          payload: {
-            id,
-            question: spec.question,
-            inputType: spec.inputType,
-            options: spec.options,
-            allowCustomText: !!spec.allowCustomText,
-            placeholder: spec.placeholder
-          }
+          payload: { sessionId: session.id, ...askSpec }
         });
         // If the run is cancelled before the user answers, unblock the agent
         // loop so it can wind down cleanly instead of hanging on this promise.
         const cancelSub = cts.token.onCancellationRequested(() => {
-          if (this.pendingAskUser?.id === id) {
-            this.pendingAskUser = undefined;
-            this.post({ type: 'ask-user-cancel', payload: { id } });
+          if (ctx.pendingAsk?.id === id) {
+            ctx.pendingAsk = undefined;
+            ctx.live.pendingAsk = undefined;
+            postLive({ type: 'ask-user-cancel', payload: { id } });
             resolve('(cancelled by user)');
           }
           cancelSub.dispose();
@@ -631,16 +966,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
 
     const onPlanUpdate = (steps: PlanStep[]): void => {
-      if (this.currentSession) {
-        this.currentSession.plan = steps;
-      }
-      this.post({ type: 'plan-update', payload: { steps } });
-      void this.persistCurrentSession();
+      // Plan belongs to the run's session, not necessarily the visible one.
+      session.plan = steps;
+      postLive({ type: 'plan-update', payload: { steps } });
+      void this.persistSession(session);
     };
 
     const systemPrompt = await systemPromptPromise;
     const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
     const coreReadTools: Tool[] = [buildReadFileTool(this.applier), listDirTool, grepSearchTool, workspaceOutlineTool];
+    const writeFileTool = buildWriteFileTool();
     const lspTools = buildLspTools(bridge, this.depGuard);
     const editTools = buildEditTools(this.applier, askUser);
     const subagentTool = buildSubagentTool({
@@ -663,6 +998,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       subagentTool,
       ...buildLangTools(),
       ...editTools,
+      writeFileTool,
       ...buildShellTools({ askUser }),
       buildPlanTool(onPlanUpdate),
       ...buildLessonTools(this.lessons, (list) => {
@@ -686,70 +1022,175 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       maxAutoResumes: agentCfg.get<number>('maxAutoResumes') ?? 3,
       maxStuckRepeats: agentCfg.get<number>('maxStuckRepeats') ?? 2,
       autoContinueOnPrematureStop: agentCfg.get<boolean>('autoContinueOnPrematureStop') ?? true,
-      maxPrematureStopContinues: agentCfg.get<number>('maxPrematureStopContinues') ?? 5,
+      maxPrematureStopContinues: agentCfg.get<number>('maxPrematureStopContinues') ?? 2,
       askUser,
       systemPrompt
     });
 
-    this.post({ type: 'run-start' });
+    postLive({ type: 'run-start' });
 
+    let doneReason: string | undefined;
+    let sawError = false;
     try {
       for await (const event of agent.run(session.messages, cts.token)) {
+        // Update the per-session live snapshot FIRST so it stays consistent
+        // whether or not the webview is currently showing this session.
+        this.applyEventToLive(ctx, event);
         switch (event.type) {
           case 'assistant-delta':
-            this.post({ type: 'assistant-delta', payload: { text: event.payload as string } });
+            postLive({ type: 'assistant-delta', payload: { text: event.payload as string } });
             break;
           case 'reasoning-delta':
-            this.post({ type: 'reasoning-delta', payload: { text: event.payload as string } });
+            postLive({ type: 'reasoning-delta', payload: { text: event.payload as string } });
             break;
           case 'assistant-message':
-            this.post({ type: 'assistant-message', payload: event.payload });
+            postLive({ type: 'assistant-message', payload: event.payload });
             break;
           case 'tool-call-start':
-            this.post({ type: 'tool-call-start', payload: event.payload });
+            postLive({ type: 'tool-call-start', payload: event.payload });
             break;
           case 'tool-call-end':
-            this.post({ type: 'tool-call-end', payload: event.payload });
+            postLive({ type: 'tool-call-end', payload: event.payload });
             break;
           case 'tool-progress':
-            this.post({ type: 'tool-progress', payload: event.payload });
+            postLive({ type: 'tool-progress', payload: event.payload });
             break;
           case 'iteration-start':
-            this.post({ type: 'iteration', payload: event.payload });
+            postLive({ type: 'iteration', payload: event.payload });
             break;
           case 'auto-continue':
-            this.post({ type: 'auto-continue', payload: event.payload });
+            postLive({ type: 'auto-continue', payload: event.payload });
             break;
           case 'auto-resume':
-            this.post({ type: 'auto-resume', payload: event.payload });
+            postLive({ type: 'auto-resume', payload: event.payload });
             break;
           case 'context-usage':
-            this.post({ type: 'context-usage', payload: event.payload });
+            postLive({ type: 'context-usage', payload: event.payload });
             break;
           case 'context-compressed':
-            this.post({ type: 'context-compressed', payload: event.payload });
+            postLive({ type: 'context-compressed', payload: event.payload });
             break;
           case 'stuck-detected':
-            this.post({ type: 'stuck-detected', payload: event.payload });
+            postLive({ type: 'stuck-detected', payload: event.payload });
             break;
           case 'error':
-            this.post({ type: 'error', payload: event.payload });
+            sawError = true;
+            postLive({ type: 'error', payload: event.payload });
             break;
-          case 'done':
-            this.post({ type: 'done', payload: event.payload });
+          case 'done': {
+            const r = (event.payload as { reason?: string } | undefined)?.reason;
+            doneReason = typeof r === 'string' ? r : undefined;
+            postLive({ type: 'done', payload: event.payload });
             break;
+          }
         }
       }
     } catch (err) {
+      sawError = true;
       this.logger.error('Agent run failed', String(err));
-      this.post({ type: 'error', payload: String(err) });
+      postLive({ type: 'error', payload: String(err) });
     } finally {
-      this.currentRun = undefined;
+      this.runs.delete(session.id);
       cts.dispose();
+      // Decide final status: error > cancelled > completed.
+      const cancelled = cts.token.isCancellationRequested || doneReason === 'cancelled';
+      session.status = sawError
+        ? 'error'
+        : cancelled
+          ? 'stopped'
+          : doneReason === 'max_iterations' || doneReason === 'stuck' || doneReason === 'aborted-stuck'
+            ? 'stopped'
+            : 'completed';
       this.foregroundActivityEmitter.fire('chat-end');
-      this.broadcastContextUsage();
-      await this.persistCurrentSession();
+      if (isActive()) this.broadcastContextUsage();
+      await this.persistSession(session);
+      this.broadcastSessions();
     }
+  }
+
+  /** Mutate the per-session live snapshot in response to one agent event. */
+  private applyEventToLive(ctx: RunContext, event: { type: string; payload?: unknown }): void {
+    const live = ctx.live;
+    switch (event.type) {
+      case 'assistant-delta':
+        live.assistantText += String(event.payload ?? '');
+        live.lastStatus = { state: 'busy', label: live.iter ? `Streaming (iter ${live.iter})...` : 'Streaming...' };
+        break;
+      case 'reasoning-delta':
+        live.reasoningText += String(event.payload ?? '');
+        break;
+      case 'assistant-message':
+        live.assistantText = '';
+        live.reasoningText = '';
+        break;
+      case 'tool-call-start': {
+        const p = (event.payload ?? {}) as { id?: string; name?: string; args?: unknown };
+        const id = String(p.id ?? `${p.name}_${Date.now()}`);
+        live.runningTools.set(id, { id, name: String(p.name ?? ''), args: p.args, startedAt: Date.now() });
+        const names = Array.from(live.runningTools.values()).map((t) => t.name).join(', ');
+        live.lastStatus = { state: 'tool', label: `Running ${names}...` };
+        break;
+      }
+      case 'tool-call-end': {
+        const p = (event.payload ?? {}) as { id?: string };
+        if (p.id) {
+          live.runningTools.delete(p.id);
+          live.toolProgress.delete(p.id);
+        }
+        live.lastStatus = live.runningTools.size === 0
+          ? { state: 'busy', label: live.iter ? `Thinking (iter ${live.iter})...` : 'Thinking...' }
+          : { state: 'tool', label: `Running ${Array.from(live.runningTools.values()).map((t) => t.name).join(', ')}...` };
+        break;
+      }
+      case 'tool-progress': {
+        const p = (event.payload ?? {}) as { id?: string; message?: string };
+        if (p.id) {
+          const arr = live.toolProgress.get(p.id) ?? [];
+          arr.push(String(p.message ?? ''));
+          // Cap to keep memory bounded.
+          if (arr.length > 200) arr.splice(0, arr.length - 200);
+          live.toolProgress.set(p.id, arr);
+        }
+        break;
+      }
+      case 'iteration-start': {
+        const p = (event.payload ?? {}) as { iter?: number };
+        const iter = Number(p.iter ?? 0) + 1;
+        live.iter = iter;
+        live.pills.push({ kind: 'iteration', payload: { iter: iter - 1 } });
+        live.assistantText = '';
+        live.reasoningText = '';
+        live.lastStatus = { state: 'busy', label: `Thinking (iter ${iter})...` };
+        break;
+      }
+      case 'auto-continue':
+        live.pills.push({ kind: 'auto-continue', payload: event.payload });
+        break;
+      case 'auto-resume':
+        live.pills.push({ kind: 'auto-resume', payload: event.payload });
+        live.assistantText = '';
+        live.reasoningText = '';
+        break;
+      case 'done':
+        live.lastStatus = { state: 'done', label: 'Done' };
+        live.runningTools.clear();
+        live.toolProgress.clear();
+        break;
+      case 'error':
+        live.lastStatus = { state: 'error', label: 'Error' };
+        break;
+    }
+  }
+
+  /** Persist a specific session (not necessarily the currently-visible one). */
+  private async persistSession(session: Session): Promise<void> {
+    session.updatedAt = Date.now();
+    try {
+      await this.sessions.save(session);
+    } catch (err) {
+      this.logger.error('Failed to persist session', String(err));
+    }
+    this.broadcastSessions();
   }
 
   private renderHtml(webview: vscode.Webview): string {
@@ -787,7 +1228,7 @@ document.addEventListener('click', (ev) => {
   } catch (e) {}
 }, true);
 function runProbe() {
-  const ids = ['newBtn', 'historyBtn', 'lessonsBtn', 'cfgBtn', 'modelPickerBtn', 'sendBtn', 'bgStatus', 'input'];
+  const ids = ['tabs', 'newBtn', 'historyBtn', 'lessonsBtn', 'cfgBtn', 'modelPickerBtn', 'sendBtn', 'bgStatus', 'input'];
   const lines = [];
   for (const id of ids) {
     try {
@@ -831,16 +1272,62 @@ setTimeout(() => {
   * { box-sizing: border-box; }
   body { margin: 0; padding: 0; font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); background: var(--vscode-sideBar-background); display: flex; flex-direction: column; height: 100vh; position: relative; }
 
-  /* ============ Top bar ============ */
-  .topbar { display: flex; align-items: center; gap: 2px; padding: 8px 12px; background: var(--vscode-sideBar-background); flex-shrink: 0; position: relative; }
-  .topbar::after { content: ''; position: absolute; left: 12px; right: 12px; bottom: 0; height: 1px; background: var(--vscode-panel-border); opacity: 0.5; }
-  .topbar .brand { font-weight: 600; font-size: 0.92em; letter-spacing: 0.2px; opacity: 0.85; padding-right: 6px; display: inline-flex; align-items: center; gap: 6px; }
-  .topbar .brand .dot { width: 6px; height: 6px; border-radius: 50%; background: linear-gradient(135deg, var(--vscode-charts-blue), var(--vscode-charts-purple)); }
-  .topbar .spacer { flex: 1; }
-  .topbar .icon-btn { background: transparent; color: var(--vscode-foreground); border: none; border-radius: 5px; padding: 4px; cursor: pointer; opacity: 0.65; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; transition: opacity 0.15s, background 0.15s; }
+  /* ============ Top bar (single row: tabs + action icons) ============ */
+  /*
+   * Single-row topbar: tab strip on the left grows to fill, action icon
+   * buttons (history / lessons / settings) sit on the right. No brand label
+   * \u2014 the tabs themselves identify the current chat. Tabs dock to the
+   * bottom hairline of the topbar so they read as proper "tabs" (rounded
+   * top, flush bottom merging with the chat area below).
+   */
+  .topbar { display: flex; align-items: stretch; gap: 2px; padding: 6px 8px 0; background: var(--vscode-sideBar-background); flex-shrink: 0; position: relative; min-height: 36px; }
+  .topbar::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 1px; background: var(--vscode-panel-border); opacity: 0.5; }
+  .topbar .icon-btn { background: transparent; color: var(--vscode-foreground); border: none; border-radius: 5px; padding: 4px; cursor: pointer; opacity: 0.65; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; transition: opacity 0.15s, background 0.15s; align-self: center; flex-shrink: 0; margin-bottom: 4px; }
   .topbar .icon-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
   .topbar .icon-btn svg { width: 15px; height: 15px; }
-  .topbar .divider { width: 1px; height: 16px; background: var(--vscode-panel-border); opacity: 0.5; margin: 0 4px; }
+  .topbar .divider { width: 1px; height: 16px; background: var(--vscode-panel-border); opacity: 0.5; margin: 0 4px; align-self: center; }
+
+  /* ============ Session tabs (inline with topbar) ============ */
+  /*
+   * Tab strip lives INSIDE the topbar so the layout is one compact row.
+   * Each tab is a rounded-top rectangle whose fill is a vertical gradient
+   * \u2014 darker at the BOTTOM, fading toward near-transparent at the TOP. The
+   * base tint comes from --tab-color (per status: running / done / stopped
+   * / error / idle). The active tab uses a stronger ramp and a 2px overlay
+   * that covers the topbar's bottom hairline so it visually merges with the
+   * chat area below.
+   */
+  #tabs { display: flex; gap: 2px; flex: 1; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; scrollbar-color: var(--vscode-scrollbarSlider-background) transparent; align-items: flex-end; padding-right: 4px; }
+  #tabs::-webkit-scrollbar { height: 6px; }
+  #tabs::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 3px; }
+  #tabs::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
+  .tab { display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px 6px 10px; font-size: 0.78em; line-height: 1.3; border: 1px solid var(--vscode-panel-border); border-bottom: none; border-radius: 6px 6px 0 0; cursor: pointer; max-width: 160px; min-width: 70px; color: var(--vscode-foreground); position: relative; flex-shrink: 0; user-select: none; transition: opacity 0.15s, transform 0.15s; opacity: 0.72; --tab-color: var(--vscode-descriptionForeground); background: linear-gradient(to top, color-mix(in srgb, var(--tab-color) 32%, var(--vscode-sideBar-background)) 0%, color-mix(in srgb, var(--tab-color) 6%, var(--vscode-sideBar-background)) 100%); }
+  .tab:hover { opacity: 0.95; }
+  /* Active tab: stronger ramp + a 2px strip overlapping the topbar bottom
+     hairline so the tab visually "connects" to the chat area below. */
+  .tab[data-active="true"] { opacity: 1; border-color: color-mix(in srgb, var(--tab-color) 55%, var(--vscode-panel-border)); background: linear-gradient(to top, color-mix(in srgb, var(--tab-color) 55%, var(--vscode-sideBar-background)) 0%, color-mix(in srgb, var(--tab-color) 18%, var(--vscode-sideBar-background)) 100%); z-index: 1; }
+  .tab[data-active="true"]::after { content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--vscode-sideBar-background); }
+  .tab .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--tab-color); flex-shrink: 0; box-shadow: 0 0 4px color-mix(in srgb, var(--tab-color) 55%, transparent); }
+  .tab[data-state="running"] .dot { animation: tabPulse 1.1s ease-in-out infinite; }
+  .tab .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .tab .close { background: transparent; border: none; color: inherit; opacity: 0; padding: 1px 4px; cursor: pointer; border-radius: 3px; font-size: 11px; line-height: 1; flex-shrink: 0; transition: opacity 0.15s, background 0.15s; }
+  .tab:hover .close, .tab[data-active="true"] .close { opacity: 0.55; }
+  .tab .close:hover { opacity: 1 !important; background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-errorForeground); }
+  .tab[data-state="running"] { --tab-color: var(--vscode-charts-blue); }
+  .tab[data-state="completed"] { --tab-color: var(--vscode-charts-green); }
+  .tab[data-state="stopped"] { --tab-color: var(--vscode-charts-orange, #d18616); }
+  .tab[data-state="error"] { --tab-color: var(--vscode-errorForeground); }
+  .tab[data-state="idle"] { --tab-color: var(--vscode-descriptionForeground); }
+  @keyframes tabPulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(0.65); } }
+
+  /* Right-click context menu for tabs. Floats over everything, dismissed on
+     outside click / Escape. Layout mimics VS Code's native menu popups. */
+  .tab-menu { position: fixed; z-index: 1000; min-width: 168px; background: var(--vscode-menu-background, var(--vscode-editorWidget-background)); color: var(--vscode-menu-foreground, var(--vscode-foreground)); border: 1px solid var(--vscode-menu-border, var(--vscode-editorWidget-border)); border-radius: 6px; padding: 4px 0; box-shadow: 0 6px 20px rgba(0,0,0,0.45); font-size: 0.84em; user-select: none; }
+  .tab-menu .item { padding: 5px 14px; cursor: pointer; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .tab-menu .item:hover { background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground)); color: var(--vscode-menu-selectionForeground, var(--vscode-foreground)); }
+  .tab-menu .item.danger:hover { background: color-mix(in srgb, var(--vscode-errorForeground) 22%, transparent); color: var(--vscode-errorForeground); }
+  .tab-menu .item.disabled { opacity: 0.4; cursor: default; pointer-events: none; }
+  .tab-menu .sep { height: 1px; background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border)); margin: 4px 0; opacity: 0.7; }
 
   /* ============ Model picker pill (above composer) ============ */
   .model-bar { display: flex; align-items: center; gap: 6px; padding: 0 4px 6px; }
@@ -970,6 +1457,16 @@ setTimeout(() => {
   /* Assistant: clean prose, no bubble. Rendered as Markdown. */
   .msg.assistant { padding: 2px 4px 2px 26px; line-height: 1.6; word-wrap: break-word; position: relative; }
   .msg.assistant::before { content: '⏺'; color: var(--vscode-charts-green); position: absolute; left: 6px; top: 2px; opacity: 0.85; }
+  /* Bottom action bar — only revealed on hover. Modeled after ChatGPT/Claude. */
+  .msg.assistant .msg-actions { display: flex; align-items: center; gap: 2px; margin-top: 6px; opacity: 0; transform: translateY(-2px); transition: opacity 0.18s ease, transform 0.18s ease; pointer-events: none; }
+  .msg.assistant:hover .msg-actions,
+  .msg.assistant:focus-within .msg-actions { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  .msg.assistant .msg-actions .act { display: inline-flex; align-items: center; gap: 5px; background: transparent; border: 1px solid transparent; color: var(--vscode-descriptionForeground); cursor: pointer; padding: 3px 8px; border-radius: 6px; font-size: 0.78em; font-family: inherit; line-height: 1; transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease; }
+  .msg.assistant .msg-actions .act:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+  .msg.assistant .msg-actions .act:active { transform: scale(0.97); }
+  .msg.assistant .msg-actions .act.copied { color: var(--vscode-charts-green, #2ea043); border-color: color-mix(in srgb, var(--vscode-charts-green, #2ea043) 30%, transparent); background: color-mix(in srgb, var(--vscode-charts-green, #2ea043) 10%, transparent); }
+  .msg.assistant .msg-actions .act svg { width: 12px; height: 12px; flex-shrink: 0; }
+  .msg.assistant .msg-actions .sep { width: 1px; height: 11px; background: var(--vscode-panel-border); opacity: 0.6; margin: 0 2px; }
   /* Markdown content */
   .md > *:first-child { margin-top: 0; }
   .md > *:last-child { margin-bottom: 0; }
@@ -1136,6 +1633,22 @@ setTimeout(() => {
   #history .item .time { font-size: 0.78em; opacity: 0.6; margin-left: 6px; }
   #history .item .del { background: transparent; border: none; color: var(--vscode-foreground); padding: 2px 6px; border-radius: 4px; opacity: 0.5; cursor: pointer; }
   #history .item .del:hover { background: var(--vscode-toolbar-hoverBackground); opacity: 1; color: var(--vscode-errorForeground); }
+  /* Status badge for each session in the history list. Color-coded dot +
+     short label; layout mirrors the bottom status pill so it feels native. */
+  #history .item .status { display: inline-flex; align-items: center; gap: 4px; font-size: 0.72em; padding: 1px 6px; border-radius: 999px; border: 1px solid transparent; flex-shrink: 0; opacity: 0.85; user-select: none; }
+  #history .item .status .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+  #history .item .status[data-state="running"] { color: var(--vscode-charts-blue); border-color: color-mix(in srgb, var(--vscode-charts-blue) 35%, transparent); background: color-mix(in srgb, var(--vscode-charts-blue) 12%, transparent); }
+  #history .item .status[data-state="running"] .dot { animation: histPulse 1.1s ease-in-out infinite; }
+  #history .item .status[data-state="completed"] { color: var(--vscode-charts-green); border-color: color-mix(in srgb, var(--vscode-charts-green) 30%, transparent); background: color-mix(in srgb, var(--vscode-charts-green) 10%, transparent); }
+  #history .item .status[data-state="stopped"] { color: var(--vscode-charts-orange, #d18616); border-color: color-mix(in srgb, var(--vscode-charts-orange, #d18616) 30%, transparent); background: color-mix(in srgb, var(--vscode-charts-orange, #d18616) 10%, transparent); }
+  #history .item .status[data-state="error"] { color: var(--vscode-errorForeground); border-color: color-mix(in srgb, var(--vscode-errorForeground) 35%, transparent); background: color-mix(in srgb, var(--vscode-errorForeground) 12%, transparent); }
+  #history .item .status[data-state="idle"] { color: var(--vscode-descriptionForeground); opacity: 0.55; }
+  @keyframes histPulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(0.7); } }
+  /* Stop button only visible for running sessions. */
+  #history .item .stop { background: transparent; border: 1px solid transparent; color: var(--vscode-descriptionForeground); padding: 2px 6px; border-radius: 4px; cursor: pointer; opacity: 0; transition: opacity 0.15s, background 0.15s, color 0.15s; display: inline-flex; align-items: center; }
+  #history .item .stop:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-charts-red); border-color: var(--vscode-panel-border); opacity: 1; }
+  #history .item:hover .stop { opacity: 0.65; }
+  #history .item .stop svg { width: 10px; height: 10px; }
 
   /* ============ Lessons overlay (top-bar) ============ */
   #lessons { display: none; position: absolute; top: 44px; left: 12px; right: 12px; max-height: 70vh; overflow-y: auto; background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-editorWidget-border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); z-index: 11; }
@@ -1200,8 +1713,7 @@ setTimeout(() => {
 <body>
   ${diagBannerHtml}
   <div class="topbar">
-    <span class="brand"><span class="dot"></span>BurstCode</span>
-    <span class="spacer"></span>
+    <div id="tabs" role="tablist" aria-label="Chat sessions"></div>
     <button id="newBtn" class="icon-btn" title="New chat" aria-label="New chat">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>
     </button>
@@ -1371,6 +1883,7 @@ bgStatusEl.addEventListener('click', () => {
 });
 const historyBtn = document.getElementById('historyBtn');
 const historyEl = document.getElementById('history');
+const tabsEl = document.getElementById('tabs');
 const lessonsBtn = document.getElementById('lessonsBtn');
 const lessonsEl = document.getElementById('lessons');
 const planEl = document.getElementById('plan');
@@ -1392,7 +1905,7 @@ let activeReasoningEl = null;
 let toolElements = new Map();
 let runningTools = new Map(); // id -> { name, startedAt }
 let busy = false;
-let sessionsCache = { sessions: [], activeId: null };
+let sessionsCache = { sessions: [], activeId: null, openIds: [] };
 let lessonsCache = [];
 let lessonsAdding = false;
 let runStartedAt = 0;
@@ -1628,6 +2141,162 @@ function renderPendingFileList(fileList) {
   });
 }
 
+// Floating right-click menu for tabs. Only one is alive at a time; the
+// closure tracks the current node and we wire global listeners ONCE.
+let tabMenuEl = null;
+function closeTabMenu() {
+  if (tabMenuEl && tabMenuEl.parentNode) tabMenuEl.parentNode.removeChild(tabMenuEl);
+  tabMenuEl = null;
+}
+// Outside-click dismiss. Capture phase so it runs before any other handler
+// that might prevent default / stop propagation.
+document.addEventListener('mousedown', (ev) => {
+  if (!tabMenuEl) return;
+  if (!tabMenuEl.contains(ev.target)) closeTabMenu();
+}, true);
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && tabMenuEl) closeTabMenu();
+}, true);
+// Also close on scroll / resize \u2014 the anchor would otherwise drift.
+window.addEventListener('scroll', closeTabMenu, true);
+window.addEventListener('resize', closeTabMenu);
+
+function showTabMenu(ev, s) {
+  closeTabMenu();
+  const openCount = (sessionsCache.openIds || []).length;
+  // Build the item list dynamically so we can inject status-specific actions
+  // (e.g. "Stop run") only when they make sense.
+  const items = [];
+  if (s.status === 'running') {
+    items.push({ label: 'Stop run', action: () => vscode.postMessage({ type: 'cancel-session', payload: { id: s.id } }) });
+    items.push({ kind: 'sep' });
+  }
+  items.push({ label: 'Close', action: () => vscode.postMessage({ type: 'close-tab', payload: { id: s.id } }) });
+  items.push({
+    label: 'Close Others',
+    disabled: openCount <= 1,
+    action: () => vscode.postMessage({ type: 'close-other-tabs', payload: { id: s.id } })
+  });
+  items.push({ label: 'Close All', danger: true, action: () => vscode.postMessage({ type: 'close-all-tabs' }) });
+  items.push({ kind: 'sep' });
+  items.push({
+    label: 'Delete from history',
+    danger: true,
+    disabled: s.status === 'running',
+    // Backend pops a VS Code modal to confirm — webview confirm() is a
+    // no-op in vscode webviews so we cannot guard the action here.
+    action: () => vscode.postMessage({ type: 'delete-session', payload: { id: s.id } })
+  });
+
+  const menu = document.createElement('div');
+  menu.className = 'tab-menu';
+  menu.setAttribute('role', 'menu');
+  for (const it of items) {
+    if (it.kind === 'sep') {
+      const sep = document.createElement('div');
+      sep.className = 'sep';
+      menu.appendChild(sep);
+      continue;
+    }
+    const el = document.createElement('div');
+    el.className = 'item' + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : '');
+    el.setAttribute('role', 'menuitem');
+    el.textContent = it.label;
+    el.onclick = () => {
+      if (it.disabled) return;
+      closeTabMenu();
+      try { it.action(); } catch (_) { /* swallow \u2014 menu must not leak */ }
+    };
+    menu.appendChild(el);
+  }
+  document.body.appendChild(menu);
+  tabMenuEl = menu;
+  // Position at the cursor, then nudge inside the viewport on next frame.
+  menu.style.left = ev.clientX + 'px';
+  menu.style.top = ev.clientY + 'px';
+  requestAnimationFrame(() => {
+    if (!tabMenuEl) return;
+    const r = tabMenuEl.getBoundingClientRect();
+    if (r.right > window.innerWidth - 4) tabMenuEl.style.left = (window.innerWidth - r.width - 6) + 'px';
+    if (r.bottom > window.innerHeight - 4) tabMenuEl.style.top = (window.innerHeight - r.height - 6) + 'px';
+  });
+}
+
+// Render the horizontal session-tab strip below the topbar. Each tab shows
+// the session's title, a status-colored dot, and a close (\u00d7) button. The
+// active session is highlighted with a stronger gradient + flush bottom edge
+// so it reads as the foreground tab. Tabs are kept in sync with the history
+// list (so they share the same data shape and ordering).
+function renderTabs() {
+  if (!tabsEl) return;
+  tabsEl.innerHTML = '';
+  const list = sessionsCache.sessions || [];
+  // Browser-style working set: the tab strip ONLY shows sessions the user
+  // has explicitly opened (via clicking a history item, creating a new chat,
+  // or sending a prompt). The full archive lives in the history overlay.
+  const openIds = new Set(sessionsCache.openIds || []);
+  const visible = list.filter((s) => openIds.has(s.id));
+  // Stable ordering by creation time so opening/closing a tab doesn't
+  // shuffle the others around.
+  visible.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  visible.forEach((s) => {
+    const tab = document.createElement('div');
+    tab.className = 'tab';
+    tab.setAttribute('role', 'tab');
+    tab.dataset.state = String(s.status || 'idle');
+    const isActive = s.id === sessionsCache.activeId;
+    tab.dataset.active = String(isActive);
+    tab.setAttribute('aria-selected', String(isActive));
+    tab.title = s.title + (s.status && s.status !== 'idle' ? ' \u00b7 ' + s.status : '');
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    const title = document.createElement('span');
+    title.className = 'title';
+    title.textContent = s.title;
+    const close = document.createElement('button');
+    close.className = 'close';
+    close.type = 'button';
+    close.title = 'Close tab (chat stays in history)';
+    close.innerHTML = '\u00d7';
+    // Close \u2192 just remove from the working set. Does NOT delete the
+    // session and does NOT cancel an in-flight run; users can re-open from
+    // history, and stopping a run is done via the chat panel's Stop button.
+    close.onclick = (ev) => {
+      ev.stopPropagation();
+      vscode.postMessage({ type: 'close-tab', payload: { id: s.id } });
+    };
+    // Middle-click also closes the tab (browser convention).
+    tab.addEventListener('mousedown', (ev) => {
+      if (ev.button === 1) {
+        ev.preventDefault();
+        vscode.postMessage({ type: 'close-tab', payload: { id: s.id } });
+      }
+    });
+    // Right-click \u2192 floating context menu (Close / Close Others / Close All / \u2026).
+    tab.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      showTabMenu(ev, s);
+    });
+    tab.appendChild(dot);
+    tab.appendChild(title);
+    tab.appendChild(close);
+    tab.onclick = () => {
+      if (isActive) return;
+      vscode.postMessage({ type: 'load-session', payload: { id: s.id } });
+    };
+    tabsEl.appendChild(tab);
+  });
+  // (No trailing "+" inside the strip \u2014 the New chat icon lives in the
+  // topbar's action-icon cluster, just to the left of the history button.)
+  // Auto-scroll the active tab into view so switching via history doesn't
+  // leave it clipped offscreen.
+  const activeEl = tabsEl.querySelector('.tab[data-active="true"]');
+  if (activeEl && typeof activeEl.scrollIntoView === 'function') {
+    activeEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
+}
+
 function renderHistory() {
   historyEl.innerHTML = '';
   const list = sessionsCache.sessions || [];
@@ -1638,27 +2307,62 @@ function renderHistory() {
     historyEl.appendChild(e);
     return;
   }
+  const STATUS_LABELS = {
+    running: 'Running',
+    completed: 'Done',
+    stopped: 'Stopped',
+    error: 'Error',
+    idle: ''
+  };
   list.forEach((s) => {
     const item = document.createElement('div');
     item.className = 'item' + (s.id === sessionsCache.activeId ? ' active' : '');
     const title = document.createElement('div');
     title.className = 'title';
     title.textContent = s.title;
+    // Status badge \u2014 only rendered for non-trivial states. Idle sessions
+    // keep the list visually quiet.
+    const state = String(s.status || 'idle');
+    if (state !== 'idle') {
+      const badge = document.createElement('span');
+      badge.className = 'status';
+      badge.dataset.state = state;
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      const lbl = document.createElement('span');
+      lbl.textContent = STATUS_LABELS[state] || state;
+      badge.appendChild(dot);
+      badge.appendChild(lbl);
+      item.appendChild(badge);
+    }
     const time = document.createElement('span');
     time.className = 'time';
     time.textContent = formatTime(s.updatedAt);
+    // Per-row stop button \u2014 only meaningful while running. Stays in the
+    // DOM but hidden otherwise so layout doesn't jump on state transitions.
+    const stop = document.createElement('button');
+    stop.className = 'stop';
+    stop.title = 'Stop this run';
+    stop.innerHTML = '<svg viewBox="0 0 10 10" fill="currentColor" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7" rx="1"/></svg>';
+    stop.style.display = state === 'running' ? '' : 'none';
+    stop.onclick = (ev) => {
+      ev.stopPropagation();
+      vscode.postMessage({ type: 'cancel-session', payload: { id: s.id } });
+    };
     const del = document.createElement('button');
     del.className = 'del';
-    del.textContent = '✕';
+    del.textContent = '\u2715';
     del.title = 'Delete this chat';
+    // Backend pops a VS Code modal to confirm; webview confirm() is a no-op
+    // inside vscode webviews so we just fire the intent and let the host
+    // gate it with a native dialog.
     del.onclick = (ev) => {
       ev.stopPropagation();
-      if (confirm('Delete this chat?')) {
-        vscode.postMessage({ type: 'delete-session', payload: { id: s.id } });
-      }
+      vscode.postMessage({ type: 'delete-session', payload: { id: s.id } });
     };
     item.appendChild(title);
     item.appendChild(time);
+    item.appendChild(stop);
     item.appendChild(del);
     item.onclick = () => {
       vscode.postMessage({ type: 'load-session', payload: { id: s.id } });
@@ -1697,9 +2401,8 @@ function renderLessons() {
   if (lessonsCache.length === 0) clearBtn.style.opacity = '0.35';
   clearBtn.onclick = () => {
     if (lessonsCache.length === 0) return;
-    if (confirm('Delete all ' + lessonsCache.length + ' lessons? This cannot be undone.')) {
-      vscode.postMessage({ type: 'clear-lessons' });
-    }
+    // Backend confirms via VS Code modal (webview confirm() is a no-op).
+    vscode.postMessage({ type: 'clear-lessons' });
   };
   head.appendChild(title);
   head.appendChild(count);
@@ -1823,9 +2526,8 @@ function buildLessonRow(l) {
   delBtn.className = 'del';
   delBtn.textContent = 'Delete';
   delBtn.onclick = () => {
-    if (confirm('Delete this lesson?\\n\\n' + l.content)) {
-      vscode.postMessage({ type: 'delete-lesson', payload: { id: l.id } });
-    }
+    // Backend confirms via VS Code modal (webview confirm() is a no-op).
+    vscode.postMessage({ type: 'delete-lesson', payload: { id: l.id } });
   };
   actions.appendChild(editBtn);
   actions.appendChild(delBtn);
@@ -1967,6 +2669,84 @@ function renderTranscript(entries) {
       log.appendChild(det);
     }
   });
+  forceScrollToBottom();
+}
+
+// Re-hydrate the in-flight UI state from a backend snapshot. Called when the
+// user switches BACK to a session whose agent run is still active. The
+// transcript is already rendered by load-session at this point.
+function replayLiveState(snap) {
+  clearEmptyState();
+  // Iter / auto-continue / auto-resume pills (in order).
+  const pills = Array.isArray(snap.pills) ? snap.pills : [];
+  for (const p of pills) {
+    if (p.kind === 'iteration') {
+      const pill = document.createElement('div');
+      pill.className = 'iter-pill';
+      const iter = (p.payload && p.payload.iter !== undefined) ? p.payload.iter : 0;
+      pill.innerHTML = '<span class="pill">iter ' + (iter + 1) + '</span>';
+      log.appendChild(pill);
+    } else if (p.kind === 'auto-continue') {
+      const pill = document.createElement('div');
+      pill.className = 'iter-pill';
+      const count = (p.payload && p.payload.count) || 1;
+      const max = (p.payload && p.payload.max) || 1;
+      pill.innerHTML = '<span class="pill">\u21bb auto-continue ' + count + '/' + max + '</span>';
+      log.appendChild(pill);
+    } else if (p.kind === 'auto-resume') {
+      const pill = document.createElement('div');
+      pill.className = 'iter-pill';
+      const attempt = (p.payload && p.payload.attempt) || 1;
+      const max = (p.payload && p.payload.max) || 1;
+      pill.innerHTML = '<span class="pill">\u21bb auto-resume ' + attempt + '/' + max + '</span>';
+      log.appendChild(pill);
+    }
+  }
+  // In-flight reasoning bubble.
+  if (snap.reasoningText) {
+    activeReasoningEl = addReasoningMsg(snap.reasoningText, { open: true, streaming: true });
+  }
+  // In-flight assistant bubble.
+  if (snap.assistantText) {
+    activeAssistantEl = addAssistantMsg(snap.assistantText);
+  }
+  // Running tools \u2014 rebuild each as an open details element.
+  const tools = Array.isArray(snap.runningTools) ? snap.runningTools : [];
+  for (const t of tools) {
+    const det = document.createElement('details');
+    det.className = 'tool';
+    det.dataset.running = 'true';
+    det.open = false;
+    const sum = document.createElement('summary');
+    let argSnippet = '';
+    try { argSnippet = JSON.stringify(t.args).slice(0, 200); } catch (_) { argSnippet = ''; }
+    sum.textContent = '\u{1F527} ' + t.name + '(' + argSnippet + ') \u00b7 running...';
+    det.appendChild(sum);
+    if (Array.isArray(t.progress) && t.progress.length) {
+      const progPre = document.createElement('pre');
+      progPre.className = 'tool-progress-log';
+      progPre.textContent = t.progress.join('\\n');
+      if (progPre.textContent.length > 8000) {
+        progPre.textContent = '...' + progPre.textContent.slice(-7500);
+      }
+      det.appendChild(progPre);
+      det.open = true;
+    }
+    log.appendChild(det);
+    toolElements.set(t.id, det);
+    runningTools.set(t.id, { name: t.name, startedAt: t.startedAt || Date.now() });
+  }
+  currentIter = Number(snap.iter || 0);
+  // Pending ask-user prompt (if any).
+  if (snap.pendingAsk && snap.pendingAsk.id) {
+    window.postMessage({ type: 'ask-user', payload: snap.pendingAsk }, '*');
+  }
+  setBusy(true);
+  if (snap.lastStatus) {
+    setStatus(snap.lastStatus.state || 'busy', snap.lastStatus.label || 'Running...');
+  } else {
+    setStatus('busy', currentIter ? 'Resuming iter ' + currentIter + '...' : 'Resuming...');
+  }
   forceScrollToBottom();
 }
 
@@ -2198,6 +2978,71 @@ function addUserMsg(text, messageIndex, checkpointRef) {
   return el;
 }
 
+// SVG icons used by the assistant action bar. Hand-tuned strokes to match
+// VS Code's codicon weight at 12px without pulling in another icon font.
+const ICON_COPY_TEXT =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<rect x="5" y="5" width="9" height="9" rx="1.5"/>'
+  + '<path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/>'
+  + '</svg>';
+const ICON_COPY_MD =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<rect x="1.5" y="3.5" width="13" height="9" rx="1.5"/>'
+  + '<path d="M4 10V6l2 2 2-2v4M10 6v4M10 10l1.5 1.5L13 10"/>'
+  + '</svg>';
+const ICON_CHECK =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<path d="M3 8.5L6.5 12 13 4.5"/>'
+  + '</svg>';
+
+function flashCopied(btn, originalIconHtml, originalLabel) {
+  btn.classList.add('copied');
+  btn.innerHTML = ICON_CHECK + '<span>Copied</span>';
+  if (btn._copyResetTimer) clearTimeout(btn._copyResetTimer);
+  btn._copyResetTimer = setTimeout(() => {
+    btn.classList.remove('copied');
+    btn.innerHTML = originalIconHtml + '<span>' + originalLabel + '</span>';
+    btn._copyResetTimer = null;
+  }, 1400);
+}
+
+function buildAssistantActions(messageEl) {
+  const bar = document.createElement('div');
+  bar.className = 'msg-actions';
+
+  const mkBtn = (label, iconHtml, title, getText) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'act';
+    b.title = title;
+    b.setAttribute('aria-label', title);
+    b.innerHTML = iconHtml + '<span>' + label + '</span>';
+    b.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      const txt = getText() || '';
+      if (!txt) return;
+      const done = () => flashCopied(b, iconHtml, label);
+      try {
+        const p = navigator.clipboard && navigator.clipboard.writeText(txt);
+        if (p && typeof p.then === 'function') p.then(done, done); else done();
+      } catch (_) { done(); }
+    });
+    return b;
+  };
+
+  const textBtn = mkBtn('Copy text', ICON_COPY_TEXT, 'Copy rendered text',
+    () => { const m = messageEl.querySelector('.md'); return m ? m.innerText : ''; });
+  const mdBtn = mkBtn('Copy Markdown', ICON_COPY_MD, 'Copy Markdown source',
+    () => messageEl.dataset.raw || '');
+
+  bar.appendChild(textBtn);
+  const sep = document.createElement('span');
+  sep.className = 'sep';
+  bar.appendChild(sep);
+  bar.appendChild(mdBtn);
+  return bar;
+}
+
 function addAssistantMsg(text) {
   clearEmptyState();
   const el = document.createElement('div');
@@ -2208,6 +3053,7 @@ function addAssistantMsg(text) {
   el.dataset.raw = text || '';
   md.innerHTML = renderMarkdown(text || '');
   bindCodeCopy(md);
+  el.appendChild(buildAssistantActions(el));
   log.appendChild(el);
   scrollToBottom();
   return el;
@@ -2265,21 +3111,53 @@ window.addEventListener('message', (e) => {
       runningTools.clear();
       currentIter = 0;
       renderPlan([]);
+      // Reset the send button back to send mode. Other sessions may still be
+      // running in the background, but THIS view (the fresh / new-chat view)
+      // has no in-flight run, so the composer must accept input again.
+      // Without this, clicking "+" while session A is running leaves the
+      // button stuck in Stop mode and blocks new prompts.
+      setBusy(false);
       setStatus('idle', 'Idle');
       showEmptyState();
       break;
-    case 'load-session':
+    case 'load-session': {
       renderTranscript(msg.payload.transcript || []);
       renderPlan(msg.payload.plan || []);
       runningTools.clear();
       currentIter = 0;
-      setStatus('idle', 'Idle');
+      const loadedStatus = String((msg.payload && msg.payload.status) || 'idle');
+      if (loadedStatus === 'running') {
+        // Don't go idle \u2014 a live-state-replay event will follow with the
+        // accurate snapshot. Show a neutral placeholder until then.
+        setBusy(true);
+        setStatus('busy', 'Resuming...');
+      } else {
+        setBusy(false);
+        const map = { completed: ['done', 'Done'], stopped: ['error', 'Stopped'], error: ['error', 'Error'], idle: ['idle', 'Idle'] };
+        const [st, lb] = map[loadedStatus] || ['idle', 'Idle'];
+        setStatus(st, lb);
+      }
       break;
+    }
+    case 'live-state-replay': {
+      // Switched back into a session that is still running. The transcript
+      // (already replayed by load-session) reflects everything FINALIZED so
+      // far; this snapshot fills in the in-flight bits: iter pills, partial
+      // assistant/reasoning bubbles, and any tool calls still mid-flight.
+      replayLiveState(msg.payload || {});
+      break;
+    }
     case 'plan-update':
       renderPlan(msg.payload.steps || []);
       break;
     case 'sessions':
-      sessionsCache = msg.payload || { sessions: [], activeId: null };
+      sessionsCache = msg.payload || { sessions: [], activeId: null, openIds: [] };
+      // Defensive: older backends may not send openIds; fall back to empty.
+      if (!Array.isArray(sessionsCache.openIds)) sessionsCache.openIds = [];
+      // Tabs strip is always visible (when non-empty) so it must re-render
+      // on every broadcast \u2014 status badges, active highlight, ordering all
+      // depend on the latest payload.
+      renderTabs();
       if (historyEl.classList.contains('open')) renderHistory();
       break;
     case 'lessons': {
@@ -2561,7 +3439,7 @@ window.addEventListener('message', (e) => {
         reply.appendChild(gutter);
         reply.appendChild(body);
         wrap.appendChild(reply);
-        vscode.postMessage({ type: 'ask-user-response', payload: { id: askId, answer: answer } });
+        vscode.postMessage({ type: 'ask-user-response', payload: { id: askId, answer: answer, sessionId: sessionsCache.activeId || null } });
       };
 
       if (inputType === 'single') {

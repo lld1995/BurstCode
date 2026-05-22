@@ -245,6 +245,55 @@ export const grepSearchTool: Tool = {
   }
 };
 
+/**
+ * Direct-write tool: writes content to disk immediately without queueing for
+ * user review. Use for agent-generated scripts, temp files, and any file that
+ * the agent will immediately read back or execute itself. For edits to
+ * existing source files that belong to the user, prefer propose_edit so the
+ * user can review and accept the diff.
+ */
+export function buildWriteFileTool(): Tool {
+  return {
+    name: 'write_file',
+    parallelSafe: true,
+    schema: {
+      type: 'function',
+      function: {
+        name: 'write_file',
+        description:
+          'Write (or overwrite) a file on disk immediately — no user review step, no diff UI. Use for agent-generated helper scripts, temp/scratch files, config stubs, and any file the agent needs to create and then immediately execute or read back. NOT for modifying the user\'s existing source files — use propose_edit for those so the user can review the diff. Parent directories are created automatically. Path may be workspace-relative or absolute.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Workspace-relative or absolute file path.' },
+            content: { type: 'string', description: 'Full file contents to write.' }
+          },
+          required: ['path', 'content']
+        }
+      }
+    },
+    async execute(args: Record<string, unknown>): Promise<ToolResult> {
+      const target = String(args.path ?? '').trim();
+      if (!target) return { content: 'write_file: path is required', isError: true };
+      const content = String(args.content ?? '');
+      const uri = resolveUri(target);
+      const fsModule = await import('fs/promises');
+      const nodePath = await import('path');
+      try {
+        await fsModule.mkdir(nodePath.dirname(uri.fsPath), { recursive: true });
+        await fsModule.writeFile(uri.fsPath, content, 'utf8');
+        const relPath = vscode.workspace.asRelativePath(uri);
+        return {
+          content: `Written ${content.split(/\r?\n/).length} line(s) to ${relPath}`,
+          meta: { uri: uri.toString(), bytes: Buffer.byteLength(content, 'utf8') }
+        };
+      } catch (err) {
+        return { content: `write_file failed: ${String((err as Error).message ?? err)}`, isError: true };
+      }
+    }
+  };
+}
+
 async function findRipgrep(): Promise<string> {
   // VS Code ships ripgrep at <appRoot>/node_modules.asar.unpacked/@vscode/ripgrep/bin/rg(.exe)
   const appRoot = vscode.env.appRoot;
