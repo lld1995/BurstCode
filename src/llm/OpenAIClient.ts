@@ -122,16 +122,25 @@ export function readLLMConfig(): LLMConfig {
 }
 
 /**
- * Resolve the background profile to a fully-specified LLMConfig. Empty
- * string/zero fields fall back to the chat profile so users can override
- * only the model (or only the baseURL) without re-typing everything.
+ * Resolve the background profile to a fully-specified LLMConfig.
+ *
+ * Returns `null` when the background profile has `inherit: false` but no
+ * `baseURL` has been set — in that case the caller must NOT fall back to the
+ * chat endpoint and should skip the background cycle entirely.
+ *
+ * When `inherit: true` (the default) the chat profile is used as-is.
+ * When `inherit: false` and a `baseURL` is present, empty secondary fields
+ * (apiKey, model, …) still fall back to the chat profile so the user only
+ * has to fill in the parts that differ.
  */
-export function resolveBackgroundLLMConfig(): LLMConfig {
+export function resolveBackgroundLLMConfig(): LLMConfig | null {
   const bg = readBackgroundProfile();
   if (bg.inherit) return readLLMConfig();
+  // Explicit non-inherit mode: refuse to run if no endpoint has been configured.
+  if (!bg.baseURL) return null;
   const chat = readLLMConfig();
   return {
-    baseURL: bg.baseURL || chat.baseURL,
+    baseURL: bg.baseURL,
     apiKey: bg.apiKey || chat.apiKey,
     model: bg.model || bg.models[0] || chat.model,
     temperature: typeof bg.temperature === 'number' ? bg.temperature : chat.temperature,

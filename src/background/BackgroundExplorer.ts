@@ -86,7 +86,7 @@ function readConfig(): BackgroundConfig {
   };
 }
 
-function resolveLLMConfig(): LLMConfig {
+function resolveLLMConfig(): LLMConfig | null {
   return resolveBackgroundLLMConfig();
 }
 
@@ -265,6 +265,7 @@ export class BackgroundExplorer implements vscode.Disposable {
           this.cfg = readConfig();
           if (this.cfg.enabled && !wasEnabled) this.start();
           else if (!this.cfg.enabled && wasEnabled) this.stop();
+          else if (this.cfg.enabled && !this.pollHandle) this.start();
           else this.publishStatus();
         }
       })
@@ -311,6 +312,12 @@ export class BackgroundExplorer implements vscode.Disposable {
     }
     if (!vscode.workspace.workspaceFolders?.length) {
       vscode.window.showWarningMessage('BurstCode: open a workspace folder first.');
+      return;
+    }
+    if (!resolveLLMConfig()) {
+      vscode.window.showWarningMessage(
+        'BurstCode: background endpoint not configured. Set burstcode.llm.background.baseURL or enable inherit.'
+      );
       return;
     }
     this.cfg = readConfig();
@@ -458,6 +465,17 @@ export class BackgroundExplorer implements vscode.Disposable {
       }
       const state = await this.loadState(root);
       const llm = resolveLLMConfig();
+      if (!llm) {
+        if (this.pollHandle) {
+          clearInterval(this.pollHandle);
+          this.pollHandle = undefined;
+        }
+        this.setPhase(
+          'disabled',
+          'Background endpoint not configured. Set burstcode.llm.background.baseURL or enable inherit.'
+        );
+        return;
+      }
       this.status.modelLabel = `${displayEndpoint(llm.baseURL)} · ${llm.model}`;
       // Sync persisted counters into the live status so the status bar tooltip
       // and chat panel show the lifetime totals, not just this-cycle deltas.
