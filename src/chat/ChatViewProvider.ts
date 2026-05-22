@@ -10,6 +10,8 @@ import {
   addChatModel,
   removeChatModel,
   fetchProfileModels,
+  getCachedFetchedModels,
+  writeCachedFetchedModels,
   ChatMessage
 } from '../llm/OpenAIClient';
 import { LspBridge } from '../lsp/LspBridge';
@@ -391,6 +393,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!this.view) return;
     const chat = readChatProfile();
     const activeModel = chat.model || chat.models[0] || '';
+    const cached = getCachedFetchedModels(this.context.globalState, chat.baseURL);
     this.post({
       type: 'models',
       payload: {
@@ -399,7 +402,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           baseURL: chat.baseURL,
           model: activeModel,
           models: chat.models.slice()
-        }
+        },
+        fetched: cached
       }
     });
   }
@@ -677,7 +681,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             apiKey: chat.apiKey,
             allowSelfSignedCerts: chat.allowSelfSignedCerts
           });
-          this.post({ type: 'models-fetched', payload: { models } });
+          // Persist so the picker shows these immediately on next reopen
+          // without re-hitting the network.
+          await writeCachedFetchedModels(this.context.globalState, chat.baseURL, models);
+          this.post({
+            type: 'models-fetched',
+            payload: { models, fetchedAt: Date.now() }
+          });
         } catch (err) {
           this.post({
             type: 'models-fetched',
@@ -2766,10 +2776,17 @@ function renderMarkdown(src) {
   const codeBlocks = [];
   let text = String(src);
   // Fenced code blocks. Allow unterminated trailing block (during streaming).
-  text = text.replace(/\`\`\`([a-zA-Z0-9_+\-.#]*)\\n([\\s\\S]*?)(?:\`\`\`|$)/g, (m, lang, code) => {
+  // Per CommonMark, a fence may be indented up to 3 spaces; that prefix is
+  // then stripped from every content line so XML / YAML / etc. nested inside
+  // a list item don't render with phantom leading whitespace before each line.
+  text = text.replace(/(^|\\n)([ \\t]{0,3})\`\`\`([a-zA-Z0-9_+\-.#]*)\\n([\\s\\S]*?)(?:\\n[ \\t]{0,3}\`\`\`|$)/g, (m, lead, indent, lang, code) => {
+    if (indent && indent.length > 0) {
+      const dedent = new RegExp('^[ \\\\t]{0,' + indent.length + '}', 'gm');
+      code = code.replace(dedent, '');
+    }
     const idx = codeBlocks.length;
     codeBlocks.push({ lang: (lang || '').trim(), code });
-    return '\\u0000CODEBLOCK' + idx + '\\u0000';
+    return lead + '\\u0000CODEBLOCK' + idx + '\\u0000';
   });
   // Inline code
   const inlineCodes = [];
@@ -3611,19 +3628,38 @@ window.addEventListener('message', (e) => {
       break;
     }
     case 'models': {
-      const payload = msg.payload || { chat: { baseURL: '', model: '', models: [] }, active: { model: '' } };
-      modelsState.chat = payload.chat || { baseURL: '', model: '', models: [] };
+      const payload = msg.payload || { chat: { baseURL: '', model: '', models: [] }, active: { model: '' }, fetched: null };
+      const newChat = payload.chat || { baseURL: '', model: '', models: [] };
+      const oldBaseURL = modelsState.chat.baseURL;
+      modelsState.chat = newChat;
       modelsState.active = payload.active || { model: modelsState.chat.model || '' };
+      const cached = payload.fetched && Array.isArray(payload.fetched.models) ? payload.fetched : null;
+      if (oldBaseURL !== newChat.baseURL) {
+        // baseURL changed — discard any in-flight state and seed from the
+        // cache shipped by the host (or wipe if there is none).
+        modelsState.fetched = {
+          loading: false,
+          models: cached ? cached.models.slice() : null,
+          error: null,
+          fetchedAt: cached ? cached.fetchedAt : 0
+        };
+      } else if (cached && !modelsState.fetched.loading) {
+        // Same baseURL, no refresh in flight: refresh from the cache so
+        // newly-persisted entries show up without losing user state.
+        modelsState.fetched.models = cached.models.slice();
+        modelsState.fetched.fetchedAt = cached.fetchedAt;
+      }
       renderModelPickerLabel();
       if (modelPicker.classList.contains('open')) renderModelPicker();
       break;
     }
     case 'models-fetched': {
-      const { models, error } = msg.payload || {};
+      const { models, error, fetchedAt } = msg.payload || {};
       modelsState.fetched = {
         loading: false,
         models: Array.isArray(models) ? models : (modelsState.fetched && modelsState.fetched.models) || null,
-        error: error || null
+        error: error || null,
+        fetchedAt: typeof fetchedAt === 'number' ? fetchedAt : (modelsState.fetched && modelsState.fetched.fetchedAt) || 0
       };
       if (modelPicker.classList.contains('open')) renderModelPicker();
       break;
@@ -3720,7 +3756,7 @@ input.addEventListener('keydown', (e) => {
 const modelsState = {
   chat: { baseURL: '', model: '', models: [] },
   active: { model: '' },
-  fetched: { loading: false, models: null, error: null }
+  fetched: { loading: false, models: null, error: null, fetchedAt: 0 }
 };
 
 function setModelPickerOpen(open) {

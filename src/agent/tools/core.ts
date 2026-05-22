@@ -68,8 +68,43 @@ export function buildReadFileTool(applier?: HunkApplier): Tool {
       for (let i = start - 1; i < end; i++) {
         lines.push(`${(i + 1).toString().padStart(5)}\t${rawLines[i] ?? ''}`);
       }
+
+      // When the file has pending edits, append an explicit map of each
+      // hunk's range in modified-content coords. Without this, the model has
+      // to guess where each pending hunk starts/ends in the post-edit view
+      // — and a wrong guess silently corrupts subsequent propose_edits.
+      let hunkMap = '';
+      if (pendingContent !== undefined && applier) {
+        const ranges = applier.getHunkRangesInModifiedCoords(uri);
+        const visible = ranges.filter((r) => {
+          // Show every hunk that intersects the visible window OR is non-empty.
+          if (r.modStart > r.modEnd) return r.modStart >= start && r.modStart <= end;
+          return r.modEnd >= start && r.modStart <= end;
+        });
+        if (visible.length > 0) {
+          const lines2 = visible.map((r) => {
+            // modStart > modEnd is the empty-range encoding emitted by
+            // getHunkRangesInModifiedCoords for PURE DELETIONS (the hunk
+            // removed lines from the original without inserting any lines
+            // back, so it occupies zero lines in the modified view).
+            // modStart points at the line just AFTER the deletion in
+            // modified coords, i.e. the line that "took the place" of the
+            // deleted block.
+            const range = r.modStart > r.modEnd
+              ? `(deletion before line ${r.modStart})`
+              : r.modStart === r.modEnd
+                ? `line ${r.modStart}`
+                : `lines ${r.modStart}-${r.modEnd}`;
+            return `#   - ${r.status.padEnd(8)} ${range}`;
+          });
+          hunkMap =
+            `\n# pending hunks (modified-line coords) — use these ranges as-is when issuing follow-up propose_edit:\n` +
+            lines2.join('\n');
+        }
+      }
+
       return {
-        content: `# ${vscode.workspace.asRelativePath(uri)} (lines ${start}-${end} of ${total})${pendingNote}\n${lines.join('\n')}`,
+        content: `# ${vscode.workspace.asRelativePath(uri)} (lines ${start}-${end} of ${total})${pendingNote}\n${lines.join('\n')}${hunkMap}`,
         meta: { uri: uri.toString(), totalLines: total, start, end, hasPendingEdits: pendingContent !== undefined }
       };
     }

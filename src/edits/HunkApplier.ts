@@ -8,6 +8,15 @@ export interface ProposedHunk {
   startLine: number; // 1-indexed inclusive
   endLine: number;   // 1-indexed inclusive
   newText: string;
+  /**
+   * Optional string anchor. When set, HunkApplier resolves this exact
+   * sequence of lines against the file's current view (modifiedContent if
+   * the file has pending edits, else disk content) and uses that match as
+   * the (startLine, endLine) range — the caller-supplied startLine/endLine
+   * become a disambiguation HINT for non-unique matches. This makes line
+   * numbers tolerant to drift and is the recommended way to issue edits.
+   */
+  oldText?: string;
 }
 
 export interface ProposedEditFile {
@@ -229,12 +238,24 @@ export class HunkApplier implements vscode.Disposable {
     // Process every file under its own lock. Different files run concurrently
     // (the parallelism win); same-file calls serialize so loadOriginal +
     // modifiedContent recomputation stay consistent.
+    //
+    // Per-file error isolation: collect per-file failures here so a single
+    // file's overlap-rejection does NOT swallow other files that succeeded.
+    // (processFile validates BEFORE mutating, so a failed file leaves
+    // `this.pending` untouched for that file — but other files in the same
+    // batch may already have been queued by the time the failure surfaces.)
     let firstNewlyQueuedUri: vscode.Uri | undefined;
+    const fileErrors: string[] = [];
     await Promise.all(
       files.map((f) =>
         this.withFileLock(this.resolveUri(f.path).toString(), async () => {
-          const queuedNew = await this.processFile(f, summary);
-          if (queuedNew && !firstNewlyQueuedUri) firstNewlyQueuedUri = queuedNew;
+          try {
+            const queuedNew = await this.processFile(f, summary);
+            if (queuedNew && !firstNewlyQueuedUri) firstNewlyQueuedUri = queuedNew;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            fileErrors.push(`${f.path}: ${msg}`);
+          }
         })
       )
     );
@@ -268,8 +289,20 @@ export class HunkApplier implements vscode.Disposable {
         }
       }
     }
-    this.logger.info('Proposed edits queued', { files: files.length, summary });
+    this.logger.info('Proposed edits queued', {
+      files: files.length,
+      succeeded: files.length - fileErrors.length,
+      summary
+    });
+    // Always emit state so the banner reflects partial successes even when
+    // some files were rejected.
     this.emitState();
+    if (fileErrors.length > 0) {
+      // Surface aggregated errors to the tool layer. Files that succeeded
+      // are already queued and visible in the banner; the error message tells
+      // the model which files need re-targeting.
+      throw new Error(fileErrors.join(' | '));
+    }
   }
 
   /**
@@ -342,10 +375,195 @@ export class HunkApplier implements vscode.Disposable {
   ): Promise<vscode.Uri | undefined> {
     const uri = this.resolveUri(f.path);
     const key = uri.toString();
-    let entry = this.pending.get(key);
+    const existingEntry = this.pending.get(key);
+
+    // ---- oldText anchor resolution ----
+    // For any new hunk that supplies `oldText`, locate that exact line
+    // sequence in the file's current view (modifiedContent for pending
+    // files, else disk content) and rewrite (startLine, endLine) to match.
+    // Done BEFORE the overlap classification so downstream logic stays
+    // unchanged. Resolution failures throw so the tool surfaces a clear
+    // re-target message to the model.
+    let preloaded: { content: string; eol: string; isNewFile: boolean } | undefined;
+    let viewContent: string | undefined = existingEntry?.modifiedContent;
+    const needsOldText = f.hunks.some((h) => h.oldText !== undefined);
+    if (needsOldText && viewContent === undefined) {
+      preloaded = await this.loadOriginal(uri);
+      viewContent = preloaded.content;
+    }
+    const resolvedHunks: ProposedHunk[] = f.hunks.map((h) => {
+      if (h.oldText === undefined) return h;
+      if (viewContent === undefined) {
+        throw new Error(`oldText anchor on ${f.path} requires a readable file view`);
+      }
+      return resolveOldTextHunk(h, viewContent, f.path);
+    });
+    f = { path: f.path, hunks: resolvedHunks };
+
+    // Translate new hunks from baseline (modifiedContent) coords into
+    // originalContent coords. Rationale: read_file returns modifiedContent
+    // for files with pending edits, so when the model issues a follow-up
+    // propose_edit on the same file it naturally uses post-edit line numbers.
+    // Internally we keep every hunk in original-coord space so the existing
+    // flush path (WorkspaceEdit.replace on the live disk document) keeps
+    // working unchanged.
+    // Reject overlapping new hunks within THIS propose_edit call. Without
+    // this guard, two new hunks that overlap each other would be silently
+    // applied bottom-up and clobber one another. Pure insertions (startLine
+    // > endLine) collapse to an empty range and never overlap.
+    const newOverlapErrors: string[] = [];
+    for (let i = 0; i < f.hunks.length; i++) {
+      const a = f.hunks[i];
+      if (a.startLine > a.endLine) continue;
+      for (let j = i + 1; j < f.hunks.length; j++) {
+        const b = f.hunks[j];
+        if (b.startLine > b.endLine) continue;
+        if (!(a.endLine < b.startLine || b.endLine < a.startLine)) {
+          newOverlapErrors.push(
+            `two new hunks in the same propose_edit overlap: lines ${a.startLine}-${a.endLine} vs ${b.startLine}-${b.endLine}. Make them disjoint.`
+          );
+        }
+      }
+    }
+    if (newOverlapErrors.length > 0) {
+      throw new Error(`propose_edit overlap rejected: ${newOverlapErrors.join(' | ')}`);
+    }
+
+    let translatedHunks: ProposedHunk[];
+    const droppedExistingIds = new Set<string>();
+    // Refinements: new hunks that fall fully INSIDE a pending hunk's modified
+    // range. Instead of adding them as separate hunks (which would either
+    // overlap the parent or get rejected), we splice them into the parent
+    // pending hunk's newText so the model can iteratively shape one queued
+    // edit. Collected here, applied after classification.
+    const refinements: Array<{ targetId: string; nh: ProposedHunk; modStart: number }> = [];
+    const refinedNewHunkIndices = new Set<number>();
+    if (!existingEntry || existingEntry.hunks.length === 0) {
+      // First propose_edit on this file: baseline === original, no translation.
+      translatedHunks = f.hunks;
+    } else {
+      // Annotate each existing PENDING / ACCEPTED hunk with its baseline-coord
+      // range and per-hunk line delta. REJECTED hunks are excluded entirely
+      // because they were never applied to modifiedContent — leaving them in
+      // would inflate `cum` and skew every subsequent hunk's modStart.
+      const sortedExisting = existingEntry.hunks
+        .filter((h) => h.status !== 'rejected')
+        .slice()
+        .sort((a, b) => a.hunk.startLine - b.hunk.startLine);
+      let cum = 0;
+      type Annot = {
+        h: PendingHunk;
+        modStart: number;
+        modEnd: number;
+        delta: number;
+        isEmpty: boolean; // pure deletion: occupies zero lines in modified
+      };
+      const annotated: Annot[] = sortedExisting.map((h) => {
+        const removed =
+          h.hunk.startLine > h.hunk.endLine ? 0 : h.hunk.endLine - h.hunk.startLine + 1;
+        const added = countAddedLines(h.hunk.newText);
+        const modStart = h.hunk.startLine + cum;
+        // Bug fix: pure deletions (added=0) occupy ZERO lines in modified
+        // coords, so represent them as an empty range [modStart, modStart-1].
+        // The previous `Math.max(added, 1) - 1` formula incorrectly stamped
+        // them as a 1-line range, which caused spurious overlap matches and
+        // off-by-one drift in the per-hunk delta calculation below.
+        const modEnd = added === 0 ? modStart - 1 : modStart + added - 1;
+        const delta = added - removed;
+        cum += delta;
+        return { h, modStart, modEnd, delta, isEmpty: added === 0 };
+      });
+
+      // Classify each new hunk against existing annotated hunks. Four cases:
+      //   1. New hunk fully CONTAINS a pending hunk        -> drop pending (last-write-wins).
+      //   2. Pending hunk fully CONTAINS the new hunk      -> splice the new
+      //      hunk's newText into the pending hunk's newText (refinement).
+      //   3. New hunk PARTIALLY overlaps a pending hunk    -> reject (silent
+      //      corruption otherwise — part of the pending newText would vanish).
+      //   4. New hunk overlaps an ACCEPTED hunk            -> reject (the
+      //      accepted region is locked in for review; refining its newText
+      //      via line numbers is fragile, ask the model to re-read instead).
+      const overlapErrors: string[] = [];
+      for (let nhIdx = 0; nhIdx < f.hunks.length; nhIdx++) {
+        const nh = f.hunks[nhIdx];
+        for (const ann of annotated) {
+          if (ann.isEmpty) continue; // pure deletions never overlap anything
+          const overlaps = !(nh.endLine < ann.modStart || ann.modEnd < nh.startLine);
+          if (!overlaps) continue;
+          const newContainsExisting =
+            nh.startLine <= ann.modStart && ann.modEnd <= nh.endLine;
+          const existingContainsNew =
+            ann.modStart <= nh.startLine && nh.endLine <= ann.modEnd;
+          if (ann.h.status === 'accepted') {
+            overlapErrors.push(
+              `new hunk modLines ${nh.startLine}-${nh.endLine} overlaps already-accepted hunk at modLines ${ann.modStart}-${ann.modEnd}. Re-read the file with read_file and retarget against the post-decision view.`
+            );
+          } else if (newContainsExisting) {
+            droppedExistingIds.add(ann.h.id);
+          } else if (existingContainsNew) {
+            // Refinement: splice nh into ann's newText after we finish
+            // classification. Record the absolute modStart of the parent
+            // pending hunk so the splice target is computed against the
+            // model-stable view (before any sibling refinement applies).
+            refinements.push({ targetId: ann.h.id, nh, modStart: ann.modStart });
+            refinedNewHunkIndices.add(nhIdx);
+          } else {
+            overlapErrors.push(
+              `new hunk modLines ${nh.startLine}-${nh.endLine} partially overlaps pending hunk at modLines ${ann.modStart}-${ann.modEnd}. Either fully contain the pending hunk's range or shrink so the ranges do not overlap.`
+            );
+          }
+        }
+      }
+      if (overlapErrors.length > 0) {
+        throw new Error(`propose_edit overlap rejected: ${overlapErrors.join(' | ')}`);
+      }
+
+      // New hunks that became refinements are not added as separate pending
+      // entries — their content is folded into the parent pending hunk below.
+      const remainingNewHunks = f.hunks.filter((_, idx) => !refinedNewHunkIndices.has(idx));
+
+      // Translate each remaining new hunk to original coords. We use TWO
+      // cumulative deltas — one for the start line, one for the end line:
+      //   - cumBeforeStart: sum of deltas of annotated hunks whose modified
+      //     range ends strictly BEFORE nh.startLine. These shift both ends.
+      //   - cumBeforeEnd: cumBeforeStart PLUS deltas of annotated hunks whose
+      //     modified range is fully inside [nh.startLine, nh.endLine]. These
+      //     "internal" hunks (always dropped because new fully contains them)
+      //     get absorbed into the new hunk's original range, so the new hunk
+      //     correctly replaces every original line they were pointing at.
+      // Without this end-side correction, multi-hunk-subsumption used to drop
+      // or duplicate one boundary line per inside hunk (the visible symptom
+      // was "propose_edit replaced almost the right region but ate one extra
+      // line above/below").
+      translatedHunks = remainingNewHunks.map((nh) => {
+        let cumBeforeStart = 0;
+        let cumBeforeEnd = 0;
+        for (const a of annotated) {
+          if (a.isEmpty) continue;
+          if (a.modEnd < nh.startLine) {
+            cumBeforeStart += a.delta;
+            cumBeforeEnd += a.delta;
+          } else if (a.modStart >= nh.startLine && a.modEnd <= nh.endLine) {
+            cumBeforeEnd += a.delta;
+          }
+        }
+        return {
+          startLine: nh.startLine - cumBeforeStart,
+          endLine: nh.endLine - cumBeforeEnd,
+          newText: nh.newText
+        };
+      });
+    }
+
+    // Validation passed (or wasn't needed). NOW create the entry if it didn't
+    // exist — this way a thrown overlap rejection above leaves `this.pending`
+    // completely untouched, so the tool error message ("No hunks were queued")
+    // is true and concurrent calls on other files don't see torn state.
+    let entry: PendingFile;
     let newlyQueued: vscode.Uri | undefined;
-    if (!entry) {
-      const loaded = await this.loadOriginal(uri);
+    if (!existingEntry) {
+      // Reuse the loadOriginal result from oldText resolution if it ran.
+      const loaded = preloaded ?? (await this.loadOriginal(uri));
       const proposedUri = this.diffPreview.registerProposed(uri, loaded.content);
       entry = {
         uri,
@@ -360,64 +578,45 @@ export class HunkApplier implements vscode.Disposable {
       this.pending.set(key, entry);
       newlyQueued = uri;
     } else {
+      entry = existingEntry;
       entry.lastSummary = summary;
     }
 
-    // Translate new hunks from baseline (modifiedContent) coords into
-    // originalContent coords. Rationale: read_file now returns modifiedContent
-    // for files with pending edits, so when the model issues a follow-up
-    // propose_edit on the same file it naturally uses post-edit line numbers.
-    // Internally we still keep every hunk in original-coord space so the
-    // existing flush path (WorkspaceEdit.replace on the live disk document)
-    // keeps working unchanged.
-    let translatedHunks: ProposedHunk[];
-    let droppedExistingIds: Set<string> = new Set();
-    if (entry.hunks.length === 0) {
-      // First propose_edit on this file: baseline === original, no translation.
-      translatedHunks = f.hunks;
-    } else {
-      // Annotate each existing hunk with its baseline-coord range and per-hunk
-      // line delta. Walking original-startLine ASC keeps cumDelta monotonic.
-      const sortedExisting = [...entry.hunks].sort(
-        (a, b) => a.hunk.startLine - b.hunk.startLine
-      );
-      let cum = 0;
-      const annotated = sortedExisting.map((h) => {
-        const removed =
-          h.hunk.startLine > h.hunk.endLine ? 0 : h.hunk.endLine - h.hunk.startLine + 1;
-        const added = countAddedLines(h.hunk.newText);
-        const modStart = h.hunk.startLine + cum;
-        const modEnd = modStart + Math.max(added, 1) - 1;
-        const delta = added - removed;
-        cum += delta;
-        return { h, modStart, modEnd, delta };
-      });
-      // Drop existing PENDING hunks whose baseline range overlaps any new
-      // hunk — the model is rewriting that region, last-write-wins. Accepted
-      // hunks survive (they were already locked in by the user).
-      for (const ann of annotated) {
-        if (ann.h.status !== 'pending') continue;
-        const overlaps = f.hunks.some(
-          (nh) => !(nh.endLine < ann.modStart || ann.modEnd < nh.startLine)
-        );
-        if (overlaps) droppedExistingIds.add(ann.h.id);
+    // Apply pending-hunk refinements: each refinement target is an existing
+    // pending hunk whose newText we splice the new hunk into. Group by target
+    // so we can splice multiple refinements into the same parent in DESC
+    // order (so earlier splice indices stay valid). All refinements were
+    // computed against the model-stable view, so we splice using the parent
+    // hunk's ORIGINAL newText (a snapshot taken before any refinement runs).
+    if (refinements.length > 0) {
+      const byTarget = new Map<string, Array<{ nh: ProposedHunk; modStart: number }>>();
+      for (const r of refinements) {
+        const arr = byTarget.get(r.targetId) ?? [];
+        arr.push({ nh: r.nh, modStart: r.modStart });
+        byTarget.set(r.targetId, arr);
       }
-      const kept = annotated.filter((a) => !droppedExistingIds.has(a.h.id));
-      // Translate each new hunk to original coords using cumulative delta of
-      // KEPT hunks entirely before it in baseline coords. New hunks that fall
-      // strictly between kept hunks get a clean offset; new hunks that
-      // subsume dropped ones are translated using only the surviving deltas.
-      translatedHunks = f.hunks.map((nh) => {
-        let cumBefore = 0;
-        for (const k of kept) {
-          if (k.modEnd < nh.startLine) cumBefore += k.delta;
+      for (const [targetId, group] of byTarget) {
+        const parent = entry.hunks.find((h) => h.id === targetId);
+        if (!parent) continue; // shouldn't happen; defensive
+        const trailingNewline = parent.hunk.newText.endsWith('\n');
+        const parentLines = splitLogicalLines(parent.hunk.newText);
+        // Splice in DESCENDING modStart order so each splice's local index
+        // is computed against the original parent line array.
+        group.sort((a, b) => b.nh.startLine - a.nh.startLine);
+        for (const { nh, modStart } of group) {
+          const localStart = nh.startLine - modStart; // 0-indexed
+          if (nh.startLine > nh.endLine) {
+            // Pure insertion before localStart.
+            const repl = splitLogicalLines(nh.newText);
+            parentLines.splice(localStart, 0, ...repl);
+          } else {
+            const localCount = nh.endLine - nh.startLine + 1;
+            const repl = splitLogicalLines(nh.newText);
+            parentLines.splice(localStart, localCount, ...repl);
+          }
         }
-        return {
-          startLine: nh.startLine - cumBefore,
-          endLine: nh.endLine - cumBefore,
-          newText: nh.newText
-        };
-      });
+        parent.hunk.newText = parentLines.join('\n') + (trailingNewline ? '\n' : '');
+      }
     }
 
     const stamp = Date.now();
@@ -492,34 +691,64 @@ export class HunkApplier implements vscode.Disposable {
   }
 
   async acceptHunk(hunkId: string): Promise<void> {
-    const target = this.findHunkById(hunkId);
-    if (!target) return;
-    target.hunk.status = 'accepted';
-    await this.flushFileIfDone(target.file);
+    // Two-phase lookup: an initial lookup gives us the file URI for locking;
+    // we re-lookup INSIDE the lock to ensure the hunk still exists (another
+    // concurrent decision could have flushed it out from under us between
+    // the two steps). Run the status flip + flush under the file's lock so
+    // an in-flight propose_edit can't race with the entry deletion.
+    const initial = this.findHunkById(hunkId);
+    if (!initial) return;
+    await this.withFileLock(initial.file.uri.toString(), async () => {
+      const target = this.findHunkById(hunkId);
+      if (!target) return; // raced — already drained by another decision
+      target.hunk.status = 'accepted';
+      await this.flushFileIfDone(target.file);
+    });
     this.emitDecision();
   }
 
   async rejectHunk(hunkId: string): Promise<void> {
-    const target = this.findHunkById(hunkId);
-    if (!target) return;
-    target.hunk.status = 'rejected';
-    await this.flushFileIfDone(target.file);
+    const initial = this.findHunkById(hunkId);
+    if (!initial) return;
+    await this.withFileLock(initial.file.uri.toString(), async () => {
+      const target = this.findHunkById(hunkId);
+      if (!target) return; // raced — already drained
+      target.hunk.status = 'rejected';
+      await this.flushFileIfDone(target.file);
+    });
     this.emitDecision();
   }
 
   async acceptAll(): Promise<void> {
-    for (const file of Array.from(this.pending.values())) {
-      for (const h of file.hunks) if (h.status === 'pending') h.status = 'accepted';
-      await this.flushFileIfDone(file);
-    }
+    // Per-file lock so concurrent propose_edits on different files keep
+    // running in parallel; same-file ones serialize against the flush. The
+    // `this.pending.has(...)` re-check inside the lock guards against a
+    // file being drained by a per-hunk decision between our snapshot and
+    // lock acquisition.
+    const snapshot = Array.from(this.pending.values());
+    await Promise.all(
+      snapshot.map((file) =>
+        this.withFileLock(file.uri.toString(), async () => {
+          if (!this.pending.has(file.uri.toString())) return;
+          for (const h of file.hunks) if (h.status === 'pending') h.status = 'accepted';
+          await this.flushFileIfDone(file);
+        })
+      )
+    );
     this.emitDecision();
   }
 
   async rejectAll(): Promise<void> {
-    for (const file of Array.from(this.pending.values())) {
-      for (const h of file.hunks) if (h.status === 'pending') h.status = 'rejected';
-      await this.flushFileIfDone(file);
-    }
+    const snapshot = Array.from(this.pending.values());
+    await Promise.all(
+      snapshot.map((file) =>
+        this.withFileLock(file.uri.toString(), async () => {
+          if (!this.pending.has(file.uri.toString())) return;
+          for (const h of file.hunks) if (h.status === 'pending') h.status = 'rejected';
+          await this.flushFileIfDone(file);
+        })
+      )
+    );
     this.emitDecision();
   }
 
@@ -715,6 +944,46 @@ export class HunkApplier implements vscode.Disposable {
     return this.pending.get(uri.toString())?.hunks ?? [];
   }
 
+  /**
+   * Compute each queued hunk's range in MODIFIED-content coordinates (i.e.
+   * the line numbers the model sees via read_file when the file has pending
+   * edits). Mirrors the per-hunk delta math in `processFile`. Used by
+   * read_file to surface explicit hunk boundaries in its output so the model
+   * can target follow-up propose_edits without guessing where each pending
+   * hunk starts and ends.
+   *
+   * Returns an empty array when the file has no pending entry.
+   */
+  getHunkRangesInModifiedCoords(
+    uri: vscode.Uri
+  ): Array<{ id: string; status: 'pending' | 'accepted' | 'rejected'; modStart: number; modEnd: number }> {
+    const key = uri.scheme === DiffPreview.scheme
+      ? uri.with({ scheme: 'file', path: uri.path.replace(/\.proposed$/, '') }).toString()
+      : uri.toString();
+    const entry = this.pending.get(key);
+    if (!entry) return [];
+    // Annotate in original-startLine ASC order so cumulative delta walks
+    // monotonically (same convention as processFile). REJECTED hunks are
+    // excluded — they were never applied to modifiedContent, so including
+    // their delta would skew every subsequent hunk's reported modStart.
+    const sorted = entry.hunks
+      .filter((h) => h.status !== 'rejected')
+      .slice()
+      .sort((a, b) => a.hunk.startLine - b.hunk.startLine);
+    let cum = 0;
+    const out: Array<{ id: string; status: 'pending' | 'accepted' | 'rejected'; modStart: number; modEnd: number }> = [];
+    for (const h of sorted) {
+      const removed =
+        h.hunk.startLine > h.hunk.endLine ? 0 : h.hunk.endLine - h.hunk.startLine + 1;
+      const added = countAddedLines(h.hunk.newText);
+      const modStart = h.hunk.startLine + cum;
+      const modEnd = added === 0 ? modStart - 1 : modStart + added - 1;
+      cum += added - removed;
+      out.push({ id: h.id, status: h.status, modStart, modEnd });
+    }
+    return out;
+  }
+
   dispose(): void {
     this.codeLensRegistration.dispose();
     this.stateEmitter.dispose();
@@ -799,7 +1068,11 @@ function applyHunkToText(text: string, h: ProposedHunk, eol: string): string {
   const lines = text.split(/\r?\n/);
   const start = Math.max(0, h.startLine - 1);
   const end = Math.min(lines.length, h.endLine);
-  const replacement = h.newText.split(/\r?\n/);
+  // newText === '' means "no replacement content" (pure deletion or no-op
+  // insertion). Without this branch, splitting '' yields [''] which would
+  // splice an extra blank line into the result. countAddedLines already
+  // reports 0 lines for '' — keep applyHunkToText consistent.
+  const replacement = h.newText === '' ? [] : h.newText.split(/\r?\n/);
   // If replacement ends with empty string (trailing newline), drop it to avoid double EOL.
   if (replacement.length > 0 && replacement[replacement.length - 1] === '' && h.newText.endsWith('\n')) {
     replacement.pop();
@@ -815,6 +1088,29 @@ function hunkToRange(doc: vscode.TextDocument, h: ProposedHunk): vscode.Range {
     return new vscode.Range(start, 0, start, 0);
   }
   const endLineIdx = Math.max(0, Math.min(maxLine, h.endLine - 1));
+  // Pure deletion: extend the range to also consume one surrounding newline,
+  // otherwise WorkspaceEdit.replace(range, '') leaves a stray blank line
+  // where the deleted block used to be (because the line-bounding newlines
+  // are NOT part of `[startCol=0, endCol=text.length]`). Prefer to consume
+  // the FOLLOWING newline; if the deleted block reaches end-of-file, fall
+  // back to the PRECEDING newline so we don't lose the file's trailing EOL.
+  if (h.newText === '') {
+    if (endLineIdx + 1 <= maxLine) {
+      return new vscode.Range(start, 0, endLineIdx + 1, 0);
+    }
+    if (start > 0) {
+      const prevEnd = doc.lineAt(start - 1).text.length;
+      return new vscode.Range(
+        start - 1,
+        prevEnd,
+        endLineIdx,
+        doc.lineAt(endLineIdx).text.length
+      );
+    }
+    // Deleting from the only line: fall through to the standard "(0, 0) to
+    // (endLineIdx, lineEnd)" range — the resulting empty file matches what
+    // the model asked for.
+  }
   const endChar = doc.lineAt(endLineIdx).text.length;
   return new vscode.Range(start, 0, endLineIdx, endChar);
 }
@@ -823,4 +1119,240 @@ function ensureTrailingEol(text: string, eol: string, _insertOnly: boolean): str
   // Normalize line endings to the document's EOL.
   const normalized = text.replace(/\r\n?/g, '\n').replace(/\n/g, eol);
   return normalized;
+}
+
+/**
+ * Split a string into "logical lines" the same way the rest of HunkApplier
+ * does: split on either \r\n or \n, then drop a trailing empty entry that
+ * comes from a terminating newline (so the line count matches what
+ * applyHunkToText / countAddedLines treat as the file's line count).
+ *
+ * The empty string is treated as ZERO lines (consistent with countAddedLines)
+ * — note that '\n' (one trailing newline) still counts as ONE empty line,
+ * which matches "one empty line in the file".
+ */
+function splitLogicalLines(text: string): string[] {
+  if (text === '') return [];
+  const lines = text.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === '' && /\r?\n$/.test(text)) {
+    lines.pop();
+  }
+  return lines;
+}
+
+/**
+ * Resolve a hunk that carries an `oldText` anchor against `viewContent`:
+ * find the unique line-aligned occurrence of oldText and rewrite the hunk's
+ * (startLine, endLine) to match. Throws with a model-friendly message when
+ * oldText is missing, ambiguous, or empty.
+ *
+ * Matching is two-tier. We first try an EXACT line equality match. If that
+ * finds nothing, we retry with a whitespace-tolerant comparator (each line
+ * compared after `trim()`) — this is the LLM's most common failure mode:
+ * tabs vs spaces, wrong tab count, hallucinated extra leading whitespace,
+ * stray trailing whitespace. A unique fuzzy match is accepted, and we then
+ * auto-reindent `newText` by detecting the constant leading-whitespace
+ * offset between the supplied oldText and the actually-matched file lines,
+ * so the resulting diff still has the file's true indentation rather than
+ * the LLM's mistaken one.
+ *
+ * - oldText must align to whole lines.
+ * - When oldText appears multiple times, the caller's startLine acts as a
+ *   disambiguation hint: only the match starting at that 1-indexed line is
+ *   accepted; otherwise we ask the caller to add more context.
+ * - To express a pure insertion via oldText, set oldText to the empty string
+ *   (or a string that becomes empty after the trailing-newline drop) and
+ *   provide startLine; we return startLine = endLine + 1 (insertion form).
+ */
+function resolveOldTextHunk(
+  h: ProposedHunk,
+  viewContent: string,
+  filePath: string
+): ProposedHunk {
+  const rawOld = h.oldText ?? '';
+  if (rawOld === '') {
+    // Empty oldText is treated as an insertion at the caller-supplied
+    // startLine. We require startLine for this case so the destination is
+    // unambiguous. Note: splitLogicalLines('') returns [''] (one empty
+    // string), not [], so we check the raw text directly here instead of
+    // relying on the line array's length.
+    if (!Number.isFinite(h.startLine) || h.startLine < 1) {
+      throw new Error(
+        `propose_edit on ${filePath}: oldText is empty and no usable startLine hint was provided. Either supply non-empty oldText, or use the legacy line-range form (startLine = endLine + 1 for insertion).`
+      );
+    }
+    return { startLine: h.startLine, endLine: h.startLine - 1, newText: h.newText };
+  }
+
+  const oldLines = splitLogicalLines(rawOld);
+  const viewLines = splitLogicalLines(viewContent);
+
+  // Pass 1: exact line equality.
+  let matches = findOldTextMatches(viewLines, oldLines, (a, b) => a === b);
+  let matchMode: 'exact' | 'fuzzy' = 'exact';
+
+  // Pass 2: whitespace-tolerant fallback. Compare lines after `.trim()`,
+  // which catches the common case where the model reproduced indentation
+  // imperfectly (tabs vs spaces, wrong tab count, stray trailing
+  // whitespace). We only accept a UNIQUE fuzzy match below, so this can't
+  // silently re-target an unrelated section that happens to share trimmed
+  // content with oldText.
+  if (matches.length === 0) {
+    matches = findOldTextMatches(viewLines, oldLines, (a, b) => a.trim() === b.trim());
+    matchMode = 'fuzzy';
+  }
+
+  if (matches.length === 0) {
+    const preview = oldLines.slice(0, 2).join('\n');
+    const more = oldLines.length > 2 ? ` ...(+${oldLines.length - 2} more lines)` : '';
+    // Surface the actual file content at the model-supplied startLine so it
+    // can compare side-by-side and self-correct on the next try, rather
+    // than re-issuing the same wrong oldText in a tight loop.
+    let actualSnippet = '';
+    const hint = Number(h.startLine);
+    if (Number.isFinite(hint) && hint >= 1) {
+      const idx = hint - 1;
+      const winSize = Math.min(Math.max(oldLines.length, 2), 8);
+      const win = viewLines.slice(idx, Math.min(idx + winSize, viewLines.length));
+      if (win.length > 0) {
+        const numbered = win.map((l, i) => `${(idx + i + 1).toString().padStart(5)}\t${l}`).join('\n');
+        actualSnippet = `\nActual file content starting at line ${hint}:\n${numbered}`;
+      }
+    }
+    throw new Error(
+      `propose_edit on ${filePath}: oldText not found in current view of file (tried exact match and whitespace-trimmed match). Re-read the file with read_file and copy the EXACT lines you want to replace.\nFirst lines of supplied oldText: "${preview}${more}".${actualSnippet}`
+    );
+  }
+
+  let chosen: number;
+  if (matches.length === 1) {
+    chosen = matches[0];
+  } else {
+    // Disambiguate via the caller-supplied startLine hint.
+    const hint = Number(h.startLine);
+    if (Number.isFinite(hint) && hint >= 1 && matches.includes(hint - 1)) {
+      chosen = hint - 1;
+    } else {
+      const matchLines = matches.map((m) => m + 1).join(', ');
+      throw new Error(
+        `propose_edit on ${filePath}: oldText is not unique (${matches.length} matches at lines ${matchLines}). Add more context lines to oldText to make it unique, or set startLine to one of those line numbers as a tie-breaker.`
+      );
+    }
+  }
+
+  // Fuzzy mode: try to detect a constant leading-whitespace offset between
+  // the supplied oldText and the actually-matched file lines, and apply
+  // that offset to newText. This produces a diff that respects the file's
+  // real indentation even when the model hallucinated extra tabs/spaces.
+  let newText = h.newText;
+  if (matchMode === 'fuzzy') {
+    const matchedFileLines = viewLines.slice(chosen, chosen + oldLines.length);
+    const reindented = tryReindentByPrefix(newText, oldLines, matchedFileLines);
+    if (reindented !== null) newText = reindented;
+  }
+
+  return {
+    startLine: chosen + 1,
+    endLine: chosen + oldLines.length,
+    newText
+  };
+}
+
+/**
+ * Sliding-window search for `oldLines` inside `viewLines`. Returns 0-indexed
+ * start positions of every match according to `eq`. Empty `oldLines` is
+ * treated as "no matches" (callers handle the empty-oldText case earlier
+ * via the insertion branch).
+ */
+function findOldTextMatches(
+  viewLines: string[],
+  oldLines: string[],
+  eq: (a: string, b: string) => boolean
+): number[] {
+  const matches: number[] = [];
+  if (oldLines.length === 0) return matches;
+  outer: for (let i = 0; i + oldLines.length <= viewLines.length; i++) {
+    for (let j = 0; j < oldLines.length; j++) {
+      if (!eq(viewLines[i + j], oldLines[j])) continue outer;
+    }
+    matches.push(i);
+  }
+  return matches;
+}
+
+/**
+ * When fuzzy-matching landed a hunk, try to detect a constant leading-
+ * whitespace offset between every non-blank line of `oldLines` and its
+ * counterpart in `fileLines`, and translate `newText`'s leading prefix
+ * accordingly. Returns the rewritten newText, or `null` when no consistent
+ * offset exists (in which case the caller falls back to the model's
+ * newText verbatim).
+ *
+ * Heuristic: every non-blank oldLine must have its file counterpart end in
+ * the SAME suffix (i.e. they differ only in their leading-whitespace
+ * prefix). The shared old-prefix and the shared new-prefix are then
+ * substituted at the start of every newText line that begins with the
+ * old-prefix. Lines in newText that don't start with the old-prefix are
+ * left alone — that catches the common case where newText extends or
+ * shrinks beyond oldText's base indent and the LLM consistently used the
+ * same (incorrect) prefix throughout.
+ */
+function tryReindentByPrefix(
+  newText: string,
+  oldLines: string[],
+  fileLines: string[]
+): string | null {
+  if (oldLines.length !== fileLines.length || oldLines.length === 0) return null;
+  let oldPrefix: string | null = null;
+  let newPrefix: string | null = null;
+  for (let i = 0; i < oldLines.length; i++) {
+    const o = oldLines[i];
+    const f = fileLines[i];
+    if (o.trim() === '' || f.trim() === '') continue;
+    const oLW = leadingWs(o);
+    const fLW = leadingWs(f);
+    // Both must end in the same non-whitespace content for the offset to
+    // be meaningful. (We already passed the trimmed-equality match, so
+    // this check is technically redundant, but it guards against future
+    // comparator changes.)
+    if (o.slice(oLW.length) !== f.slice(fLW.length)) return null;
+    if (oldPrefix === null) {
+      oldPrefix = oLW;
+      newPrefix = fLW;
+    } else {
+      // Require the offset to be constant across all anchored lines —
+      // otherwise we have no reliable single substitution.
+      if (oLW !== oldPrefix || fLW !== newPrefix) return null;
+    }
+  }
+  if (oldPrefix === null || newPrefix === null) return null;
+  if (oldPrefix === newPrefix) return null;
+  return reindentTextPrefix(newText, oldPrefix, newPrefix);
+}
+
+function leadingWs(line: string): string {
+  const m = /^[ \t]*/.exec(line);
+  return m ? m[0] : '';
+}
+
+/**
+ * Replace a leading `fromPrefix` with `toPrefix` at the start of every line
+ * in `text`. Lines that don't start with fromPrefix are left untouched.
+ * EOL style (\n vs \r\n) is preserved.
+ */
+function reindentTextPrefix(text: string, fromPrefix: string, toPrefix: string): string {
+  if (fromPrefix === toPrefix) return text;
+  if (fromPrefix === '') {
+    // Empty fromPrefix would otherwise prepend toPrefix to every line,
+    // including blank ones. Skip — the caller's `oldPrefix === null`
+    // guard already covers this case for fuzzy matches.
+    return text;
+  }
+  const parts = text.split(/(\r?\n)/);
+  for (let i = 0; i < parts.length; i += 2) {
+    if (parts[i].startsWith(fromPrefix)) {
+      parts[i] = toPrefix + parts[i].slice(fromPrefix.length);
+    }
+  }
+  return parts.join('');
 }

@@ -309,12 +309,41 @@ export class AgentLoop {
     let consecutiveRepeats = 0;
     const maxStuckRepeats = this.options.maxStuckRepeats ?? DEFAULT_MAX_STUCK_REPEATS;
 
+    // ---- propose_edit decision feedback ----
+    // Without this, when the user accepts/rejects pending edits while the
+    // agent is still running, the model has no way of knowing that the file
+    // it last saw via read_file may now have stale line numbers. We buffer
+    // each fully-drained file's decision summary here and inject it as a
+    // user-role notice at the next iteration boundary so the model knows to
+    // re-read before any follow-up propose_edit.
+    const decisionBuffer: string[] = [];
+    const decisionSub = this.applier.onPendingStateChange((state) => {
+      if (state.recentDecision) decisionBuffer.push(state.recentDecision);
+    });
+
+    try {
     for (let iter = 0; iter < this.options.maxIterations; iter++) {
       if (cancellation.isCancellationRequested) {
         yield { type: 'done', payload: { reason: 'cancelled' } };
         return;
       }
       yield { type: 'iteration-start', payload: { iter } };
+
+      // If the user accepted or rejected pending edits since the last turn,
+      // surface a one-shot notice so the model invalidates its line-number
+      // cache for those files. Drained here (not on the emitter) so the
+      // notice always lands BEFORE the next compression / model call.
+      if (decisionBuffer.length > 0) {
+        const drained = decisionBuffer.splice(0).join(' | ');
+        messages.push({
+          role: 'user',
+          content:
+            `[user-decision] ${drained}\n` +
+            `Any file that just drained has been written to disk (or had its pending hunks discarded). ` +
+            `If you plan to issue another propose_edit on those files, re-read them with read_file first — ` +
+            `the line numbers you saw via the post-edit preview are now stale.`
+        });
+      }
 
       // Measure persistent context usage and auto-compress in place when we
       // cross the high-water mark. Compressing the persistent `messages`
@@ -624,6 +653,15 @@ export class AgentLoop {
         callId: string;
         parsed: Record<string, unknown>;
         tool: Tool | undefined;
+        /**
+         * Set when `tc.arguments` couldn't be parsed as JSON (truncated
+         * stream, malformed escapes, etc). When non-null we short-circuit
+         * `executeOne` and surface a clear parse-error message back to the
+         * LLM instead of calling the tool with an empty `{}` — otherwise
+         * the model gets a misleading "field X is missing" error and loops.
+         */
+        parseError?: string;
+        rawArgs?: string;
       }
       const prepared: PreparedCall[] = [];
       for (let i = 0; i < toolCalls.length; i++) {
@@ -631,12 +669,43 @@ export class AgentLoop {
         if (!tc.name) continue;
         const callId = finalCalls[i]?.id ?? `call_${Date.now()}_${i}`;
         let parsed: Record<string, unknown> = {};
-        try {
-          parsed = tc.arguments ? JSON.parse(tc.arguments) : {};
-        } catch (err) {
-          this.logger.warn('Tool args parse failed', tc.name, tc.arguments);
+        let parseError: string | undefined;
+        if (tc.arguments) {
+          try {
+            parsed = JSON.parse(tc.arguments);
+          } catch (err) {
+            // The LLM's most common JSON-emission bug is embedding raw
+            // control characters (literal TAB / NEWLINE / CR bytes) inside
+            // string values when copying file content for oldText/newText.
+            // Try a tolerant repair pass — escape control chars that lie
+            // INSIDE string literals — before declaring defeat.
+            const repaired = repairJsonControlChars(tc.arguments);
+            if (repaired !== null) {
+              try {
+                parsed = JSON.parse(repaired);
+                this.logger.info(
+                  `Tool args ${tc.name}: parsed after lenient control-char repair`
+                );
+              } catch (err2) {
+                parseError = err2 instanceof Error ? err2.message : String(err2);
+              }
+            } else {
+              parseError = err instanceof Error ? err.message : String(err);
+            }
+            if (parseError) {
+              this.logger.warn('Tool args parse failed', tc.name, parseError, tc.arguments);
+            }
+          }
         }
-        prepared.push({ index: i, name: tc.name, callId, parsed, tool: this.toolMap.get(tc.name) });
+        prepared.push({
+          index: i,
+          name: tc.name,
+          callId,
+          parsed,
+          tool: this.toolMap.get(tc.name),
+          parseError,
+          rawArgs: tc.arguments
+        });
       }
 
       // Emit tool-call-start events in original order so the chat panel
@@ -648,6 +717,33 @@ export class AgentLoop {
 
       const executeOne = async (c: PreparedCall): Promise<ToolResult> => {
         if (!c.tool) return { content: `Unknown tool: ${c.name}`, isError: true };
+        if (c.parseError) {
+          // Show the model the actual parse error AND a head/tail snippet of
+          // what we received, so it can see whether its JSON was truncated
+          // (long oldText/newText overflowing the model's per-call output
+          // budget is the usual cause) or just malformed (bad escape, stray
+          // newline inside a string, etc). Without this hint, the LLM gets
+          // a downstream "field X is missing" from the tool and retries the
+          // same broken JSON.
+          const raw = c.rawArgs ?? '';
+          const HEAD = 600;
+          const TAIL = 200;
+          const snippet =
+            raw.length > HEAD + TAIL
+              ? `${raw.slice(0, HEAD)}\n... [truncated ${raw.length - HEAD - TAIL} chars] ...\n${raw.slice(-TAIL)}`
+              : raw;
+          return {
+            content:
+              `Tool '${c.name}' args could not be parsed as JSON: ${c.parseError}.\n` +
+              `Re-issue the call with valid JSON. If you were embedding a long string ` +
+              `(oldText / newText / file contents), make sure all backslashes (\\\\), ` +
+              `double-quotes (\\"), and newlines (\\n) are properly escaped, and that ` +
+              `the JSON wasn't truncated by your output token budget — split the work ` +
+              `into multiple smaller propose_edit calls if needed.\n` +
+              `Received args (length=${raw.length}):\n${snippet}`,
+            isError: true
+          };
+        }
         try {
           return await c.tool.execute(c.parsed, {
             cancellation,
@@ -899,5 +995,67 @@ export class AgentLoop {
     }
 
     yield { type: 'done', payload: { reason: 'max_iterations' } };
+    } finally {
+      decisionSub.dispose();
+    }
   }
+}
+
+/**
+ * Walk a JSON-ish string and escape any RAW control character (codes < 0x20)
+ * that lies INSIDE a string literal. This is the LLM's single most common
+ * malformed-JSON failure mode for code-edit tools: the model copies a chunk
+ * of source straight into a JSON string value and forgets that JSON requires
+ * tabs / newlines / CR to be \\t / \\n / \\r. We don't try to repair other
+ * forms of malformed JSON (unbalanced braces, unescaped quotes, half-finished
+ * escapes) — those would risk silently changing the model's intent.
+ *
+ * Returns the rewritten string when at least one control character was
+ * escaped, or `null` when the input contains no in-string control bytes
+ * (so the caller can surface the original parse error verbatim).
+ */
+function repairJsonControlChars(input: string): string | null {
+  let out = '';
+  let inString = false;
+  let escape = false;
+  let changed = false;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    const code = ch.charCodeAt(0);
+    if (escape) {
+      // Preserve the next character verbatim — it's the second half of an
+      // escape sequence (\\n, \\t, \\u..., etc). We don't validate these
+      // here; if they're invalid, the second JSON.parse pass will surface it.
+      out += ch;
+      escape = false;
+      continue;
+    }
+    if (inString) {
+      if (ch === '\\') {
+        out += ch;
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        out += ch;
+        inString = false;
+        continue;
+      }
+      if (code < 0x20) {
+        changed = true;
+        if (code === 0x09) out += '\\t';
+        else if (code === 0x0a) out += '\\n';
+        else if (code === 0x0d) out += '\\r';
+        else if (code === 0x08) out += '\\b';
+        else if (code === 0x0c) out += '\\f';
+        else out += '\\u' + code.toString(16).padStart(4, '0');
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+    out += ch;
+    if (ch === '"') inString = true;
+  }
+  return changed ? out : null;
 }

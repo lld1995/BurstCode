@@ -13,7 +13,8 @@ import {
   addChatModel,
   updateBackgroundProfile,
   addBackgroundModel,
-  fetchProfileModels
+  fetchProfileModels,
+  writeCachedFetchedModels
 } from './llm/OpenAIClient';
 import { WorkspaceIndex } from './context/WorkspaceIndex';
 import { BackgroundExplorer, ExplorerStatus } from './background/BackgroundExplorer';
@@ -170,6 +171,9 @@ export function activate(context: vscode.ExtensionContext): void {
                 allowSelfSignedCerts: chat.allowSelfSignedCerts
               })
           );
+          // Mirror into the shared cache so the chat-panel picker shows
+          // these immediately (without re-hitting /v1/models).
+          await writeCachedFetchedModels(context.globalState, chat.baseURL, ids);
           if (ids.length === 0) {
             vscode.window.showWarningMessage(`BurstCode: ${chat.baseURL} returned no models.`);
             return;
@@ -398,6 +402,9 @@ export function activate(context: vscode.ExtensionContext): void {
                 allowSelfSignedCerts: profile.allowSelfSignedCerts || chat.allowSelfSignedCerts
               })
           );
+          // Mirror into the shared cache so the chat-panel picker stays in
+          // sync if the background profile shares its baseURL.
+          await writeCachedFetchedModels(context.globalState, probeBaseURL, ids);
           if (ids.length === 0) {
             vscode.window.showWarningMessage(`BurstCode: ${probeBaseURL} returned no models.`);
             return;

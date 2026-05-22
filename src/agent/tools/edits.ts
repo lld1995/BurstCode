@@ -2,6 +2,26 @@ import * as vscode from 'vscode';
 import { Tool, ToolResult } from './types';
 import { HunkApplier, ProposedEditFile } from '../../edits/HunkApplier';
 
+/**
+ * Return the first string-typed value found at any of `keys` on `obj`, along
+ * with the actual key that hit. Used to forgive the LLM's frequent drift
+ * away from canonical schema field names (e.g. `file` instead of `path`,
+ * `replacement` instead of `newText`). Returns `undefined` when no key
+ * present yields a string. Empty strings are preserved (callers that care
+ * about emptiness — e.g. path validation — check the returned `value`
+ * themselves, but `newText` legitimately can be empty for deletions).
+ */
+function pickFirstString(
+  obj: Record<string, unknown>,
+  keys: string[]
+): { value: string; key: string } | undefined {
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === 'string') return { value: v, key: k };
+  }
+  return undefined;
+}
+
 /** A single answer choice presented to the user. */
 export interface AskUserOption {
   label: string;
@@ -35,7 +55,11 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
       function: {
         name: 'propose_edit',
         description:
-          'Queue a set of line-based edits across one or more files for user review. NON-BLOCKING: returns immediately — the edits are NOT written to disk until the user accepts them. Use for modifications to the user\'s existing source files so they can review the diff. DO NOT use propose_edit for agent-generated scripts or temp files that you need to execute immediately — use write_file for those instead, as it writes to disk right away without a review step. You may call propose_edit multiple times within a turn (and across turns) to keep refining the queued change set; later hunks that overlap earlier pending hunks replace them (last-write-wins). The user accepts or rejects the queued edits at their leisure via a chat banner or per-hunk CodeLenses. Use 1-indexed inclusive [startLine, endLine] referring to the file AS YOU LAST SAW IT via read_file — when a file already has pending edits, read_file returns the post-edit preview, and your next propose_edit on that file MUST use those post-edit line numbers. ALWAYS re-read a file with read_file before issuing a follow-up propose_edit on it. To INSERT without replacing, set startLine=endLine+1 and end newText with a newline. To CREATE A NEW FILE, set path to the new file path (parent directories will be auto-created), startLine=1, endLine=0, and put the full file contents in newText. Do NOT bail out and stuff the new code into an unrelated existing file just because the file does not exist yet \u2014 propose_edit handles file creation natively.',
+          "Queue edits across one or more files for user review. NON-BLOCKING: returns immediately — edits are NOT written to disk until the user accepts them. Use for modifications to the user's existing source files. For agent-generated scripts or temp files you'll execute immediately, use write_file instead.\n\n" +
+          "RECOMMENDED FORM (anchor-based, robust to line drift): supply 'oldText' = the EXACT contiguous lines you want to replace (whitespace-exact, full lines). 'newText' is what they become. The applier locates oldText in the file's current view and rewrites the line range for you, so stale line numbers no longer corrupt edits. If oldText appears multiple times, set 'startLine' to the 1-indexed line where the intended match starts as a tie-breaker, OR add more context lines to oldText to make it unique.\n\n" +
+          "FALLBACK FORM (line-range, used when oldText is omitted): supply 1-indexed inclusive [startLine, endLine] referring to the file AS YOU LAST SAW IT via read_file. When the file has pending edits, read_file returns the post-edit preview WITH a `pending hunks` map at the bottom — copy those line numbers as-is. To INSERT without replacing in this form, set startLine = endLine + 1 and end newText with a newline.\n\n" +
+          "CREATING A NEW FILE: set path to the new file path (parent dirs auto-created), startLine=1, endLine=0, omit oldText, and put the full file contents in newText. Do NOT stuff new code into an unrelated existing file just because the target doesn't exist yet — propose_edit handles file creation natively.\n\n" +
+          "You may call propose_edit multiple times within a turn (and across turns) to refine the queued change set. Later hunks that fully contain earlier pending hunks replace them (last-write-wins); partially-overlapping hunks are REJECTED with a clear error so you can retarget. The user accepts/rejects via a chat banner or per-hunk CodeLenses; when they finish a file, you'll receive a [user-decision] notice — re-read that file before any follow-up propose_edit on it.",
         parameters: {
           type: 'object',
           properties: {
@@ -46,11 +70,27 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
                 type: 'object',
                 properties: {
                   path: { type: 'string' },
-                  startLine: { type: 'number' },
-                  endLine: { type: 'number' },
-                  newText: { type: 'string' }
+                  oldText: {
+                    type: 'string',
+                    description:
+                      "RECOMMENDED. Exact contiguous lines to replace, whitespace-exact and aligned to whole lines. When set, startLine/endLine become hints (only used to disambiguate non-unique matches). Omit only when creating a new file or when you genuinely want pure line-range mode."
+                  },
+                  startLine: {
+                    type: 'number',
+                    description:
+                      "1-indexed inclusive start. Required in line-range mode. Optional disambiguation hint when oldText is supplied."
+                  },
+                  endLine: {
+                    type: 'number',
+                    description:
+                      "1-indexed inclusive end. Required in line-range mode. Ignored when oldText is supplied."
+                  },
+                  newText: {
+                    type: 'string',
+                    description: 'Replacement text. Use the empty string to delete oldText / the line range without inserting anything.'
+                  }
                 },
-                required: ['path', 'startLine', 'endLine', 'newText']
+                required: ['path', 'newText']
               }
             }
           },
@@ -60,30 +100,135 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
     },
     async execute(args): Promise<ToolResult> {
       const summary = String(args.summary ?? '');
-      const rawEdits = Array.isArray(args.edits) ? args.edits : [];
+      // Accept a few common alias keys (`hunks`, `changes`, `files`) for
+      // `edits` — the model occasionally picks one of these on the first
+      // call. Without this, a naming slip caused the LLM to loop on
+      // "no edits provided" because the downstream message didn't tell it
+      // which key it actually used.
+      const rawEditsCandidate =
+        (args as Record<string, unknown>).edits ??
+        (args as Record<string, unknown>).hunks ??
+        (args as Record<string, unknown>).changes ??
+        (args as Record<string, unknown>).files;
+      const usedAlias =
+        !Array.isArray((args as Record<string, unknown>).edits) && Array.isArray(rawEditsCandidate)
+          ? Object.keys(args as Record<string, unknown>).find(
+              (k) => k !== 'edits' && Array.isArray((args as Record<string, unknown>)[k])
+            )
+          : undefined;
+      const rawEdits = Array.isArray(rawEditsCandidate) ? rawEditsCandidate : [];
+      // Top-level path fallback: when the model emits {summary, path, edits:
+      // [{oldText, newText}, ...]} (a single-file convenience form it
+      // sometimes invents), propagate that path to every hunk that lacks
+      // its own. Cheap to support; expensive to debug when missing.
+      const argsRecord = (args ?? {}) as Record<string, unknown>;
+      const topLevelPath = pickFirstString(argsRecord, [
+        'path',
+        'file',
+        'filePath',
+        'filename',
+        'fileName',
+        'target',
+        'targetFile',
+        'uri'
+      ]);
       const grouped = new Map<string, ProposedEditFile>();
-      for (const e of rawEdits as Array<Record<string, unknown>>) {
-        const path = String(e.path);
-        const startLine = Number(e.startLine);
-        const endLine = Number(e.endLine);
-        const newText = String(e.newText ?? '');
-        if (!path || !Number.isFinite(startLine) || !Number.isFinite(endLine)) continue;
+      const skipReasons: string[] = [];
+      let aliasedPathKey: string | undefined;
+      for (let i = 0; i < rawEdits.length; i++) {
+        const e = (rawEdits[i] ?? {}) as Record<string, unknown>;
+        // Accept common path-field aliases. The `edit_*` / `replacement` /
+        // `code` aliases for newText are also forgiven below — together they
+        // cover ~all of the LLM's drift away from the canonical schema.
+        let pathPicked = pickFirstString(e, [
+          'path',
+          'file',
+          'filePath',
+          'filename',
+          'fileName',
+          'target',
+          'targetFile',
+          'uri'
+        ]);
+        if (!pathPicked && topLevelPath) pathPicked = { value: topLevelPath.value, key: topLevelPath.key };
+        const path = pathPicked?.value ?? '';
+        if (pathPicked && pathPicked.key !== 'path' && !aliasedPathKey) aliasedPathKey = pathPicked.key;
+        const newTextPicked = pickFirstString(e, ['newText', 'new_text', 'replacement', 'code', 'content', 'text']);
+        const newText = newTextPicked?.value ?? '';
+        const oldTextPicked = pickFirstString(e, ['oldText', 'old_text', 'original', 'search']);
+        const hasOldText = oldTextPicked !== undefined;
+        const startLineRaw = e.startLine === undefined ? NaN : Number(e.startLine);
+        const endLineRaw = e.endLine === undefined ? NaN : Number(e.endLine);
+        if (!path) {
+          const presentKeys = Object.keys(e);
+          skipReasons.push(
+            `edits[${i}]: missing 'path' — keys present: [${presentKeys.join(', ') || '(none)'}]`
+          );
+          continue;
+        }
+        // oldText form: line numbers optional (used as hint).
+        // Line-range form: both startLine and endLine required.
+        if (!hasOldText && (!Number.isFinite(startLineRaw) || !Number.isFinite(endLineRaw))) {
+          skipReasons.push(
+            `edits[${i}] (${path}): no 'oldText' was supplied AND startLine/endLine are not finite numbers — supply oldText, or both line numbers`
+          );
+          continue;
+        }
         const entry = grouped.get(path) ?? { path, hunks: [] };
-        entry.hunks.push({ startLine, endLine, newText });
+        entry.hunks.push({
+          startLine: Number.isFinite(startLineRaw) ? startLineRaw : 0,
+          endLine: Number.isFinite(endLineRaw) ? endLineRaw : 0,
+          newText,
+          ...(hasOldText ? { oldText: oldTextPicked!.value } : {})
+        });
         grouped.set(path, entry);
       }
       const files = Array.from(grouped.values());
       if (files.length === 0) {
-        const diagnosis = !Array.isArray(args.edits)
-          ? `'edits' was not an array (received ${typeof args.edits})`
-          : args.edits.length === 0
+        const argsObj = (args ?? {}) as Record<string, unknown>;
+        const presentKeys = Object.keys(argsObj);
+        const editsField = argsObj.edits;
+        const diagnosis = !Array.isArray(editsField)
+          ? editsField === undefined
+            ? `'edits' field is missing. Received top-level keys: [${presentKeys.join(', ') || '(none)'}]. The schema requires {summary: string, edits: array<{path, newText, oldText?, startLine?, endLine?}>}`
+            : `'edits' was not an array (got ${typeof editsField}: ${JSON.stringify(editsField).slice(0, 120)})`
+          : editsField.length === 0
             ? "'edits' array was empty"
-            : `all ${(args.edits as unknown[]).length} edit(s) were skipped — each edit requires 'path' (non-empty string), 'startLine' (finite number), 'endLine' (finite number), and 'newText' (string)`;
-        return { content: `no edits provided: ${diagnosis}. Re-emit propose_edit with a non-empty 'edits' array.`, isError: true };
+            : `all ${editsField.length} edit(s) were skipped: ${skipReasons.join('; ')}`;
+        return { content: `no edits provided: ${diagnosis}. Re-emit propose_edit with a valid 'edits' array.`, isError: true };
       }
-      await applier.proposeEdits(files, summary);
+      try {
+        await applier.proposeEdits(files, summary);
+      } catch (err) {
+        // proposeEdits throws on overlap-rejection (new hunks that clash with
+        // already-accepted regions, partially overlap pending hunks, or
+        // overlap each other within the same call) and on oldText resolution
+        // failure. Per-file errors are aggregated; files that succeeded ARE
+        // already queued and visible in the chat banner — only the named
+        // files need re-targeting.
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content:
+            `propose_edit error(s): ${message}\n` +
+            `Files NOT named above were queued successfully and remain pending in the banner. ` +
+            `For each named file, re-read it with read_file (the line numbers you saw earlier may be stale) ` +
+            `and re-issue propose_edit with corrected oldText / non-overlapping ranges. ` +
+            `Prefer the oldText form so line drift no longer matters.`,
+          isError: true
+        };
+      }
+      const aliasNotes: string[] = [];
+      if (usedAlias) {
+        aliasNotes.push(`top-level field 'edits' was sent as '${usedAlias}'`);
+      }
+      if (aliasedPathKey) {
+        aliasNotes.push(`per-edit field 'path' was sent as '${aliasedPathKey}'`);
+      }
+      const aliasNote = aliasNotes.length
+        ? `\nNote: ${aliasNotes.join('; ')}. Accepted this time — please use the canonical field names ('edits', 'path') on subsequent calls.`
+        : '';
       return {
-        content: `Queued edits for ${files.length} file(s) — pending user review (non-blocking). You may call propose_edit again to add or replace hunks, or move on to the next step.`,
+        content: `Queued edits for ${files.length} file(s) — pending user review (non-blocking). You may call propose_edit again to add or replace hunks, or move on to the next step.${aliasNote}`,
         meta: { files: files.map((f) => f.path), summary }
       };
     }

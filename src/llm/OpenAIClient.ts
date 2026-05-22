@@ -247,6 +247,57 @@ export async function fetchProfileModels(profile: {
   return ids;
 }
 
+/**
+ * Persistent cache of `/v1/models` responses keyed by baseURL. Lives in the
+ * extension's globalState so a fetched list survives webview reloads and
+ * IDE restarts; the model picker can show the previously-fetched ids
+ * immediately and only re-hit the network when the user clicks Refresh.
+ */
+const FETCHED_MODELS_CACHE_KEY = 'burstcode.llm.fetchedModelsCache.v1';
+
+export interface FetchedModelsCacheEntry {
+  models: string[];
+  fetchedAt: number;
+}
+
+type FetchedModelsCache = Record<string, FetchedModelsCacheEntry>;
+
+function readFetchedModelsCache(memento: vscode.Memento): FetchedModelsCache {
+  const raw = memento.get<FetchedModelsCache>(FETCHED_MODELS_CACHE_KEY);
+  if (!raw || typeof raw !== 'object') return {};
+  return raw;
+}
+
+/** Look up the cached `/v1/models` response for the given baseURL, if any. */
+export function getCachedFetchedModels(
+  memento: vscode.Memento,
+  baseURL: string
+): FetchedModelsCacheEntry | null {
+  const url = (baseURL || '').trim();
+  if (!url) return null;
+  const cache = readFetchedModelsCache(memento);
+  const entry = cache[url];
+  if (!entry || !Array.isArray(entry.models)) return null;
+  const models = entry.models.filter(
+    (m): m is string => typeof m === 'string' && !!m
+  );
+  const fetchedAt = typeof entry.fetchedAt === 'number' ? entry.fetchedAt : 0;
+  return { models, fetchedAt };
+}
+
+/** Persist a successful `/v1/models` response under the given baseURL. */
+export async function writeCachedFetchedModels(
+  memento: vscode.Memento,
+  baseURL: string,
+  models: string[]
+): Promise<void> {
+  const url = (baseURL || '').trim();
+  if (!url) return;
+  const cache = readFetchedModelsCache(memento);
+  cache[url] = { models: models.slice(), fetchedAt: Date.now() };
+  await memento.update(FETCHED_MODELS_CACHE_KEY, cache);
+}
+
 export type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 export type ToolDef = OpenAI.Chat.Completions.ChatCompletionTool;
 
