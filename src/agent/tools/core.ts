@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as cp from 'child_process';
 import { Tool, ToolContext, ToolResult } from './types';
+import { HunkApplier } from '../../edits/HunkApplier';
 import { buildWorkspaceOutline } from '../../context/WorkspaceOutline';
 
 function workspaceRoot(): string | undefined {
@@ -16,42 +17,58 @@ function resolveUri(target: string): vscode.Uri {
   return vscode.Uri.file(path.join(root, target));
 }
 
-export const readFileTool: Tool = {
-  name: 'read_file',
-  schema: {
-    type: 'function',
-    function: {
-      name: 'read_file',
-      description:
-        'Read a slice of a workspace file with 1-indexed line numbers. Use this to inspect code regions; prefer reading targeted ranges over whole files.',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Path relative to workspace or absolute.' },
-          startLine: { type: 'number', description: '1-indexed start line (inclusive). Defaults to 1.' },
-          endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200.' }
-        },
-        required: ['path']
+export function buildReadFileTool(applier?: HunkApplier): Tool {
+  return {
+    name: 'read_file',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'read_file',
+        description:
+          'Read a slice of a workspace file with 1-indexed line numbers. Use this to inspect code regions; prefer reading targeted ranges over whole files.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Path relative to workspace or absolute.' },
+            startLine: { type: 'number', description: '1-indexed start line (inclusive). Defaults to 1.' },
+            endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200.' }
+          },
+          required: ['path']
+        }
       }
+    },
+    async execute(args: Record<string, unknown>): Promise<ToolResult> {
+      const target = String(args.path);
+      const uri = resolveUri(target);
+      let text: string;
+      let total: number;
+      let pendingNote = '';
+      const pendingContent = applier?.getPendingModifiedContent(uri);
+      if (pendingContent !== undefined) {
+        text = pendingContent;
+        total = text.split(/\r?\n/).length;
+        pendingNote = ' [pending edits applied — not yet written to disk]';
+      } else {
+        const doc = await vscode.workspace.openTextDocument(uri);
+        text = doc.getText();
+        total = doc.lineCount;
+      }
+      const start = Math.max(1, Number(args.startLine) || 1);
+      const end = Math.min(total, Number(args.endLine) || Math.min(total, start + 199));
+      const rawLines = text.split(/\r?\n/);
+      const lines: string[] = [];
+      for (let i = start - 1; i < end; i++) {
+        lines.push(`${(i + 1).toString().padStart(5)}\t${rawLines[i] ?? ''}`);
+      }
+      return {
+        content: `# ${vscode.workspace.asRelativePath(uri)} (lines ${start}-${end} of ${total})${pendingNote}\n${lines.join('\n')}`,
+        meta: { uri: uri.toString(), totalLines: total, start, end, hasPendingEdits: pendingContent !== undefined }
+      };
     }
-  },
-  async execute(args: Record<string, unknown>): Promise<ToolResult> {
-    const target = String(args.path);
-    const uri = resolveUri(target);
-    const doc = await vscode.workspace.openTextDocument(uri);
-    const total = doc.lineCount;
-    const start = Math.max(1, Number(args.startLine) || 1);
-    const end = Math.min(total, Number(args.endLine) || Math.min(total, start + 199));
-    const lines: string[] = [];
-    for (let i = start - 1; i < end; i++) {
-      lines.push(`${(i + 1).toString().padStart(5)}\t${doc.lineAt(i).text}`);
-    }
-    return {
-      content: `# ${vscode.workspace.asRelativePath(uri)} (lines ${start}-${end} of ${total})\n${lines.join('\n')}`,
-      meta: { uri: uri.toString(), totalLines: total, start, end }
-    };
-  }
-};
+  };
+}
+
+export const readFileTool: Tool = buildReadFileTool();
 
 export const workspaceOutlineTool: Tool = {
   name: 'workspace_outline',

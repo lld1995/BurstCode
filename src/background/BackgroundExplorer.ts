@@ -22,7 +22,7 @@ import { runGeneratedTest, TestRunResult } from './TestRunner';
 import { HunkApplier } from '../edits/HunkApplier';
 import { AgentLoop } from '../agent/AgentLoop';
 import {
-  readFileTool,
+  buildReadFileTool,
   listDirTool,
   grepSearchTool,
   workspaceOutlineTool
@@ -908,7 +908,7 @@ export class BackgroundExplorer implements vscode.Disposable {
 
     try {
       const client = new OpenAIClient(llm, this.logger);
-      const tools = [readFileTool, listDirTool, grepSearchTool, workspaceOutlineTool];
+      const tools = [buildReadFileTool(), listDirTool, grepSearchTool, workspaceOutlineTool];
       const agent = new AgentLoop(client, tools, this.hunkApplier, this.logger, {
         contextWindow: llm.contextWindow,
         maxIterations: 12,

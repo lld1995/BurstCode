@@ -622,6 +622,19 @@ export class HunkApplier implements vscode.Disposable {
     };
   }
 
+  /**
+   * If `uri` has pending edits, returns the current `modifiedContent` string
+   * (i.e. the original file with all queued hunks applied). Returns `undefined`
+   * when no pending edits exist for that file, so callers fall back to the
+   * normal disk read path.
+   */
+  getPendingModifiedContent(uri: vscode.Uri): string | undefined {
+    const key = uri.scheme === DiffPreview.scheme
+      ? uri.with({ scheme: 'file', path: uri.path.replace(/\.proposed$/, '') }).toString()
+      : uri.toString();
+    return this.pending.get(key)?.modifiedContent;
+  }
+
   /** Get pending hunks for a file URI (used by CodeLens provider). */
   getPendingForUri(uri: vscode.Uri): PendingHunk[] {
     // The diff editor opens both `proposedUri` (burstcode-preview) and the source `uri`.

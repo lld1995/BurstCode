@@ -16,7 +16,7 @@ import { LspBridge } from '../lsp/LspBridge';
 import { estimateMessagesTokens } from '../llm/tokenizer';
 import { AgentLoop } from '../agent/AgentLoop';
 import { Tool } from '../agent/tools/types';
-import { readFileTool, listDirTool, grepSearchTool, workspaceOutlineTool } from '../agent/tools/core';
+import { buildReadFileTool, listDirTool, grepSearchTool, workspaceOutlineTool } from '../agent/tools/core';
 import { WorkspaceIndex } from '../context/WorkspaceIndex';
 import { buildSystemPrompt } from '../agent/prompts';
 import { buildLspTools } from '../agent/tools/lsp';
@@ -640,7 +640,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const systemPrompt = await systemPromptPromise;
     const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
-    const coreReadTools: Tool[] = [readFileTool, listDirTool, grepSearchTool, workspaceOutlineTool];
+    const coreReadTools: Tool[] = [buildReadFileTool(this.applier), listDirTool, grepSearchTool, workspaceOutlineTool];
     const lspTools = buildLspTools(bridge, this.depGuard);
     const editTools = buildEditTools(this.applier, askUser);
     const subagentTool = buildSubagentTool({
