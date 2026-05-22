@@ -3025,17 +3025,22 @@ newBtn.addEventListener('click', () => vscode.postMessage({ type: 'reset' }));
 cfgBtn.addEventListener('click', () => vscode.postMessage({ type: 'open-config' }));
 
 // Pending-edits banner: persistent controls for the queued edit set.
-pendingReviewBtn.addEventListener('click', () => vscode.postMessage({ type: 'review-edits' }));
+pendingReviewBtn.addEventListener('click', (ev) => {
+  ev.stopPropagation();
+  vscode.postMessage({ type: 'review-edits' });
+});
 // Click the title to collapse/expand the changed-file list.
 pendingTitleRow.addEventListener('click', () => {
   pendingBanner.classList.toggle('collapsed');
 });
-pendingAcceptBtn.addEventListener('click', () => {
+pendingAcceptBtn.addEventListener('click', (ev) => {
+  ev.stopPropagation();
   pendingAcceptBtn.disabled = true;
   pendingRejectBtn.disabled = true;
   vscode.postMessage({ type: 'accept-all-edits' });
 });
-pendingRejectBtn.addEventListener('click', () => {
+pendingRejectBtn.addEventListener('click', (ev) => {
+  ev.stopPropagation();
   pendingAcceptBtn.disabled = true;
   pendingRejectBtn.disabled = true;
   vscode.postMessage({ type: 'reject-all-edits' });

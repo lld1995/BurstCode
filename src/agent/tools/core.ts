@@ -40,22 +40,30 @@ export function buildReadFileTool(applier?: HunkApplier): Tool {
     async execute(args: Record<string, unknown>): Promise<ToolResult> {
       const target = String(args.path);
       const uri = resolveUri(target);
-      let text: string;
-      let total: number;
+      let rawLines: string[];
       let pendingNote = '';
       const pendingContent = applier?.getPendingModifiedContent(uri);
       if (pendingContent !== undefined) {
-        text = pendingContent;
-        total = text.split(/\r?\n/).length;
+        rawLines = pendingContent.split(/\r?\n/);
+        // Mirror VS Code's `doc.lineCount` semantics: a trailing newline does
+        // not add a phantom empty line. Without this, line counts drift by 1
+        // between the disk path and the pending path on every read.
+        if (
+          rawLines.length > 0 &&
+          rawLines[rawLines.length - 1] === '' &&
+          /\r?\n$/.test(pendingContent)
+        ) {
+          rawLines.pop();
+        }
         pendingNote = ' [pending edits applied — not yet written to disk]';
       } else {
         const doc = await vscode.workspace.openTextDocument(uri);
-        text = doc.getText();
-        total = doc.lineCount;
+        rawLines = [];
+        for (let i = 0; i < doc.lineCount; i++) rawLines.push(doc.lineAt(i).text);
       }
+      const total = rawLines.length;
       const start = Math.max(1, Number(args.startLine) || 1);
       const end = Math.min(total, Number(args.endLine) || Math.min(total, start + 199));
-      const rawLines = text.split(/\r?\n/);
       const lines: string[] = [];
       for (let i = start - 1; i < end; i++) {
         lines.push(`${(i + 1).toString().padStart(5)}\t${rawLines[i] ?? ''}`);

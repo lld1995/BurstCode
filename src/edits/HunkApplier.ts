@@ -363,17 +363,75 @@ export class HunkApplier implements vscode.Disposable {
       entry.lastSummary = summary;
     }
 
+    // Translate new hunks from baseline (modifiedContent) coords into
+    // originalContent coords. Rationale: read_file now returns modifiedContent
+    // for files with pending edits, so when the model issues a follow-up
+    // propose_edit on the same file it naturally uses post-edit line numbers.
+    // Internally we still keep every hunk in original-coord space so the
+    // existing flush path (WorkspaceEdit.replace on the live disk document)
+    // keeps working unchanged.
+    let translatedHunks: ProposedHunk[];
+    let droppedExistingIds: Set<string> = new Set();
+    if (entry.hunks.length === 0) {
+      // First propose_edit on this file: baseline === original, no translation.
+      translatedHunks = f.hunks;
+    } else {
+      // Annotate each existing hunk with its baseline-coord range and per-hunk
+      // line delta. Walking original-startLine ASC keeps cumDelta monotonic.
+      const sortedExisting = [...entry.hunks].sort(
+        (a, b) => a.hunk.startLine - b.hunk.startLine
+      );
+      let cum = 0;
+      const annotated = sortedExisting.map((h) => {
+        const removed =
+          h.hunk.startLine > h.hunk.endLine ? 0 : h.hunk.endLine - h.hunk.startLine + 1;
+        const added = countAddedLines(h.hunk.newText);
+        const modStart = h.hunk.startLine + cum;
+        const modEnd = modStart + Math.max(added, 1) - 1;
+        const delta = added - removed;
+        cum += delta;
+        return { h, modStart, modEnd, delta };
+      });
+      // Drop existing PENDING hunks whose baseline range overlaps any new
+      // hunk — the model is rewriting that region, last-write-wins. Accepted
+      // hunks survive (they were already locked in by the user).
+      for (const ann of annotated) {
+        if (ann.h.status !== 'pending') continue;
+        const overlaps = f.hunks.some(
+          (nh) => !(nh.endLine < ann.modStart || ann.modEnd < nh.startLine)
+        );
+        if (overlaps) droppedExistingIds.add(ann.h.id);
+      }
+      const kept = annotated.filter((a) => !droppedExistingIds.has(a.h.id));
+      // Translate each new hunk to original coords using cumulative delta of
+      // KEPT hunks entirely before it in baseline coords. New hunks that fall
+      // strictly between kept hunks get a clean offset; new hunks that
+      // subsume dropped ones are translated using only the surviving deltas.
+      translatedHunks = f.hunks.map((nh) => {
+        let cumBefore = 0;
+        for (const k of kept) {
+          if (k.modEnd < nh.startLine) cumBefore += k.delta;
+        }
+        return {
+          startLine: nh.startLine - cumBefore,
+          endLine: nh.endLine - cumBefore,
+          newText: nh.newText
+        };
+      });
+    }
+
     const stamp = Date.now();
-    const newPending: PendingHunk[] = f.hunks.map((h, i) => ({
+    const newPending: PendingHunk[] = translatedHunks.map((h, i) => ({
       id: `${key}::${stamp}::${i}`,
       fileUri: uri,
       hunk: h,
       status: 'pending'
     }));
-    // Drop existing PENDING hunks whose ranges overlap any newly-queued one.
-    // Already-accepted hunks are kept (they will be applied alongside the
-    // new ones when the file is finally flushed).
+    // Apply both the baseline-coord drop set AND a defensive original-coord
+    // overlap check (catches the rare partial-overlap case the baseline pass
+    // missed when an accepted hunk sat in the way).
     entry.hunks = entry.hunks.filter((existing) => {
+      if (droppedExistingIds.has(existing.id)) return false;
       if (existing.status !== 'pending') return true;
       return !newPending.some((nh) => hunksOverlap(existing.hunk, nh.hunk));
     });
@@ -438,7 +496,7 @@ export class HunkApplier implements vscode.Disposable {
     if (!target) return;
     target.hunk.status = 'accepted';
     await this.flushFileIfDone(target.file);
-    this.emitState({ recentDecision: this.consumeDecisionSummary() });
+    this.emitDecision();
   }
 
   async rejectHunk(hunkId: string): Promise<void> {
@@ -446,7 +504,7 @@ export class HunkApplier implements vscode.Disposable {
     if (!target) return;
     target.hunk.status = 'rejected';
     await this.flushFileIfDone(target.file);
-    this.emitState({ recentDecision: this.consumeDecisionSummary() });
+    this.emitDecision();
   }
 
   async acceptAll(): Promise<void> {
@@ -454,7 +512,7 @@ export class HunkApplier implements vscode.Disposable {
       for (const h of file.hunks) if (h.status === 'pending') h.status = 'accepted';
       await this.flushFileIfDone(file);
     }
-    this.emitState({ recentDecision: this.consumeDecisionSummary() });
+    this.emitDecision();
   }
 
   async rejectAll(): Promise<void> {
@@ -462,18 +520,30 @@ export class HunkApplier implements vscode.Disposable {
       for (const h of file.hunks) if (h.status === 'pending') h.status = 'rejected';
       await this.flushFileIfDone(file);
     }
-    this.emitState({ recentDecision: this.consumeDecisionSummary() });
+    this.emitDecision();
+  }
+
+  /**
+   * Emit a pending-state change after a user decision. Only attaches a
+   * `recentDecision` string when at least one file actually drained — per-hunk
+   * accept/reject in a multi-hunk file otherwise produces a misleading
+   * "no decisions recorded" flash and pollutes the system-note message log.
+   */
+  private emitDecision(): void {
+    const summary = this.consumeDecisionSummary();
+    this.emitState(summary ? { recentDecision: summary } : {});
   }
 
   /**
    * Snapshot and clear the decision journal accumulated since the last
    * `proposeEdits` call. Returns a short human-readable string the agent loop
-   * feeds back to the model so it knows whether to retry, follow up, or stop.
+   * feeds back to the model so it knows whether to retry, follow up, or stop,
+   * or `undefined` when no file has fully drained since the last call.
    */
-  consumeDecisionSummary(): string {
+  consumeDecisionSummary(): string | undefined {
     const journal = this.decisionJournal;
     this.decisionJournal = [];
-    if (journal.length === 0) return 'no decisions recorded';
+    if (journal.length === 0) return undefined;
     let totalAcc = 0;
     let totalRej = 0;
     const parts = journal.map((d) => {
@@ -709,6 +779,20 @@ class HunkCodeLensProvider implements vscode.CodeLensProvider {
       })
       .flat();
   }
+}
+
+/**
+ * Count the number of lines `applyHunkToText` will substitute for a hunk's
+ * newText. Mirrors the trailing-newline-drop in `applyHunkToText` so the
+ * hunk-translation math in `processFile` stays consistent.
+ */
+function countAddedLines(newText: string): number {
+  if (newText === '') return 0;
+  const lines = newText.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === '' && newText.endsWith('\n')) {
+    lines.pop();
+  }
+  return lines.length;
 }
 
 function applyHunkToText(text: string, h: ProposedHunk, eol: string): string {
