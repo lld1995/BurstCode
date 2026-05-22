@@ -137,8 +137,19 @@ export const listDirTool: Tool = {
   }
 };
 
+// Hard upper bound for a single grep_search invocation. Far above the 30s
+// batch-safety net (which we opt out of via noTimeout) so legitimately slow
+// searches on large repos can finish, but still finite so a wedged ripgrep
+// process can't silently hang the agent forever.
+const GREP_INTERNAL_TIMEOUT_MS = 10 * 60_000;
+
 export const grepSearchTool: Tool = {
   name: 'grep_search',
+  // grep can take longer than the AgentLoop's 30s batch-safety timeout on
+  // large repos / broad regexes — opt out of that net. We keep ctx.cancellation
+  // (so the user's stop button still works) and an internal 10-minute kill
+  // timer below as the final safety.
+  noTimeout: true,
   schema: {
     type: 'function',
     function: {
@@ -174,11 +185,29 @@ export const grepSearchTool: Tool = {
       const proc = cp.spawn(rgPath, cliArgs);
       let stdout = '';
       let stderr = '';
+      let killedByInternalTimeout = false;
       proc.stdout.on('data', (d) => (stdout += d.toString()));
       proc.stderr.on('data', (d) => (stderr += d.toString()));
-      ctx.cancellation.onCancellationRequested(() => proc.kill());
-      proc.on('error', reject);
+      const cancelSub = ctx.cancellation.onCancellationRequested(() => proc.kill());
+      const internalTimer = setTimeout(() => {
+        killedByInternalTimeout = true;
+        proc.kill();
+      }, GREP_INTERNAL_TIMEOUT_MS);
+      proc.on('error', (err) => {
+        clearTimeout(internalTimer);
+        cancelSub.dispose();
+        reject(err);
+      });
       proc.on('close', () => {
+        clearTimeout(internalTimer);
+        cancelSub.dispose();
+        if (killedByInternalTimeout) {
+          resolve({
+            content: `# grep_search aborted after ${Math.round(GREP_INTERNAL_TIMEOUT_MS / 1000)}s — narrow the query / add a glob and retry`,
+            isError: true
+          });
+          return;
+        }
         const lines = stdout.split(/\r?\n/).filter(Boolean).slice(0, max);
         resolve({
           content: lines.length

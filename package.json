@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.24",
+  "version": "0.1.25",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -249,7 +249,7 @@
         },
         "burstcode.agent.maxIterations": {
           "type": "number",
-          "default": 30,
+          "default": 512,
           "description": "Maximum tool-calling iterations per user request."
         },
         "burstcode.agent.requireConfirmBeforeEdit": {
@@ -310,6 +310,11 @@
           "type": "boolean",
           "default": true,
           "description": "Allow launch_subagent to run independent write tasks that can call propose_edit within explicit allowedFiles scopes."
+        },
+        "burstcode.diag.webviewProbe": {
+          "type": "boolean",
+          "default": false,
+          "description": "Diagnostic only — when true, the BurstCode chat panel renders a red banner at the bottom listing the hit-test result of every interactive button (probes for invisible overlays / unclickable controls) and logs every click. Reload the window after toggling. Leave off in normal use."
         },
         "burstcode.lsp.maxWaitMs": {
           "type": "number",

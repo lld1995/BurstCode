@@ -73,7 +73,14 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
         grouped.set(path, entry);
       }
       const files = Array.from(grouped.values());
-      if (files.length === 0) return { content: 'no edits provided', isError: true };
+      if (files.length === 0) {
+        const diagnosis = !Array.isArray(args.edits)
+          ? `'edits' was not an array (received ${typeof args.edits})`
+          : args.edits.length === 0
+            ? "'edits' array was empty"
+            : `all ${(args.edits as unknown[]).length} edit(s) were skipped — each edit requires 'path' (non-empty string), 'startLine' (finite number), 'endLine' (finite number), and 'newText' (string)`;
+        return { content: `no edits provided: ${diagnosis}. Re-emit propose_edit with a non-empty 'edits' array.`, isError: true };
+      }
       await applier.proposeEdits(files, summary);
       return {
         content: `Queued edits for ${files.length} file(s) — pending user review (non-blocking). You may call propose_edit again to add or replace hunks, or move on to the next step.`,

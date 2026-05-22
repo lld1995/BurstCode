@@ -678,7 +678,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const agent = new AgentLoop(client, tools, this.applier, this.logger, {
       contextWindow: llmCfg.contextWindow,
-      maxIterations: agentCfg.get<number>('maxIterations') ?? 50,
+      maxIterations: agentCfg.get<number>('maxIterations') ?? 512,
       requireConfirmBeforeEdit: agentCfg.get<boolean>('requireConfirmBeforeEdit') ?? true,
       autoContinueOnLength: agentCfg.get<boolean>('autoContinueOnLength') ?? true,
       maxAutoContinues: agentCfg.get<number>('maxAutoContinues') ?? 3,
@@ -761,6 +761,64 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       `img-src ${webview.cspSource} data:`,
       `font-src ${webview.cspSource}`
     ].join('; ');
+    const diagEnabled = vscode.workspace.getConfiguration('burstcode.diag').get<boolean>('webviewProbe', false);
+    const diagBannerHtml = diagEnabled
+      ? `<div id="bcDiagBanner" style="position:fixed;left:0;right:0;bottom:0;background:rgba(122,31,31,0.92);color:#fff;font:11px/1.4 ui-monospace,monospace;padding:6px 28px 6px 8px;z-index:99999;white-space:pre-wrap;max-height:40vh;overflow:auto;box-shadow:0 -2px 8px rgba(0,0,0,0.5);pointer-events:none;user-select:text;">[BurstCode probe] script has NOT executed yet — if you see this for more than 1s the inline &lt;script&gt; tag failed to run (CSP / nonce / syntax). Open DevTools (right-click → Inspect) for the exact reason.</div>`
+      : '';
+    const diagScript = diagEnabled
+      ? `
+window.addEventListener('error', (ev) => {
+  console.error('[BurstCode][webview-error]', ev.message, ev.filename + ':' + ev.lineno + ':' + ev.colno, ev.error);
+});
+window.addEventListener('unhandledrejection', (ev) => {
+  console.error('[BurstCode][webview-rejection]', ev.reason);
+});
+function describeNode(n) {
+  if (!n || !n.tagName) return String(n);
+  const cls = typeof n.className === 'string'
+    ? n.className
+    : (n.className && n.className.baseVal) || '';
+  const tail = cls ? '.' + String(cls).split(' ').filter(Boolean).join('.') : '';
+  return n.tagName.toLowerCase() + (n.id ? '#' + n.id : '') + tail;
+}
+document.addEventListener('click', (ev) => {
+  try {
+    console.log('[BurstCode][click]', describeNode(ev.target), 'x=' + ev.clientX, 'y=' + ev.clientY);
+  } catch (e) {}
+}, true);
+function runProbe() {
+  const ids = ['newBtn', 'historyBtn', 'lessonsBtn', 'cfgBtn', 'modelPickerBtn', 'sendBtn', 'bgStatus', 'input'];
+  const lines = [];
+  for (const id of ids) {
+    try {
+      const el = document.getElementById(id);
+      if (!el) { lines.push(id + ': MISSING'); continue; }
+      const r = el.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      const hit = document.elementFromPoint(x, y);
+      const overlaid = hit !== el && !el.contains(hit);
+      const line = id + ' [' + Math.round(r.left) + ',' + Math.round(r.top) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) + '] -> ' + describeNode(hit) + (overlaid ? ' !! BLOCKED' : ' ok');
+      console.log('[BurstCode][probe]', line);
+      lines.push(line);
+    } catch (err) {
+      lines.push(id + ': ERR ' + err);
+    }
+  }
+  return lines;
+}
+function showDiagBanner(lines) {
+  const banner = document.getElementById('bcDiagBanner');
+  if (!banner) return;
+  banner.textContent = '[BurstCode probe @ ' + new Date().toLocaleTimeString() + ']\\n' + lines.join('\\n');
+}
+showDiagBanner(['probing...']);
+try { showDiagBanner(runProbe()); } catch (err) { showDiagBanner(['probe-err: ' + err]); }
+setTimeout(() => {
+  try { showDiagBanner(runProbe()); } catch (err) { showDiagBanner(['probe-err(late): ' + err]); }
+}, 600);
+`
+      : '';
 
     return /* html */ `
 <!DOCTYPE html>
@@ -967,6 +1025,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .tool summary:hover { opacity: 1; }
   .tool[data-error="true"] summary { color: var(--vscode-errorForeground); }
   .tool pre { margin: 4px 0 4px 4px; padding: 6px 8px; max-height: 260px; overflow: auto; white-space: pre-wrap; background: var(--vscode-textCodeBlock-background); border-radius: 4px; font-size: 0.95em; }
+  .tool .tool-progress-log { max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .tool[data-running="true"] summary::after { content: ''; display: inline-block; width: 7px; height: 7px; margin-left: 8px; border-radius: 50%; background: var(--vscode-charts-yellow); animation: pulse 1.1s ease-in-out infinite; vertical-align: middle; }
 
   .iter-pill { margin: 8px 0 4px; opacity: 0.55; font-size: 0.8em; }
@@ -1139,6 +1198,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </style>
 </head>
 <body>
+  ${diagBannerHtml}
   <div class="topbar">
     <span class="brand"><span class="dot"></span>BurstCode</span>
     <span class="spacer"></span>
@@ -1213,6 +1273,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </div>
 <script nonce="${nonce}">
+${diagScript}
 const vscode = acquireVsCodeApi();
 const log = document.getElementById('log');
 const input = document.getElementById('input');
@@ -2389,7 +2450,7 @@ window.addEventListener('message', (e) => {
           progDet.open = true;
         }
         const line = String((msg.payload && msg.payload.message) || '');
-        progPre.textContent = (progPre.textContent ? progPre.textContent + '\n' : '') + line;
+        progPre.textContent = (progPre.textContent ? progPre.textContent + '\\n' : '') + line;
         if (progPre.textContent.length > 8000) {
           progPre.textContent = '...' + progPre.textContent.slice(-7500);
         }

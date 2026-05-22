@@ -113,10 +113,12 @@ export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig)
   const budget = Math.floor(cfg.contextWindow * cfg.inputBudgetRatio);
   let current = estimateMessagesTokens(result as Array<{ role: string; content: unknown }>);
 
-  // Drop oldest non-system, non-protected messages until under budget.
+  // Drop oldest non-system, non-user, non-protected messages until under budget.
+  // User messages must never be dropped — they are the ground truth of the
+  // conversation and their absence causes history to render without the prompts.
   const protected_ = result.length - cfg.keepLastN * 2;
   while (current > budget) {
-    const idx = result.findIndex((m, i) => i > systemIdx && i < protected_);
+    const idx = result.findIndex((m, i) => i > systemIdx && i < protected_ && m.role !== 'user');
     if (idx < 0) break;
     const removed = result.splice(idx, 1)[0];
     current -= estimateTokens(stringifyContent(removed.content));
