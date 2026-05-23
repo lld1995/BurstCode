@@ -30,6 +30,10 @@ export class GitCheckpoint {
   private static readonly CHECKPOINT_DIR = '.burstcode/checkpoints';
   private static readonly MAX_FILE_SIZE = 1024 * 1024;
   private static readonly IO_CONCURRENCY = 16;
+  /** Force a full snapshot once a delta chain reaches this depth (caps restore cost). */
+  private static readonly MAX_DELTA_CHAIN = 20;
+  /** Keep roughly this many checkpoints; older whole segments are pruned past it. */
+  private static readonly MAX_CHECKPOINTS = 100;
 
   private static readonly BINARY_EXTENSIONS = new Set([
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.webp', '.tiff', '.tif', '.psd', '.ai',
@@ -173,17 +177,34 @@ export class GitCheckpoint {
     const checkpointDir = path.join(this.getCheckpointDir(wsRoot), createdAt.toString());
     await fs.promises.mkdir(checkpointDir, { recursive: true });
 
+    // Pick the most recent existing checkpoint as a delta base. Only files
+    // modified since the base are snapshotted; the rest are reconstructed from
+    // the base chain at restore time. This keeps each checkpoint small instead
+    // of re-copying the whole tree every time. The chain is periodically
+    // re-based with a full snapshot to cap restore cost (MAX_DELTA_CHAIN).
+    const base = await this.findLatestFileCheckpoint(wsRoot, createdAt);
+    const useDelta = base !== null && base.chainDepth + 1 < GitCheckpoint.MAX_DELTA_CHAIN;
+    const sinceMs = useDelta ? base!.createdAt : 0;
+    const baseRef = useDelta ? base!.ref : undefined;
+    const chainDepth = useDelta ? base!.chainDepth + 1 : 0;
+
     try {
       // Phase 1: parallel directory walk — collect candidate paths
       const candidates = await this.gatherCandidates(wsRoot, wsRoot);
 
-      // Phase 2: concurrent file reads
+      // Phase 2: concurrent file reads. In delta mode, unchanged files (mtime
+      // older than the base checkpoint) are skipped before reading — that is
+      // where the I/O savings come from. `>=` errs toward capturing a file
+      // rather than missing an edit made right at the base boundary.
       const MAX = GitCheckpoint.MAX_FILE_SIZE;
       const readTasks = candidates.map(c => async () => {
         try {
           const stats = await fs.promises.stat(c.fullPath);
           if (stats.size > MAX) {
             this.logger.debug(`Skipping large file ${c.relativePath} (${stats.size} bytes)`);
+            return null;
+          }
+          if (sinceMs > 0 && stats.mtimeMs < sinceMs) {
             return null;
           }
           const content = await fs.promises.readFile(c.fullPath, 'utf-8');
@@ -195,8 +216,19 @@ export class GitCheckpoint {
       const readResults = await GitCheckpoint.runPool(readTasks, GitCheckpoint.IO_CONCURRENCY);
       const files = readResults.filter((f): f is { relativePath: string; content: string } => f !== null);
 
-      // Write manifest (tiny, no need to parallelize)
-      const manifest = { label, createdAt, files: files.map(f => ({ relativePath: f.relativePath })) };
+      // Tombstones: files the base chain still carries but that no longer exist
+      // in the working tree. Recorded so restore drops them instead of
+      // resurrecting deleted files (manifest-only walk — no blob reads).
+      let deleted: string[] = [];
+      if (baseRef) {
+        const baseEffective = await this.resolveCheckpointChain(wsRoot, baseRef, new Set());
+        const currentPaths = new Set(candidates.map(c => c.relativePath));
+        deleted = [...baseEffective.keys()].filter(p => !currentPaths.has(p));
+      }
+
+      // Write manifest (tiny, no need to parallelize). `baseRef` lets restore
+      // walk the delta chain; undefined marks a full snapshot.
+      const manifest = { label, createdAt, baseRef, chainDepth, files: files.map(f => ({ relativePath: f.relativePath })), deleted };
       await fs.promises.writeFile(path.join(checkpointDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
 
       // Phase 3: concurrent checkpoint file writes
@@ -206,13 +238,172 @@ export class GitCheckpoint {
       });
       await GitCheckpoint.runPool(writeTasks, GitCheckpoint.IO_CONCURRENCY);
 
-      this.logger.info('Checkpoint created', { ref, label, fileCount: files.length });
+      this.logger.info('Checkpoint created', { ref, label, fileCount: files.length, baseRef: baseRef ?? null, chainDepth });
+
+      // Bound disk usage by pruning the oldest whole segments past the cap.
+      // Best-effort: a prune failure must not fail checkpoint creation.
+      try {
+        await this.pruneOldCheckpoints(wsRoot);
+      } catch (err) {
+        this.logger.debug(`Checkpoint prune skipped: ${String(err)}`);
+      }
+
       return { ref, sha: '', label, createdAt, isFileBased: true };
     } catch (err) {
       try { await fs.promises.rm(checkpointDir, { recursive: true, force: true }); } catch {}
       const msg = `checkpoint failed: ${err instanceof Error ? err.message : String(err)}`;
       this.logger.warn(msg);
       throw new Error(msg);
+    }
+  }
+
+  /**
+   * Most recent file-based checkpoint strictly older than `beforeMs`, together
+   * with its delta-chain depth. Used to pick a base for incremental snapshots.
+   * Directories without a readable manifest are ignored (not usable as a base).
+   */
+  private async findLatestFileCheckpoint(
+    wsRoot: string,
+    beforeMs: number
+  ): Promise<{ ref: string; createdAt: number; chainDepth: number } | null> {
+    const dir = this.getCheckpointDir(wsRoot);
+    if (!fs.existsSync(dir)) return null;
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+
+    // Inspect candidates newest-first so we read at most one manifest in the
+    // common case.
+    const timestamps = entries
+      .filter(e => e.isDirectory())
+      .map(e => Number(e.name))
+      .filter(ts => Number.isFinite(ts) && ts < beforeMs)
+      .sort((a, b) => b - a);
+
+    for (const ts of timestamps) {
+      const manifestPath = path.join(dir, ts.toString(), 'manifest.json');
+      try {
+        const m = JSON.parse(await fs.promises.readFile(manifestPath, 'utf-8'));
+        const chainDepth = typeof m.chainDepth === 'number' ? m.chainDepth : 0;
+        return { ref: `${GitCheckpoint.FILE_REF_PREFIX}${ts}`, createdAt: ts, chainDepth };
+      } catch {
+        // No valid manifest — skip and try the next-oldest.
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Delete every file-based checkpoint whose timestamp is strictly greater than
+   * `afterMs`. Used on rollback to discard forward history. Chain-safe: a
+   * checkpoint's base is always older than itself, so removing newer ones can
+   * never orphan a checkpoint we keep. Returns the number deleted.
+   */
+  private async deleteForwardCheckpoints(wsRoot: string, afterMs: number): Promise<number> {
+    const dir = this.getCheckpointDir(wsRoot);
+    if (!fs.existsSync(dir)) return 0;
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return 0;
+    }
+    let deleted = 0;
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const ts = Number(e.name);
+      if (!Number.isFinite(ts) || ts <= afterMs) continue;
+      try {
+        await fs.promises.rm(path.join(dir, e.name), { recursive: true, force: true });
+        deleted++;
+      } catch (err) {
+        this.logger.debug(`Failed to delete forward checkpoint ${e.name}: ${String(err)}`);
+      }
+    }
+    return deleted;
+  }
+
+  /** List file-based checkpoints (oldest-first) with the base ref each declares. */
+  private async listFileCheckpointMeta(
+    wsRoot: string
+  ): Promise<Array<{ ts: number; ref: string; baseRef?: string }>> {
+    const dir = this.getCheckpointDir(wsRoot);
+    if (!fs.existsSync(dir)) return [];
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const metas: Array<{ ts: number; ref: string; baseRef?: string }> = [];
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const ts = Number(e.name);
+      if (!Number.isFinite(ts)) continue;
+      let baseRef: string | undefined;
+      try {
+        const m = JSON.parse(await fs.promises.readFile(path.join(dir, e.name, 'manifest.json'), 'utf-8'));
+        baseRef = typeof m.baseRef === 'string' ? m.baseRef : undefined;
+      } catch {
+        // Unreadable manifest — treat as a standalone full snapshot (own segment).
+        baseRef = undefined;
+      }
+      metas.push({ ts, ref: `${GitCheckpoint.FILE_REF_PREFIX}${ts}`, baseRef });
+    }
+    metas.sort((a, b) => a.ts - b.ts);
+    return metas;
+  }
+
+  /**
+   * Prune the oldest whole delta-chain segments once the checkpoint count
+   * exceeds MAX_CHECKPOINTS. A segment starts at a full snapshot (no baseRef)
+   * and runs until the next one; segments are dependency-isolated, so deleting
+   * an entire older segment can never break a newer chain. The newest segment
+   * is always kept. Cheap early-out when under the cap.
+   */
+  private async pruneOldCheckpoints(wsRoot: string): Promise<void> {
+    const cap = GitCheckpoint.MAX_CHECKPOINTS;
+    const dir = this.getCheckpointDir(wsRoot);
+    if (!fs.existsSync(dir)) return;
+
+    // Cheap count first — only pay for manifest reads when actually over cap.
+    let dirCount = 0;
+    try {
+      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+      dirCount = entries.filter(e => e.isDirectory()).length;
+    } catch {
+      return;
+    }
+    if (dirCount <= cap) return;
+
+    const metas = await this.listFileCheckpointMeta(wsRoot);
+
+    // Group into segments: a checkpoint with no baseRef (or the very first one)
+    // begins a new segment.
+    const segments: Array<Array<{ ts: number }>> = [];
+    for (const m of metas) {
+      if (!m.baseRef || segments.length === 0) {
+        segments.push([{ ts: m.ts }]);
+      } else {
+        segments[segments.length - 1].push({ ts: m.ts });
+      }
+    }
+
+    let total = metas.length;
+    while (total > cap && segments.length > 1) {
+      const seg = segments.shift()!;
+      for (const cp of seg) {
+        try {
+          await fs.promises.rm(path.join(dir, cp.ts.toString()), { recursive: true, force: true });
+        } catch (err) {
+          this.logger.debug(`Failed to prune checkpoint ${cp.ts}: ${String(err)}`);
+        }
+      }
+      total -= seg.length;
+      this.logger.info('Pruned old checkpoint segment', { count: seg.length, remaining: total });
     }
   }
 
@@ -339,42 +530,30 @@ export class GitCheckpoint {
     }
 
     try {
-      const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf-8'));
-
-      // Safety snapshot must complete before we start overwriting files.
-      try {
-        await this.createCheckpoint('pre-restore safety snapshot');
-      } catch (err) {
-        this.logger.warn('Pre-restore safety checkpoint failed (continuing with restore)', String(err));
-      }
+      // Compose the full snapshot by walking the delta chain (base → … →
+      // target). Each entry maps a workspace-relative path to the stored
+      // checkpoint blob it should be restored from; newer checkpoints win.
+      const sourceMap = await this.resolveCheckpointChain(wsRoot, ref, new Set());
 
       // Concurrent restore
       const skippedPaths: string[] = [];
-      let restored = 0;
 
-      const restoreTasks = (manifest.files as Array<{ relativePath: string }>).map(file => async () => {
-        const originalPath = path.join(wsRoot, file.relativePath);
-        const encoded = file.relativePath.replace(/[^a-zA-Z0-9._-]/g, '_');
-        const checkpointFilePath = path.join(checkpointDir, encoded);
-
-        if (!fs.existsSync(checkpointFilePath)) {
-          skippedPaths.push(file.relativePath);
-          return false;
-        }
+      const restoreTasks = Array.from(sourceMap.entries()).map(([relativePath, sourcePath]) => async () => {
+        const originalPath = path.join(wsRoot, relativePath);
         try {
-          const content = await fs.promises.readFile(checkpointFilePath, 'utf-8');
+          const content = await fs.promises.readFile(sourcePath, 'utf-8');
           await fs.promises.mkdir(path.dirname(originalPath), { recursive: true });
           await fs.promises.writeFile(originalPath, content);
           return true;
         } catch (err) {
-          this.logger.debug(`Skipped locked/inaccessible file during restore: ${file.relativePath} (${String(err)})`);
-          skippedPaths.push(file.relativePath);
+          this.logger.debug(`Skipped locked/inaccessible file during restore: ${relativePath} (${String(err)})`);
+          skippedPaths.push(relativePath);
           return false;
         }
       });
 
       const results = await GitCheckpoint.runPool(restoreTasks, GitCheckpoint.IO_CONCURRENCY);
-      restored = results.filter(Boolean).length;
+      const restored = results.filter(Boolean).length;
 
       this.logger.info('Restored from checkpoint', { ref, restored, skipped: skippedPaths.length });
       if (skippedPaths.length > 0) {
@@ -383,12 +562,74 @@ export class GitCheckpoint {
           `BurstCode: restored ${restored} file(s), but ${skippedPaths.length} could not be restored (locked or not captured in this checkpoint). See BurstCode output for details.`
         );
       }
+
+      // Rollback discards forward history: delete every checkpoint newer than
+      // the one we restored to. Chain-safe because a checkpoint's base is always
+      // older, so nothing we keep depends on what we delete. No safety net is
+      // retained — by design, a rollback cannot itself be undone.
+      const targetTs = Number(timestamp);
+      if (Number.isFinite(targetTs)) {
+        const removed = await this.deleteForwardCheckpoints(wsRoot, targetTs);
+        if (removed > 0) this.logger.info('Pruned forward checkpoints after rollback', { removed });
+      }
       return true;
     } catch (err) {
       this.logger.error('Restore failed', String(err));
       vscode.window.showErrorMessage(`BurstCode: failed to restore checkpoint: ${String(err)}`);
       return false;
     }
+  }
+
+  /**
+   * Resolve a file-based checkpoint into the full set of files it represents by
+   * overlaying its delta on top of its base chain. Returns a map of
+   * workspace-relative path → absolute path of the stored blob to read from.
+   * Entries closer to the target override those from older bases.
+   *
+   * Degrades gracefully: a missing/corrupt manifest truncates the chain (with a
+   * warning) rather than failing the whole restore. `visited` guards against
+   * cycles in a malformed chain.
+   */
+  private async resolveCheckpointChain(
+    wsRoot: string,
+    ref: string,
+    visited: Set<string>
+  ): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    if (!ref.startsWith(GitCheckpoint.FILE_REF_PREFIX)) return result;
+
+    const timestamp = ref.slice(GitCheckpoint.FILE_REF_PREFIX.length);
+    if (visited.has(timestamp)) {
+      this.logger.warn(`Checkpoint chain cycle detected at ${ref}; stopping.`);
+      return result;
+    }
+    visited.add(timestamp);
+
+    const checkpointDir = path.join(this.getCheckpointDir(wsRoot), timestamp);
+    let manifest: { baseRef?: string; files?: Array<{ relativePath: string }>; deleted?: string[] };
+    try {
+      manifest = JSON.parse(await fs.promises.readFile(path.join(checkpointDir, 'manifest.json'), 'utf-8'));
+    } catch (err) {
+      this.logger.warn(`Checkpoint ${ref} manifest unreadable; chain truncated. (${String(err)})`);
+      return result;
+    }
+
+    // Base first, so this checkpoint's changes override the inherited ones.
+    if (manifest.baseRef) {
+      const baseMap = await this.resolveCheckpointChain(wsRoot, manifest.baseRef, visited);
+      for (const [k, v] of baseMap) result.set(k, v);
+    }
+
+    // Drop files that were deleted from the working tree as of this checkpoint.
+    for (const d of manifest.deleted ?? []) {
+      result.delete(d);
+    }
+
+    for (const file of manifest.files ?? []) {
+      const encoded = file.relativePath.replace(/[^a-zA-Z0-9._-]/g, '_');
+      result.set(file.relativePath, path.join(checkpointDir, encoded));
+    }
+    return result;
   }
 
   private async restoreGitCheckpoint(ref: string): Promise<boolean> {
