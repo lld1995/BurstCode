@@ -104,8 +104,10 @@ export function readChatProfile(): LLMProfile {
 export function readBackgroundProfile(): BackgroundProfile {
   const cfg = vscode.workspace.getConfiguration('burstcode.llm');
   const inheritRaw = cfg.get<boolean>('background.inherit');
-  // Default to inherit:true so a never-touched install just follows chat.
-  const inherit = typeof inheritRaw === 'boolean' ? inheritRaw : true;
+  // Only inherit when the user has explicitly opted in.  An unset value is
+  // treated as false so that a fresh install without a baseURL does not
+  // silently fall back to the chat endpoint.
+  const inherit = inheritRaw === true;
   return { ...readProfile('background'), inherit };
 }
 
@@ -124,12 +126,13 @@ export function readLLMConfig(): LLMConfig {
 /**
  * Resolve the background profile to a fully-specified LLMConfig.
  *
- * Returns `null` when the background profile has `inherit: false` but no
- * `baseURL` has been set — in that case the caller must NOT fall back to the
- * chat endpoint and should skip the background cycle entirely.
+ * Returns `null` when `inherit` is not explicitly `true` and no `baseURL`
+ * has been set — in that case the caller must NOT fall back to the chat
+ * endpoint and should skip the background cycle entirely.
  *
- * When `inherit: true` (the default) the chat profile is used as-is.
- * When `inherit: false` and a `baseURL` is present, empty secondary fields
+ * When the user explicitly sets `inherit: true` the chat profile is used
+ * as-is.  When `inherit: false` (or unset) and a `baseURL` is present,
+ * empty secondary fields
  * (apiKey, model, …) still fall back to the chat profile so the user only
  * has to fill in the parts that differ.
  */
@@ -233,7 +236,10 @@ export async function fetchProfileModels(profile: {
 }): Promise<string[]> {
   const opts: ConstructorParameters<typeof OpenAI>[0] = {
     baseURL: profile.baseURL,
-    apiKey: profile.apiKey || 'no-key'
+    apiKey: profile.apiKey || 'no-key',
+    // Fail fast on broken endpoints — the UI shows a clear error to the
+    // user instead of stalling through three silent SDK retries.
+    maxRetries: 0
   };
   if (profile.allowSelfSignedCerts) {
     opts.httpAgent = new https.Agent({ rejectUnauthorized: false });
@@ -405,7 +411,13 @@ export class OpenAIClient {
   constructor(private readonly config: LLMConfig, private readonly logger: Logger) {
     const opts: ConstructorParameters<typeof OpenAI>[0] = {
       baseURL: config.baseURL,
-      apiKey: config.apiKey || 'no-key'
+      apiKey: config.apiKey || 'no-key',
+      // Disable the SDK's built-in retry loop (default 2). All retry logic
+      // lives in AgentLoop where each attempt emits an `auto-resume` event
+      // so the user can see what's happening. Without this, a flaky endpoint
+      // can produce up to (1 + sdkRetries) × (1 + maxAutoResumes) = 12 silent
+      // HTTP requests per turn with only 3 visible auto-resume pills.
+      maxRetries: 0
     };
     if (config.allowSelfSignedCerts) {
       // Per-client agent so we don't relax TLS globally for the host process.

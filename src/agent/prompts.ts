@@ -131,8 +131,10 @@ const PROTOCOL = `WORKING PROTOCOL:
 7. Optionally call eslint_fix after JS/TS changes.
 
 8. When confident, use the right write tool:
-   • propose_edit — for edits to the user's existing source files. Hunks are queued for
-     the user to accept/reject and are NOT written to disk until then. DOES NOT BLOCK.
+   • propose_edit — for edits to the user's existing source files. Hunks are written to
+     disk EAGERLY (so the user can compile / run with them immediately) and queued for
+     review; Accept just confirms keeping them, Reject rolls the affected hunks back.
+     DOES NOT BLOCK — you may keep verifying (build, test, read_file) right after.
    • write_file — for agent-generated scripts, temp files, or any file the agent will
      immediately execute or read back. Writes to disk instantly, no review step.
 

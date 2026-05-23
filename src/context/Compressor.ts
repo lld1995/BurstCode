@@ -103,8 +103,23 @@ export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig)
     if (zone === 0) continue;
     const cap = ZONE_CAPS[zone];
     const msg = result[i]; // may have been rewritten by reasoning strip above
-    const original = stringifyContent(msg.content);
-    if (original.length <= cap) continue;
+    let original = stringifyContent(msg.content);
+    // For older `read_file` replies, the `   123\t` line-number prefix on
+    // every line is dead weight — the model only needs current line numbers
+    // when it's about to propose_edit, which only happens off the LATEST
+    // read_file (zone 0). Stripping the prefix here roughly halves the byte
+    // cost of historical file reads, leaving more headroom under the cap.
+    if (msg.role === 'tool') {
+      original = stripReadFileLineNumbers(original);
+    }
+    if (original.length <= cap) {
+      // Even if we're under the cap, persist the prefix-stripped version
+      // so the savings stick across subsequent compressMessages passes.
+      if (original !== stringifyContent(msg.content)) {
+        result[i] = { ...msg, content: original } as ChatMessage;
+      }
+      continue;
+    }
     const summarized = summarizeText(original, cap);
     result[i] = { ...msg, content: summarized } as ChatMessage;
   }
@@ -128,6 +143,83 @@ export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig)
   // whose owning `assistant(tool_calls)` was dropped (or vice versa). Strip
   // those orphans so the request validates against the OpenAI schema.
   return sanitizeToolPairing(result);
+}
+
+/**
+ * Strip ANSI / terminal escape sequences. Build tools (npm, cargo, dotnet,
+ * webpack, ...) emit colour codes and cursor-control bytes that are pure
+ * noise once the output is text in a model prompt.
+ */
+function stripAnsi(text: string): string {
+  // CSI sequences (colour, cursor moves), OSC titles, and bare ESC bytes.
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1B\]\d+;[^\x07\x1B]*(?:\x07|\x1B\\)/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1B[@-_]/g, '');
+}
+
+/**
+ * Collapse carriage-return progress bars / spinners (npm, pip, cargo, ...)
+ * to just their final state, then drop near-duplicate consecutive progress
+ * lines that bloat tool output without adding signal.
+ */
+function collapseProgressNoise(text: string): string {
+  // Each \r-segment is a redraw of the same line; only the last one matters.
+  const collapsed = text
+    .split('\n')
+    .map((line) => {
+      if (!line.includes('\r')) return line;
+      const parts = line.split('\r');
+      return parts[parts.length - 1];
+    })
+    .join('\n');
+  // Drop ASCII progress bars like "[=====>       ] 42%" — they convey 0 info
+  // once the build finished.
+  return collapsed.replace(/^\s*\[[=>\- .]+\]\s*\d*%?.*$/gm, '');
+}
+
+/**
+ * Strip the `   123\t` line-number prefix produced by `read_file` (see
+ * `buildReadFileTool` in src/agent/tools/core.ts). The prefix is critical
+ * for the model to address ranges in propose_edit, but only on the LATEST
+ * read_file output — historical reads in older zones don't need it, so we
+ * cut ~6 chars per line to free room for actual code under the zone cap.
+ *
+ * Detection is shape-based (no tool_name on the message) — we only strip
+ * when the content starts with the unmistakable `# <path> (lines N-M of K)`
+ * header that read_file always emits.
+ */
+function stripReadFileLineNumbers(content: string): string {
+  if (!/^# .* \(lines \d+-\d+ of \d+\)/.test(content)) return content;
+  return content.replace(/^ {0,4}\d+\t/gm, '');
+}
+
+/** Head + tail truncation; keeps both ends because shell errors usually
+ * surface in the LAST 1-2 KB while context lives in the first. */
+function truncateMiddle(text: string, headChars: number, tailChars: number): string {
+  if (text.length <= headChars + tailChars + 80) return text;
+  const omitted = text.length - headChars - tailChars;
+  return (
+    text.slice(0, headChars) +
+    `\n...[${omitted} chars elided from middle]...\n` +
+    text.slice(-tailChars)
+  );
+}
+
+/**
+ * Compress one of the `## stdout` / `## stderr` sections inside a run_shell
+ * result body. Strips ANSI, collapses progress lines, then head/tail-caps.
+ * Empty bodies (the literal "(empty)" sentinel) are returned as-is so the
+ * caller can drop the whole section.
+ */
+function compressShellSection(body: string): string {
+  const trimmed = body.trim();
+  if (trimmed === '' || trimmed === '(empty)') return '(empty)';
+  const cleaned = collapseProgressNoise(stripAnsi(body)).replace(/\n{3,}/g, '\n\n');
+  if (cleaned.length <= 3000) return cleaned;
+  return truncateMiddle(cleaned, 1500, 1200);
 }
 
 /**
@@ -163,6 +255,88 @@ export function normalizeToolResult(toolName: string, content: string): string {
   if (toolName === 'list_dir' || toolName === 'workspace_outline') {
     if (content.length > 1500) {
       return content.slice(0, 1500) + `\n...[truncated]`;
+    }
+    return content;
+  }
+
+  // run_shell: the biggest single source of tool_result noise. We:
+  //   1. Strip ANSI colour codes and OSC sequences.
+  //   2. Collapse \r-style progress redraws / ASCII progress bars.
+  //   3. Drop the whole `## stdout` or `## stderr` section when it's empty.
+  //   4. Head+tail-cap each non-empty section at ~2700 chars (errors usually
+  //      live in the tail, command echo in the head).
+  if (toolName === 'run_shell') {
+    // Body layout produced by shell.ts: header lines starting with `#`,
+    // blank line, then alternating `## stdout` / `## stderr` sections.
+    const stdoutMatch = content.match(/^## stdout(?: \(truncated\))?\n([\s\S]*?)(?=\n## stderr|$)/m);
+    const stderrMatch = content.match(/^## stderr(?: \(truncated\))?\n([\s\S]*?)$/m);
+    if (!stdoutMatch && !stderrMatch) {
+      // Unknown shape — fall back to a generic head+tail cap.
+      return content.length > 4000 ? truncateMiddle(content, 2000, 1500) : content;
+    }
+    const headerEnd = stdoutMatch ? stdoutMatch.index ?? 0 : stderrMatch ? stderrMatch.index ?? 0 : 0;
+    const header = content.slice(0, headerEnd).replace(/\n+$/, '');
+    const sections: string[] = [header];
+    if (stdoutMatch) {
+      const body = compressShellSection(stdoutMatch[1] ?? '');
+      if (body !== '(empty)') sections.push(`## stdout\n${body}`);
+    }
+    if (stderrMatch) {
+      const body = compressShellSection(stderrMatch[1] ?? '');
+      if (body !== '(empty)') sections.push(`## stderr\n${body}`);
+    }
+    return sections.join('\n\n');
+  }
+
+  // LSP reference / implementation tools: header + locations + optional
+  // snippets. Snippets dominate the byte count, so cap how many we keep.
+  if (
+    toolName === 'find_references' ||
+    toolName === 'find_references_by_name' ||
+    toolName === 'find_implementations' ||
+    toolName === 'find_definition'
+  ) {
+    if (content.length <= 4000) return content;
+    // Snippets are separated by blank lines after the locations block. We
+    // keep the header + locations in full and clip the snippet tail.
+    const blocks = content.split(/\n\n+/);
+    if (blocks.length <= 3) return truncateMiddle(content, 2500, 1200);
+    const kept = blocks.slice(0, 8);
+    const omitted = blocks.length - kept.length;
+    return kept.join('\n\n') + `\n\n...[${omitted} more snippet block(s) omitted]`;
+  }
+
+  // workspace_symbols / document_symbols: flat lists; cap line count.
+  if (toolName === 'workspace_symbols' || toolName === 'document_symbols') {
+    const lines = content.split('\n');
+    if (lines.length > 82) {
+      return `${lines.slice(0, 80).join('\n')}\n...[${lines.length - 80} more symbol(s) omitted]`;
+    }
+    return content;
+  }
+
+  // hover_info: docstring-heavy markdown; squeeze blank lines and cap.
+  if (toolName === 'hover_info') {
+    const squeezed = content.replace(/\n{3,}/g, '\n\n');
+    if (squeezed.length > 2000) {
+      return squeezed.slice(0, 2000) + `\n...[truncated]`;
+    }
+    return squeezed;
+  }
+
+  // launch_subagent: concatenated per-task reports; keep head + tail so the
+  // overall summary AND the final task's conclusion survive.
+  if (toolName === 'launch_subagent') {
+    if (content.length > 8000) {
+      return truncateMiddle(content, 4500, 3000);
+    }
+    return content;
+  }
+
+  // get_function_range: similar to read_file but always whole-function; cap.
+  if (toolName === 'get_function_range') {
+    if (content.length > 4000) {
+      return content.slice(0, 4000) + `\n...[truncated ${content.length - 4000} chars]`;
     }
     return content;
   }

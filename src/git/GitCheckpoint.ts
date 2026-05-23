@@ -19,7 +19,15 @@ export interface CheckpointInfo {
  */
 export class GitCheckpoint {
   private static readonly REF_PREFIX = 'refs/burstcode/checkpoints/';
-  private repoRootCache: string | null | undefined;
+  /**
+   * Cached git toplevel path. ONLY POSITIVE results are cached — a previous
+   * detection failure (transient `git rev-parse` slowness, AV lock on `.git/`,
+   * workspace folders not yet ready, ...) must NEVER turn into a permanent
+   * "no checkpoints" state for the rest of the extension's lifetime. Caching
+   * `null` like the previous implementation did is what made the rollback
+   * button silently say "no checkpoint" forever after the first hiccup.
+   */
+  private repoRootCache: string | undefined;
 
   constructor(private readonly logger: Logger) {}
 
@@ -30,20 +38,20 @@ export class GitCheckpoint {
   }
 
   private async repoRoot(): Promise<string | undefined> {
-    if (this.repoRootCache !== undefined) {
-      return this.repoRootCache ?? undefined;
-    }
+    if (this.repoRootCache) return this.repoRootCache;
     const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!ws) {
-      this.repoRootCache = null;
-      return undefined;
-    }
+    if (!ws) return undefined;
     try {
       const out = (await this.run(ws, ['rev-parse', '--show-toplevel'])).trim();
-      this.repoRootCache = out || null;
-      return out || undefined;
+      if (out) {
+        this.repoRootCache = out;
+        return out;
+      }
+      return undefined;
     } catch {
-      this.repoRootCache = null;
+      // DON'T cache the failure — let the next call retry. `git rev-parse`
+      // can flake transiently (extension activation race, AV scan, slow disk)
+      // and a single miss must not poison every future checkpoint attempt.
       return undefined;
     }
   }
@@ -54,41 +62,85 @@ export class GitCheckpoint {
   }
 
   /**
-   * Snapshot the working tree into `refs/burstcode/checkpoints/<ts>`.
-   * Returns the new checkpoint info, or undefined if disabled / not a git repo / git failure.
+   * Snapshot the working tree into `refs/burstcode/checkpoints/<ts>` and return
+   * the new checkpoint info. THROWS with a descriptive message on every
+   * failure path so callers (and the user, via the chat banner / rollback
+   * button tooltip) see exactly WHY checkpointing did not happen. Earlier
+   * versions silently returned `undefined`, which is what made "始终没有
+   * checkpoint" un-diagnosable: the user had no way to tell apart
+   * "setting off", "not a git repo", "empty repo", or "git command failed".
+   *
+   * Callers should `try { … } catch (err) { … }` and surface `err.message`.
    */
-  async createCheckpoint(label: string): Promise<CheckpointInfo | undefined> {
-    if (!this.isEnabled()) return undefined;
+  async createCheckpoint(label: string): Promise<CheckpointInfo> {
+    if (!this.isEnabled()) {
+      const msg = 'burstcode.git.autoCheckpoint is disabled';
+      this.logger.warn(`Git checkpoint skipped: ${msg} — rollback button will be unavailable.`);
+      throw new Error(msg);
+    }
     const root = await this.repoRoot();
-    if (!root) return undefined;
+    if (!root) {
+      const msg = 'workspace is not a git repository';
+      this.logger.warn(`Git checkpoint skipped: ${msg} (git rev-parse --show-toplevel failed).`);
+      throw new Error(msg);
+    }
 
+    const message = `BurstCode checkpoint: ${label}`.replace(/\r?\n/g, ' ').slice(0, 200);
+    let sha = '';
+    let stashErr: string | undefined;
     try {
-      const message = `BurstCode checkpoint: ${label}`.replace(/\r?\n/g, ' ').slice(0, 200);
-      let sha = '';
-      try {
-        sha = (await this.run(root, ['stash', 'create', message])).trim();
-      } catch (err) {
-        // `stash create` fails on a fresh repo with no commits; fall through to HEAD lookup.
-        this.logger.debug('git stash create failed', String(err));
-      }
-      if (!sha) {
-        try {
-          sha = (await this.run(root, ['rev-parse', 'HEAD'])).trim();
-        } catch {
-          // No HEAD yet (empty repo). Nothing to snapshot.
-          return undefined;
-        }
-      }
-      if (!sha) return undefined;
-
-      const createdAt = Date.now();
-      const ref = `${GitCheckpoint.REF_PREFIX}${createdAt}`;
-      await this.run(root, ['update-ref', '-m', message, ref, sha]);
-      this.logger.info('Git checkpoint created', { ref, sha: sha.slice(0, 12), label });
-      return { ref, sha, label, createdAt };
+      // `-u` so the snapshot also covers UNTRACKED files (brand-new files
+      // created by `propose_edit` / `write_file`). Without `-u`, rollback
+      // would leave any agent-created files behind on disk.
+      sha = (await this.run(root, ['stash', 'create', '-u', message])).trim();
     } catch (err) {
-      this.logger.warn('Failed to create git checkpoint', String(err));
-      return undefined;
+      // `stash create` can fail on a fresh repo with no commits; we'll fall
+      // back to HEAD below, but keep the error for the final throw.
+      stashErr = err instanceof Error ? err.message : String(err);
+      this.logger.debug('git stash create -u failed', stashErr);
+    }
+    if (!sha) {
+      // Working tree is clean (and no untracked files) — snapshot HEAD instead.
+      try {
+        sha = (await this.run(root, ['rev-parse', 'HEAD'])).trim();
+      } catch (err) {
+        const headErr = err instanceof Error ? err.message : String(err);
+        const msg = `empty repository or no HEAD commit (${headErr})`;
+        this.logger.warn(`Git checkpoint skipped: ${msg}`);
+        throw new Error(msg);
+      }
+    }
+    if (!sha) {
+      const msg = stashErr
+        ? `could not resolve a snapshot SHA (stash create: ${stashErr})`
+        : 'could not resolve a snapshot SHA';
+      this.logger.warn(`Git checkpoint skipped: ${msg}`);
+      throw new Error(msg);
+    }
+
+    const createdAt = Date.now();
+    const ref = `${GitCheckpoint.REF_PREFIX}${createdAt}`;
+    try {
+      await this.run(root, ['update-ref', '-m', message, ref, sha]);
+    } catch (err) {
+      const msg = `git update-ref failed: ${err instanceof Error ? err.message : String(err)}`;
+      this.logger.warn(`Git checkpoint failed: ${msg}`);
+      throw new Error(msg);
+    }
+    this.logger.info('Git checkpoint created', { ref, sha: sha.slice(0, 12), label });
+    return { ref, sha, label, createdAt };
+  }
+
+  /** True iff a ref under `refs/burstcode/checkpoints/` still resolves. */
+  async refExists(ref: string): Promise<boolean> {
+    if (!ref || !ref.startsWith(GitCheckpoint.REF_PREFIX)) return false;
+    const root = await this.repoRoot();
+    if (!root) return false;
+    try {
+      const out = (await this.run(root, ['rev-parse', '--verify', '--quiet', ref])).trim();
+      return out.length > 0;
+    } catch {
+      return false;
     }
   }
 
@@ -135,9 +187,16 @@ export class GitCheckpoint {
       vscode.window.showErrorMessage('BurstCode: workspace is not a git repository.');
       return false;
     }
+    // Save uncommitted state into another checkpoint first so the user doesn't
+    // lose work. Failure here is non-fatal — proceed to the actual restore so
+    // the user's explicit request still goes through (and they were warned via
+    // logger.warn from inside createCheckpoint).
     try {
-      // Save uncommitted state into another checkpoint first so the user doesn't lose work.
       await this.createCheckpoint('pre-restore safety snapshot');
+    } catch (err) {
+      this.logger.warn('Pre-restore safety checkpoint failed (continuing with restore)', String(err));
+    }
+    try {
       await this.run(root, ['checkout', ref, '--', '.']);
       this.logger.info('Restored from checkpoint', { ref });
       return true;

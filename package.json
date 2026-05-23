@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.30",
+  "version": "0.1.31",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -201,37 +201,44 @@
         },
         "burstcode.llm.background.inherit": {
           "type": "boolean",
-          "default": true,
-          "description": "Background profile · when true, the Background Explorer uses the same configuration as the chat profile. Uncheck to override the fields below."
+          "default": false,
+          "order": 20,
+          "markdownDescription": "**Background profile** · When enabled, the Background Explorer uses the same endpoint/model as the chat profile. Leave disabled and set `#burstcode.llm.background.baseURL#` to use a separate endpoint."
         },
         "burstcode.llm.background.baseURL": {
           "type": "string",
           "default": "",
+          "order": 21,
           "description": "Background profile · OpenAI-compatible base URL. Leave empty to inherit from the chat profile when `inherit` is false."
         },
         "burstcode.llm.background.apiKey": {
           "type": "string",
           "default": "",
+          "order": 22,
           "description": "Background profile · API key. Leave empty to inherit from the chat profile when `inherit` is false."
         },
         "burstcode.llm.background.model": {
           "type": "string",
           "default": "",
+          "order": 23,
           "description": "Background profile · model id used for background analysis. Leave empty to fall back to the first entry of `models`, then the chat model."
         },
         "burstcode.llm.background.temperature": {
           "type": "number",
           "default": 0.2,
+          "order": 24,
           "description": "Background profile · sampling temperature."
         },
         "burstcode.llm.background.contextWindow": {
           "type": "number",
           "default": 32768,
+          "order": 25,
           "description": "Background profile · total context window in tokens."
         },
         "burstcode.llm.background.allowSelfSignedCerts": {
           "type": "boolean",
           "default": false,
+          "order": 26,
           "description": "Background profile · skip TLS certificate verification for the baseURL."
         },
         "burstcode.llm.background.models": {
@@ -240,6 +247,7 @@
             "type": "string"
           },
           "default": [],
+          "order": 27,
           "description": "Background profile · manually-curated model ids for the picker."
         },
         "burstcode.git.autoCheckpoint": {

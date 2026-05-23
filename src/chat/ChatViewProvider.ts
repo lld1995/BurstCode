@@ -143,6 +143,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * reloads so opened tabs survive a VS Code restart.
    */
   private openTabIds = new Set<string>();
+  /**
+   * One-shot guard for the "checkpoint creation failed" popup. Once shown for
+   * the current extension session we silently log subsequent failures and let
+   * the rollback-button tooltip carry the per-message reason instead of
+   * spamming the user with a popup on every prompt.
+   */
+  private checkpointFailureNotified = false;
   private configSub?: vscode.Disposable;
   private pendingEditsSub?: vscode.Disposable;
   private readonly sessions: SessionStore;
@@ -815,9 +822,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * Restore the working tree to the snapshot captured before a previous user
    * prompt was processed. Also truncates the session transcript back to that
    * point so the chat history stays consistent with the code on disk.
+   *
+   * `ref` may be empty when no git checkpoint was captured for this prompt
+   * (auto-checkpoint disabled, not a git repo, runtime failure, or an old
+   * session persisted before checkpointing existed). In that case we fall
+   * back to chat-only truncation behind an explicit confirmation so the
+   * user understands that the code state is NOT being restored.
    */
   private async rollbackToCheckpoint(ref: string, messageIndex: number): Promise<void> {
-    if (!ref || !this.currentSession || !Number.isFinite(messageIndex) || messageIndex < 0) {
+    if (!this.currentSession || !Number.isFinite(messageIndex) || messageIndex < 0) {
       vscode.window.showWarningMessage('BurstCode: nothing to roll back to.');
       return;
     }
@@ -834,19 +847,50 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (choice !== 'Discard & Roll Back') return;
       await this.applier.rejectAll();
     }
-    const confirm = await vscode.window.showWarningMessage(
-      'Roll back the working tree to the state right before this prompt? Conversation after this point will also be removed. Your current working tree will first be saved as a safety checkpoint.',
-      { modal: true },
-      'Roll Back'
-    );
-    if (confirm !== 'Roll Back') return;
 
-    const ok = await this.gitCheckpoint.restoreCheckpoint(ref);
-    if (!ok) return;
+    // Re-verify the ref still resolves before claiming we can restore disk
+    // state. `git gc` / `git reflog expire` / a manual `update-ref -d` could
+    // have clobbered the ref between when we wrote it and when the user
+    // clicks rollback (e.g. across a long-lived VS Code session). Failing
+    // verification here downgrades the action to chat-only truncation
+    // BEFORE the modal so the user is asked the right question.
+    let hasCheckpoint = !!ref;
+    if (hasCheckpoint && !(await this.gitCheckpoint.refExists(ref))) {
+      this.logger.warn('Rollback ref no longer exists in git — downgrading to chat-only', { ref });
+      hasCheckpoint = false;
+    }
+    const confirmPrompt = hasCheckpoint
+      ? 'Roll back the working tree to the state right before this prompt? Conversation after this point will also be removed. Your current working tree will first be saved as a safety checkpoint.'
+      : 'No git checkpoint was captured for this prompt, so the code on disk CANNOT be restored. Only the chat history will be truncated back to this point. Continue?';
+    const confirmLabel = hasCheckpoint ? 'Roll Back' : 'Truncate Chat Only';
+    const confirm = await vscode.window.showWarningMessage(
+      confirmPrompt,
+      { modal: true },
+      confirmLabel
+    );
+    if (confirm !== confirmLabel) return;
+
+    if (hasCheckpoint) {
+      const ok = await this.gitCheckpoint.restoreCheckpoint(ref);
+      if (!ok) return;
+    }
 
     const session = this.currentSession;
+    // Capture the text of the user message we're rolling back BEFORE we
+    // slice it out, so we can pre-fill the composer with it (Cursor-style
+    // edit-and-resend). The message at `messageIndex` is guaranteed to be
+    // a user message because that's the only kind that exposes a rollback
+    // button in the webview.
+    const rolledBackMsg = session.messages[messageIndex];
+    const prefillText =
+      rolledBackMsg && rolledBackMsg.role === 'user' && typeof rolledBackMsg.content === 'string'
+        ? rolledBackMsg.content
+        : '';
+
     session.messages = session.messages.slice(0, messageIndex);
-    session.checkpoints = (session.checkpoints ?? []).filter((c) => c.ref !== ref && c.messageIndex < messageIndex);
+    session.checkpoints = (session.checkpoints ?? []).filter(
+      (c) => (!ref || c.ref !== ref) && c.messageIndex < messageIndex
+    );
     session.plan = [];
     await this.persistCurrentSession();
 
@@ -861,7 +905,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         plan: session.plan ?? []
       }
     });
-    vscode.window.showInformationMessage('BurstCode: rolled back to the previous prompt.');
+    // Drop the rolled-back prompt back into the composer so the user can
+    // tweak it and resend instead of retyping the whole thing.
+    if (prefillText) {
+      this.post({ type: 'prefill-composer', payload: { text: prefillText } });
+    }
+    vscode.window.showInformationMessage(
+      hasCheckpoint
+        ? 'BurstCode: rolled back code & chat to the previous prompt.'
+        : 'BurstCode: chat history truncated. Code on disk was NOT restored — no checkpoint was available.'
+    );
   }
 
   private async runAgent(userText: string): Promise<void> {
@@ -907,19 +960,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // building the workspace-outline-augmented system prompt (filesystem
     // walk, also hundreds of ms). They are independent so we don't pay for
     // them serially before the LLM stream starts.
-    const checkpointPromise: Promise<CheckpointInfo | undefined> = (async () => {
+    //
+    // `createCheckpoint` now THROWS on failure with a descriptive message
+    // (was: silently returned undefined). We surface that message through
+    // to the rollback button's title so a broken checkpoint state is
+    // diagnosable from the chat panel itself rather than requiring the user
+    // to open the BurstCode output channel.
+    const checkpointPromise: Promise<
+      { info: CheckpointInfo } | { error: string }
+    > = (async () => {
       try {
-        return await this.gitCheckpoint.createCheckpoint(`prompt: ${deriveTitle(userText)}`);
+        const info = await this.gitCheckpoint.createCheckpoint(`prompt: ${deriveTitle(userText)}`);
+        return { info };
       } catch (err) {
-        this.logger.warn('Failed to create per-prompt checkpoint', String(err));
-        return undefined;
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.warn('Failed to create per-prompt checkpoint', message);
+        return { error: message };
       }
     })();
     const systemPromptPromise = this.buildSystemPromptForRun();
 
     let checkpointRef: string | undefined;
-    const cp = await checkpointPromise;
-    if (cp) {
+    let checkpointError: string | undefined;
+    const cpResult = await checkpointPromise;
+    if ('info' in cpResult) {
+      const cp = cpResult.info;
       checkpointRef = cp.ref;
       const entry: SessionCheckpoint = {
         messageIndex,
@@ -929,11 +994,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         label: cp.label
       };
       session.checkpoints = [...(session.checkpoints ?? []), entry];
+    } else {
+      checkpointError = cpResult.error;
+      // One-shot popup the very first time per extension session so the user
+      // notices a broken setup right away. Subsequent failures only re-log;
+      // the rollback button's tooltip already shows the reason inline.
+      if (!this.checkpointFailureNotified) {
+        this.checkpointFailureNotified = true;
+        void vscode.window.showWarningMessage(
+          `BurstCode: rollback unavailable — git checkpoint failed (${checkpointError}). See BurstCode output for details.`
+        );
+      }
     }
 
     postLive({
       type: 'user-message',
-      payload: { text: userText, messageIndex, checkpointRef }
+      payload: { text: userText, messageIndex, checkpointRef, checkpointError }
     });
     if (isActive()) this.broadcastContextUsage();
     void this.persistSession(session);
@@ -1459,9 +1535,9 @@ setTimeout(() => {
   .msg.user { display: flex; gap: 8px; padding: 6px 10px; background: var(--vscode-textBlockQuote-background); border-left: 2px solid var(--vscode-textLink-foreground); border-radius: 0 4px 4px 0; line-height: 1.5; word-wrap: break-word; opacity: 0.95; position: relative; }
   .msg.user .gutter { color: var(--vscode-textLink-foreground); font-weight: 700; flex-shrink: 0; user-select: none; }
   .msg.user .body { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
-  .msg.user .rollback-btn { flex-shrink: 0; background: transparent; border: 1px solid transparent; color: var(--vscode-descriptionForeground); cursor: pointer; padding: 2px 6px; border-radius: 4px; font-size: 0.78em; opacity: 0; transition: opacity 0.15s, background 0.15s, color 0.15s; display: inline-flex; align-items: center; gap: 3px; align-self: flex-start; }
-  .msg.user:hover .rollback-btn { opacity: 0.75; }
-  .msg.user .rollback-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); border-color: var(--vscode-panel-border); }
+  .msg.user .rollback-btn { flex-shrink: 0; background: transparent; border: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); cursor: pointer; padding: 2px 6px; border-radius: 4px; font-size: 0.78em; opacity: 0.55; transition: opacity 0.15s, background 0.15s, color 0.15s; display: inline-flex; align-items: center; gap: 3px; align-self: flex-start; }
+  .msg.user:hover .rollback-btn { opacity: 0.9; }
+  .msg.user .rollback-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
   .msg.user .rollback-btn svg { width: 11px; height: 11px; }
 
   /* Assistant: clean prose, no bubble. Rendered as Markdown. */
@@ -1756,8 +1832,8 @@ setTimeout(() => {
       </div>
       <div class="actions">
         <button class="review" id="pendingReviewBtn" title="Open the diff editor">Review</button>
-        <button class="reject" id="pendingRejectBtn" title="Discard all queued edits">Reject All</button>
-        <button class="accept" id="pendingAcceptBtn" title="Apply all queued edits">Accept All</button>
+        <button class="reject" id="pendingRejectBtn" title="Roll the file(s) back to their pre-edit state">Reject All</button>
+        <button class="accept" id="pendingAcceptBtn" title="Keep the edits already written to disk">Accept All</button>
       </div>
     </div>
     <div class="file-list" id="pendingFileList"></div>
@@ -2962,7 +3038,7 @@ function showEmptyState() {
   log.appendChild(wrap);
 }
 
-function addUserMsg(text, messageIndex, checkpointRef) {
+function addUserMsg(text, messageIndex, checkpointRef, checkpointError) {
   clearEmptyState();
   const el = document.createElement('div');
   el.className = 'msg user';
@@ -2978,13 +3054,32 @@ function addUserMsg(text, messageIndex, checkpointRef) {
   el.appendChild(gutter);
   el.appendChild(body);
 
-  if (checkpointRef && typeof messageIndex === 'number') {
+  // Always surface a rollback affordance on user messages — earlier
+  // versions only rendered the button when a git checkpointRef was
+  // captured, which silently hid the feature whenever git checkpointing
+  // was disabled, failed at runtime, or the session was saved before
+  // checkpoints existed (old sessions). We now show the button
+  // unconditionally and degrade gracefully when no checkpoint is
+  // available: the click handler is the same, but the backend falls
+  // back to chat-only truncation after an explicit confirmation.
+  if (typeof messageIndex === 'number') {
     const btn = document.createElement('button');
     btn.className = 'rollback-btn';
-    btn.title = 'Roll back code & chat to the state before this prompt';
+    // Tooltip carries the exact reason when checkpointing failed (passed up
+    // from GitCheckpoint.createCheckpoint via the user-message payload), so
+    // the user can diagnose a broken setup without opening the output panel.
+    btn.title = checkpointRef
+      ? 'Roll back code & chat to the state right before this prompt'
+      : checkpointError
+        ? 'No git checkpoint for this prompt (' + checkpointError + ') — click to truncate chat history only'
+        : 'No git checkpoint captured for this prompt — click to truncate chat history only';
+    if (!checkpointRef) btn.dataset.chatOnly = 'true';
     btn.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8a5 5 0 1 0 1.5-3.5"/><path d="M3 3v3h3"/></svg><span>Rollback</span>';
     btn.addEventListener('click', () => {
-      vscode.postMessage({ type: 'rollback', payload: { ref: checkpointRef, messageIndex } });
+      vscode.postMessage({
+        type: 'rollback',
+        payload: { ref: checkpointRef || '', messageIndex }
+      });
     });
     el.appendChild(btn);
   }
@@ -3164,6 +3259,18 @@ window.addEventListener('message', (e) => {
       replayLiveState(msg.payload || {});
       break;
     }
+    case 'prefill-composer': {
+      // Sent after a rollback so the user can edit-and-resend the prompt
+      // that just got truncated, instead of retyping it from scratch.
+      const t = (msg.payload && typeof msg.payload.text === 'string') ? msg.payload.text : '';
+      input.value = t;
+      autosizeInput();
+      input.focus();
+      // Drop the caret at the end so the user can keep typing immediately.
+      const len = input.value.length;
+      try { input.setSelectionRange(len, len); } catch { /* not focused yet */ }
+      break;
+    }
     case 'plan-update':
       renderPlan(msg.payload.steps || []);
       break;
@@ -3188,7 +3295,12 @@ window.addEventListener('message', (e) => {
       break;
     }
     case 'user-message':
-      addUserMsg(msg.payload.text, msg.payload.messageIndex, msg.payload.checkpointRef);
+      addUserMsg(
+        msg.payload.text,
+        msg.payload.messageIndex,
+        msg.payload.checkpointRef,
+        msg.payload.checkpointError
+      );
       break;
     case 'run-start': {
       activeAssistantEl = null;

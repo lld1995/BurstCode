@@ -407,17 +407,28 @@ export class AgentLoop {
         reasoningText = '';
         toolCallAccumulator.clear();
         finishReason = undefined;
+        // Overall timeout for the LLM stream: if chunks stop arriving for
+        // 120s, treat it as a stream error and either retry or surface it.
+        // This prevents the for-await from hanging forever on a half-open
+        // connection or a slow LLM.
+        const STREAM_TIMEOUT_MS = 120_000;
+        // Sentinel distinguishes a real iterator end from a timeout expiry.
+        // Using { done: true } for both would silently treat timeout as
+        // normal completion (the timeout throw below would be dead code).
+        const STREAM_TIMEOUT_SENTINEL = Symbol('stream-timeout');
+        // Hoisted so the `finally` below can clean up the generator on any
+        // non-natural exit (timeout, mid-stream cancellation, thrown error).
+        // Without that cleanup, every leaked iterator keeps the underlying
+        // OpenAI HTTP socket open while the next auto-resume opens a fresh
+        // one — the server then sees N concurrent identical requests on
+        // the wire, exactly the "大量并发相同的请求" symptom.
+        const streamIter = this.client.streamChat(
+          compressed,
+          this.toolDefs(),
+          cancellation
+        )[Symbol.asyncIterator]();
+        let streamConsumed = false;
         try {
-          // Overall timeout for the LLM stream: if chunks stop arriving for
-          // 120s, treat it as a stream error and either retry or surface it.
-          // This prevents the for-await from hanging forever on a half-open
-          // connection or a slow LLM.
-          const STREAM_TIMEOUT_MS = 120_000;
-          // Sentinel distinguishes a real iterator end from a timeout expiry.
-          // Using { done: true } for both would silently treat timeout as
-          // normal completion (the timeout throw below would be dead code).
-          const STREAM_TIMEOUT_SENTINEL = Symbol('stream-timeout');
-          const streamIter = this.client.streamChat(compressed, this.toolDefs(), cancellation)[Symbol.asyncIterator]();
           let streamDone = false;
           while (!streamDone) {
             if (cancellation.isCancellationRequested) break;
@@ -431,6 +442,7 @@ export class AgentLoop {
               throw new Error(`LLM stream timed out after ${STREAM_TIMEOUT_MS}ms`);
             }
             if (result.done) {
+              streamConsumed = true;
               streamDone = true;
               break;
             }
@@ -507,6 +519,21 @@ export class AgentLoop {
           if (cancelled) {
             yield { type: 'done', payload: { reason: 'cancelled' } };
             return;
+          }
+        } finally {
+          // Clean up the inner generator on any non-natural exit (timeout
+          // throw, mid-stream cancellation break, thrown SDK error). This
+          // propagates through `streamChat`'s `for await`, which fires the
+          // OpenAI SDK's AbortController and closes the HTTP socket on the
+          // wire — otherwise each auto-resume leaves the previous request
+          // hanging server-side and the user observes many concurrent
+          // identical requests instead of a single in-flight one.
+          if (!streamConsumed) {
+            try {
+              await streamIter.return?.(undefined);
+            } catch {
+              /* cleanup errors are not actionable */
+            }
           }
         }
       }

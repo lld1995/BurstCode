@@ -270,20 +270,7 @@ export class HunkApplier implements vscode.Disposable {
       const entry = this.pending.get(firstNewlyQueuedUri.toString());
       if (entry) {
         try {
-          if (entry.isNewFile) {
-            // Nothing exists on disk yet — a 2-pane diff would render "File
-            // not found" on the right. Show the proposed virtual document
-            // directly; CodeLenses still work because the diff-preview
-            // scheme is registered with the CodeLens provider.
-            await vscode.window.showTextDocument(entry.proposedUri, { preview: true });
-          } else {
-            await vscode.commands.executeCommand(
-              'vscode.diff',
-              entry.uri,
-              entry.proposedUri,
-              `BurstCode • ${path.basename(entry.uri.fsPath)} (Current ↔ Proposed)`
-            );
-          }
+          await this.openDiffForEntry(entry);
         } catch (err) {
           this.logger.warn('Failed to open initial diff editor', String(err));
         }
@@ -348,18 +335,19 @@ export class HunkApplier implements vscode.Disposable {
    * Lazily run the per-cycle preamble exactly once across all concurrent
    * `proposeEdits` callers. The promise is cleared in `flushFileIfDone` once
    * the pending set drains, which is what defines a "cycle" for us.
+   *
+   * Historical note: this used to also create a `pre-edit • <summary>` git
+   * checkpoint, but that checkpoint was an ORPHAN — not tied to any chat
+   * message, only reachable via the `burstcode.restoreCheckpoint` quick-pick,
+   * and (worse) captured the working tree AFTER any `write_file` / `run_shell`
+   * earlier in the same turn had already mutated it. The per-prompt checkpoint
+   * created in `ChatViewProvider.runAgent` strictly dominates it (runs before
+   * the LLM has emitted any tool call) so the orphan one was removed. The
+   * cycle-init scaffolding is kept so future preamble work has a place to go.
    */
-  private ensureCycleInit(summary: string): Promise<void> {
+  private ensureCycleInit(_summary: string): Promise<void> {
     if (this.cycleInitPromise) return this.cycleInitPromise;
-    this.cycleInitPromise = (async () => {
-      if (this.gitCheckpoint && this.pending.size === 0) {
-        try {
-          await this.gitCheckpoint.createCheckpoint(`pre-edit • ${summary}`);
-        } catch (err) {
-          this.logger.warn('Pre-edit checkpoint failed', String(err));
-        }
-      }
-    })();
+    this.cycleInitPromise = Promise.resolve();
     return this.cycleInitPromise;
   }
 
@@ -559,6 +547,13 @@ export class HunkApplier implements vscode.Disposable {
     // exist — this way a thrown overlap rejection above leaves `this.pending`
     // completely untouched, so the tool error message ("No hunks were queued")
     // is true and concurrent calls on other files don't see torn state.
+    //
+    // The virtual `proposedUri` is registered with the FROZEN original
+    // content (not the modified one). It becomes the LEFT side of the diff
+    // editor; the live file on disk (which we update eagerly below) is the
+    // RIGHT side. This is what lets the user compile/run with the proposed
+    // changes BEFORE explicitly accepting them — the disk file is already
+    // the post-edit view.
     let entry: PendingFile;
     let newlyQueued: vscode.Uri | undefined;
     if (!existingEntry) {
@@ -637,18 +632,104 @@ export class HunkApplier implements vscode.Disposable {
     entry.hunks.push(...newPending);
 
     // Recompute modified content from the cached original + every
-    // pending/accepted hunk, applied bottom-up so ranges stay valid.
-    const stack = entry.hunks
-      .filter((h) => h.status === 'pending' || h.status === 'accepted')
+    // non-rejected hunk and write it to disk eagerly so the user can
+    // compile / run with the proposed changes before accepting them.
+    // Per-hunk reject calls `syncDiskToModified` again to roll the file
+    // back hunk-by-hunk; `acceptAll` is a no-op on disk because the
+    // accepted state is what's already there.
+    await this.syncDiskToModified(entry);
+    return newlyQueued;
+  }
+
+  /**
+   * Compute the desired live disk state for `entry` (original + every
+   * non-rejected hunk) and write it. This is the core of the
+   * "changes-on-disk-before-accept" flow:
+   *   - On propose_edit: writes the proposed view so the user can build/run.
+   *   - On rejectHunk / rejectAll: writes the view minus the rejected hunks
+   *     so the file rolls back to its pre-edit shape (or to whatever still
+   *     remains accepted/pending).
+   *   - On acceptHunk / acceptAll: NOT called, because the disk already
+   *     matches the desired post-accept state (we never added the rejected
+   *     hunks in the first place, and accepts don't change inclusion).
+   *
+   * For brand-new files (never existed before this propose_edit cycle),
+   * we delete the file from disk when no non-rejected hunks remain — the
+   * user rejected the only thing keeping the file around. Existing files
+   * are rewritten via `WorkspaceEdit.replace` over the full document range
+   * so any open editor refreshes in place and the change is undoable.
+   */
+  private async syncDiskToModified(entry: PendingFile): Promise<void> {
+    const nonRejected = entry.hunks
+      .filter((h) => h.status !== 'rejected')
       .map((h) => h.hunk)
       .sort((a, b) => b.startLine - a.startLine);
-    let modified = entry.originalContent;
-    for (const h of stack) modified = applyHunkToText(modified, h, entry.eol);
-    entry.modifiedContent = modified;
-    // Re-register with the new content; this fires onDidChange on the diff
-    // provider and existing diff editors refresh in place.
-    this.diffPreview.registerProposed(uri, modified);
-    return newlyQueued;
+    let composed = entry.originalContent;
+    for (const h of nonRejected) composed = applyHunkToText(composed, h, entry.eol);
+    entry.modifiedContent = composed;
+
+    if (entry.isNewFile && nonRejected.length === 0) {
+      // Brand-new file with no edits left: clean up disk too. The file may
+      // or may not exist depending on whether a previous propose_edit in
+      // this cycle already wrote it; either way `fs.delete` is best-effort.
+      try {
+        await vscode.workspace.fs.delete(entry.uri);
+        this.logger.info('Removed brand-new file (no edits remain)', {
+          uri: entry.uri.toString()
+        });
+      } catch {
+        /* never existed on disk; nothing to undo */
+      }
+      return;
+    }
+
+    let exists = true;
+    try {
+      await vscode.workspace.fs.stat(entry.uri);
+    } catch {
+      exists = false;
+    }
+
+    if (!exists) {
+      // First-time write for a brand-new file. `applyEdit` can't operate
+      // on a non-existent document, so we go through the FS API and
+      // create the parent directory first.
+      try {
+        await ensureParentDir(entry.uri);
+        await vscode.workspace.fs.writeFile(entry.uri, Buffer.from(composed, 'utf8'));
+        this.logger.info('Created file with proposed edits', {
+          uri: entry.uri.toString(),
+          hunks: nonRejected.length
+        });
+      } catch (err) {
+        vscode.window.showErrorMessage(
+          `BurstCode: failed to write ${path.basename(entry.uri.fsPath)}: ${String(err)}`
+        );
+      }
+      return;
+    }
+
+    // Existing file: replace the full document range via WorkspaceEdit so
+    // any open editor stays in sync and the user can Ctrl+Z to walk back
+    // through propose / reject cycles.
+    try {
+      const doc = await vscode.workspace.openTextDocument(entry.uri);
+      const fullRange = fullDocumentRange(doc);
+      const wsEdit = new vscode.WorkspaceEdit();
+      wsEdit.replace(entry.uri, fullRange, composed);
+      const ok = await vscode.workspace.applyEdit(wsEdit);
+      if (ok) {
+        await doc.save();
+      } else {
+        vscode.window.showErrorMessage(
+          `BurstCode: failed to write proposed edits to ${path.basename(entry.uri.fsPath)}.`
+        );
+      }
+    } catch (err) {
+      vscode.window.showErrorMessage(
+        `BurstCode: failed to write ${path.basename(entry.uri.fsPath)}: ${String(err)}`
+      );
+    }
   }
 
   /** Open the diff editor for the first file with pending hunks (Review button). */
@@ -675,18 +756,16 @@ export class HunkApplier implements vscode.Disposable {
   }
 
   private async openDiffForEntry(entry: PendingFile): Promise<void> {
-    if (entry.isNewFile) {
-      // Brand-new file: nothing on disk to compare against, so open the
-      // proposed virtual document directly. CodeLenses still work because
-      // the diff-preview scheme is registered with the CodeLens provider.
-      await vscode.window.showTextDocument(entry.proposedUri, { preview: true });
-      return;
-    }
+    // Diff layout: LEFT = frozen original snapshot, RIGHT = live file on
+    // disk (which has been eagerly updated with the proposed edits so the
+    // user can compile/run before deciding). For brand-new files the
+    // original is an empty document, which renders as an all-additions diff
+    // — useful preview rather than a confusing "file not found" pane.
     await vscode.commands.executeCommand(
       'vscode.diff',
-      entry.uri,
       entry.proposedUri,
-      `BurstCode • ${path.basename(entry.uri.fsPath)} (Current ↔ Proposed)`
+      entry.uri,
+      `BurstCode • ${path.basename(entry.uri.fsPath)} (Original ↔ Current)`
     );
   }
 
@@ -694,8 +773,9 @@ export class HunkApplier implements vscode.Disposable {
     // Two-phase lookup: an initial lookup gives us the file URI for locking;
     // we re-lookup INSIDE the lock to ensure the hunk still exists (another
     // concurrent decision could have flushed it out from under us between
-    // the two steps). Run the status flip + flush under the file's lock so
-    // an in-flight propose_edit can't race with the entry deletion.
+    // the two steps). Accept is a no-op on disk — the disk already includes
+    // the pending hunk because propose_edit wrote it eagerly. We just flip
+    // the status and (if all hunks are now decided) clean up the entry.
     const initial = this.findHunkById(hunkId);
     if (!initial) return;
     await this.withFileLock(initial.file.uri.toString(), async () => {
@@ -708,12 +788,17 @@ export class HunkApplier implements vscode.Disposable {
   }
 
   async rejectHunk(hunkId: string): Promise<void> {
+    // Reject flips status AND rolls the live disk file back: we recompute
+    // modifiedContent excluding this hunk and write it out. If the file
+    // was brand-new and this was the last non-rejected hunk, the file is
+    // deleted from disk in `syncDiskToModified`.
     const initial = this.findHunkById(hunkId);
     if (!initial) return;
     await this.withFileLock(initial.file.uri.toString(), async () => {
       const target = this.findHunkById(hunkId);
       if (!target) return; // raced — already drained
       target.hunk.status = 'rejected';
+      await this.syncDiskToModified(target.file);
       await this.flushFileIfDone(target.file);
     });
     this.emitDecision();
@@ -724,7 +809,8 @@ export class HunkApplier implements vscode.Disposable {
     // running in parallel; same-file ones serialize against the flush. The
     // `this.pending.has(...)` re-check inside the lock guards against a
     // file being drained by a per-hunk decision between our snapshot and
-    // lock acquisition.
+    // lock acquisition. No disk writes needed — disk already matches the
+    // accepted state.
     const snapshot = Array.from(this.pending.values());
     await Promise.all(
       snapshot.map((file) =>
@@ -739,12 +825,17 @@ export class HunkApplier implements vscode.Disposable {
   }
 
   async rejectAll(): Promise<void> {
+    // Reject all pending hunks AND roll each file's disk content back to
+    // exclude every newly-rejected hunk. Files whose accepted hunks are
+    // already permanent stay at their accepted content; brand-new files
+    // with no accepted hunks are removed from disk entirely.
     const snapshot = Array.from(this.pending.values());
     await Promise.all(
       snapshot.map((file) =>
         this.withFileLock(file.uri.toString(), async () => {
           if (!this.pending.has(file.uri.toString())) return;
           for (const h of file.hunks) if (h.status === 'pending') h.status = 'rejected';
+          await this.syncDiskToModified(file);
           await this.flushFileIfDone(file);
         })
       )
@@ -817,46 +908,15 @@ export class HunkApplier implements vscode.Disposable {
       rejected: rejectedHunks.length,
       totalHunks: file.hunks.length
     });
-    const accepted = acceptedHunks.map((h) => h.hunk);
-    if (accepted.length > 0) {
-      if (file.isNewFile) {
-        // Brand-new file: compose the final content from the empty original +
-        // every accepted hunk, then create + write in one shot. Going through
-        // WorkspaceEdit.replace would fail because there is no document yet.
-        let composed = file.originalContent;
-        const sorted = [...accepted].sort((a, b) => b.startLine - a.startLine);
-        for (const h of sorted) composed = applyHunkToText(composed, h, file.eol);
-        try {
-          await ensureParentDir(file.uri);
-          await vscode.workspace.fs.writeFile(file.uri, Buffer.from(composed, 'utf8'));
-          this.logger.info('Created file', { uri: file.uri.toString(), hunks: accepted.length });
-        } catch (err) {
-          vscode.window.showErrorMessage(
-            `BurstCode: failed to create ${path.basename(file.uri.fsPath)}: ${String(err)}`
-          );
-        }
-      } else {
-        const doc = await vscode.workspace.openTextDocument(file.uri);
-        const eol = doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
-        const wsEdit = new vscode.WorkspaceEdit();
-        // Apply in descending startLine order to keep ranges valid.
-        const sorted = [...accepted].sort((a, b) => b.startLine - a.startLine);
-        for (const h of sorted) {
-          const range = hunkToRange(doc, h);
-          const replacement = ensureTrailingEol(h.newText, eol, h.startLine === h.endLine + 1);
-          wsEdit.replace(file.uri, range, replacement);
-        }
-        const ok = await vscode.workspace.applyEdit(wsEdit);
-        if (ok) {
-          await doc.save();
-          this.logger.info('Applied edits', { uri: file.uri.toString(), hunks: accepted.length });
-        } else {
-          vscode.window.showErrorMessage(
-            `BurstCode: failed to apply edits to ${path.basename(file.uri.fsPath)}.`
-          );
-        }
-      }
-    }
+    // No disk writes here — `syncDiskToModified` already wrote the correct
+    // post-decision content (accepted hunks only) when the most recent
+    // reject ran. acceptAll/acceptHunk leave the disk untouched because the
+    // proposed content is already what the user just accepted.
+    this.logger.info('Decision flushed', {
+      uri: file.uri.toString(),
+      accepted: acceptedHunks.length,
+      rejected: rejectedHunks.length
+    });
     this.diffPreview.unregister(file.proposedUri);
     this.pending.delete(file.uri.toString());
     this.codeLensProvider.refresh();
@@ -1028,10 +1088,31 @@ class HunkCodeLensProvider implements vscode.CodeLensProvider {
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
     const hunks = this.applier.getPendingForUri(document.uri);
     if (hunks.length === 0) return [];
+    // The live file on disk holds the MODIFIED content (we write proposed
+    // edits eagerly so the user can compile/run before accepting), so the
+    // CodeLens line numbers on a `file://` document must be expressed in
+    // modified-content coordinates. The frozen original snapshot under
+    // `burstcode-preview://` still uses the model-supplied original
+    // coordinates verbatim.
+    const useModifiedCoords = document.uri.scheme === 'file';
+    const modRanges = useModifiedCoords
+      ? this.applier.getHunkRangesInModifiedCoords(document.uri)
+      : [];
+    const modByHunk = new Map(modRanges.map((r) => [r.id, r]));
     return hunks
       .filter((h) => h.status === 'pending')
       .map((h) => {
-        const lineIdx = Math.max(0, Math.min(document.lineCount - 1, h.hunk.startLine - 1));
+        let lensLine: number;
+        if (useModifiedCoords) {
+          const mod = modByHunk.get(h.id);
+          // Pure deletions encode as modStart > modEnd; modStart still
+          // points at the line that took the deleted block's slot, which
+          // is the right place to anchor the Accept/Reject lens.
+          lensLine = mod ? mod.modStart : h.hunk.startLine;
+        } else {
+          lensLine = h.hunk.startLine;
+        }
+        const lineIdx = Math.max(0, Math.min(document.lineCount - 1, lensLine - 1));
         const range = new vscode.Range(lineIdx, 0, lineIdx, 0);
         return [
           new vscode.CodeLens(range, {
@@ -1081,44 +1162,16 @@ function applyHunkToText(text: string, h: ProposedHunk, eol: string): string {
   return result.join(eol);
 }
 
-function hunkToRange(doc: vscode.TextDocument, h: ProposedHunk): vscode.Range {
-  const maxLine = Math.max(0, doc.lineCount - 1);
-  const start = Math.max(0, Math.min(maxLine, h.startLine - 1));
-  if (h.startLine > h.endLine) {
-    return new vscode.Range(start, 0, start, 0);
-  }
-  const endLineIdx = Math.max(0, Math.min(maxLine, h.endLine - 1));
-  // Pure deletion: extend the range to also consume one surrounding newline,
-  // otherwise WorkspaceEdit.replace(range, '') leaves a stray blank line
-  // where the deleted block used to be (because the line-bounding newlines
-  // are NOT part of `[startCol=0, endCol=text.length]`). Prefer to consume
-  // the FOLLOWING newline; if the deleted block reaches end-of-file, fall
-  // back to the PRECEDING newline so we don't lose the file's trailing EOL.
-  if (h.newText === '') {
-    if (endLineIdx + 1 <= maxLine) {
-      return new vscode.Range(start, 0, endLineIdx + 1, 0);
-    }
-    if (start > 0) {
-      const prevEnd = doc.lineAt(start - 1).text.length;
-      return new vscode.Range(
-        start - 1,
-        prevEnd,
-        endLineIdx,
-        doc.lineAt(endLineIdx).text.length
-      );
-    }
-    // Deleting from the only line: fall through to the standard "(0, 0) to
-    // (endLineIdx, lineEnd)" range — the resulting empty file matches what
-    // the model asked for.
-  }
-  const endChar = doc.lineAt(endLineIdx).text.length;
-  return new vscode.Range(start, 0, endLineIdx, endChar);
-}
-
-function ensureTrailingEol(text: string, eol: string, _insertOnly: boolean): string {
-  // Normalize line endings to the document's EOL.
-  const normalized = text.replace(/\r\n?/g, '\n').replace(/\n/g, eol);
-  return normalized;
+/**
+ * Compute a `vscode.Range` that covers the entire document, from (0, 0)
+ * to the end of the last line. Used by `syncDiskToModified` so a single
+ * `WorkspaceEdit.replace` can swap the whole file contents in one shot
+ * while keeping any open editor in sync.
+ */
+function fullDocumentRange(doc: vscode.TextDocument): vscode.Range {
+  if (doc.lineCount === 0) return new vscode.Range(0, 0, 0, 0);
+  const lastIdx = doc.lineCount - 1;
+  return new vscode.Range(0, 0, lastIdx, doc.lineAt(lastIdx).text.length);
 }
 
 /**
