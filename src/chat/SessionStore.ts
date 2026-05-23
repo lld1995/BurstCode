@@ -30,7 +30,7 @@ export interface SessionMeta {
 export interface SessionCheckpoint {
   /** Index in `Session.messages` of the user message this checkpoint belongs to. */
   messageIndex: number;
-  /** Git ref under refs/burstcode/checkpoints/<ts>. */
+  /** Checkpoint ref — `file:<ts>` for file-based checkpoints (current), or legacy `refs/burstcode/checkpoints/<ts>` for old git-based ones. */
   ref: string;
   /** Object name the ref points at. */
   sha: string;
