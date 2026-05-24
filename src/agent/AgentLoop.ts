@@ -471,6 +471,62 @@ export class AgentLoop {
             return;
           }
           streamOk = true;
+          // Empty response with no finish_reason = transient backend issue (silent
+          // dropped body, vLLM/sglang returning nothing).  Treat exactly like a
+          // stream error: auto-resume up to maxResumes times, then terminate the
+          // run with an error.  We MUST NOT fall through to the auto-continue path
+          // here — resumeAttempt resets each for-iteration, so letting auto-continue
+          // trigger a new iteration would give the stream another full resume budget
+          // and produce an infinite loop.
+          if (
+            finishReason === undefined &&
+            assistantText.length === 0 &&
+            toolCallAccumulator.size === 0
+          ) {
+            if (resumeAttempt < maxResumes) {
+              streamOk = false;
+              resumeAttempt++;
+              const delayMs = Math.min(500 * 2 ** (resumeAttempt - 1), 4_000);
+              this.logger.warn(
+                `Empty response with missing finish_reason (resume ${resumeAttempt}/${maxResumes}); retrying in ${delayMs}ms`
+              );
+              yield {
+                type: 'auto-resume',
+                payload: {
+                  attempt: resumeAttempt,
+                  max: maxResumes,
+                  error: 'empty response (finish_reason missing)',
+                  delayMs
+                }
+              };
+              const cancelled = await new Promise<boolean>((resolve) => {
+                let timer: ReturnType<typeof setTimeout> | undefined;
+                const sub = cancellation.onCancellationRequested(() => {
+                  if (timer !== undefined) clearTimeout(timer);
+                  sub.dispose();
+                  resolve(true);
+                });
+                timer = setTimeout(() => {
+                  sub.dispose();
+                  resolve(false);
+                }, delayMs);
+              });
+              if (cancelled) {
+                yield { type: 'done', payload: { reason: 'cancelled' } };
+                return;
+              }
+              continue;
+            }
+            // All auto-resumes exhausted — end the run rather than falling through
+            // to auto-continue, which would reset resumeAttempt on the next iteration.
+            const suffix = resumeAttempt > 0
+              ? ` (after ${resumeAttempt} auto-resume${resumeAttempt === 1 ? '' : 's'})`
+              : '';
+            const detail = `Model returned an empty response with no finish_reason${suffix}. This is likely a transient backend issue.`;
+            this.logger.error(detail);
+            yield { type: 'error', payload: detail };
+            return;
+          }
         } catch (err) {
           // User-driven cancellation: don't retry, end cleanly so the run
           // surfaces the 'cancelled' reason rather than a noisy error.
