@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.34",
+  "version": "0.1.35",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -457,8 +457,8 @@
         },
         "burstcode.shell.maxOutputBytes": {
           "type": "number",
-          "default": 32768,
-          "description": "Maximum bytes of stdout / stderr (each, separately) returned to the agent per run_shell call. Output past this cap is truncated; redirect to a file inside the workspace and read_file it back if you need the full transcript."
+          "default": 131072,
+          "description": "Maximum bytes of stdout / stderr (each, separately) captured per run_shell call before the tail is dropped. Output is further compressed before being stored in context (see burstcode.agent). Raise this if you routinely redirect large build logs; lower it on memory-constrained machines. Hard cap is 524288 (512 KB)."
         }
       }
     }

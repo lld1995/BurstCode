@@ -217,9 +217,19 @@ function truncateMiddle(text: string, headChars: number, tailChars: number): str
 function compressShellSection(body: string): string {
   const trimmed = body.trim();
   if (trimmed === '' || trimmed === '(empty)') return '(empty)';
-  const cleaned = collapseProgressNoise(stripAnsi(body)).replace(/\n{3,}/g, '\n\n');
-  if (cleaned.length <= 3000) return cleaned;
-  return truncateMiddle(cleaned, 1500, 1200);
+  // Normalise Windows CRLF → LF before further processing.
+  // collapseProgressNoise splits on \n then keeps only the text after the last
+  // \r in each line (to handle carriage-return progress redraws). cmd.exe /
+  // Win32 programs (ipconfig, netstat, …) use \r\n line endings, so without
+  // normalisation every single line ends with \r → the post-\r part is ""
+  // → the entire section is silently wiped.
+  const lf = body.replace(/\r\n/g, '\n');
+  const cleaned = collapseProgressNoise(stripAnsi(lf)).replace(/\n{3,}/g, '\n\n');
+  // 20 000 chars ≈ 250 lines — covers the vast majority of build/test outputs
+  // without truncation. For longer outputs keep the first 4 000 (context /
+  // command echo) and last 12 000 (errors and results always live in the tail).
+  if (cleaned.length <= 20000) return cleaned;
+  return truncateMiddle(cleaned, 4000, 12000);
 }
 
 /**
@@ -268,8 +278,13 @@ export function normalizeToolResult(toolName: string, content: string): string {
   if (toolName === 'run_shell') {
     // Body layout produced by shell.ts: header lines starting with `#`,
     // blank line, then alternating `## stdout` / `## stderr` sections.
-    const stdoutMatch = content.match(/^## stdout(?: \(truncated\))?\n([\s\S]*?)(?=\n## stderr|$)/m);
-    const stderrMatch = content.match(/^## stderr(?: \(truncated\))?\n([\s\S]*?)$/m);
+    // NB: $(?![\s\S]) instead of bare $ — with the /m flag, plain $ also
+    // matches before every \n, so the lazy [\s\S]*? terminates at the first
+    // newline (which is the blank line shell.ts emits right after the section
+    // header) and the capture group returns empty. The negative lookahead
+    // forces $ to mean "true end of string" only.
+    const stdoutMatch = content.match(/^## stdout[^\n]*\n([\s\S]*?)(?=\n## stderr|$(?![\s\S]))/m);
+    const stderrMatch = content.match(/^## stderr[^\n]*\n([\s\S]*?)$(?![\s\S])/m);
     if (!stdoutMatch && !stderrMatch) {
       // Unknown shape — fall back to a generic head+tail cap.
       return content.length > 4000 ? truncateMiddle(content, 2000, 1500) : content;

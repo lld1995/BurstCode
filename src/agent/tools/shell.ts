@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
+import { TextDecoder } from 'util';
 import { Tool, ToolContext, ToolResult } from './types';
 import { AskUserFn } from './edits';
 
@@ -15,6 +16,13 @@ interface SpawnPlan {
    * tokenized argv properly — currently always true for the shells we wire up.
    */
   shellEscaped: boolean;
+  /**
+   * When true, decode process output using the Windows system OEM code page
+   * instead of UTF-8. Set for cmd.exe on Windows: piped subprocesses have no
+   * attached console so SetConsoleOutputCP / chcp have no effect, and native
+   * programs (ipconfig, netstat, …) write bytes in the OEM code page.
+   */
+  useOemDecoder?: boolean;
 }
 
 function workspaceRoot(): string | undefined {
@@ -41,19 +49,44 @@ function planSpawn(kind: ShellKind, command: string): SpawnPlan {
   switch (resolved) {
     case 'cmd':
       // /d disables AutoRun, /s+/c keep quoting predictable.
-      return { exe: 'cmd.exe', args: ['/d', '/s', '/c', command], shellEscaped: true };
+      // NOTE: we do NOT prepend `chcp 65001` here. In piped mode (no attached
+      // console) SetConsoleOutputCP silently fails, so the code page change
+      // has no effect on child processes like ipconfig.exe. Instead we detect
+      // the system OEM code page once and decode on the Node.js side.
+      return {
+        exe: 'cmd.exe',
+        args: ['/d', '/s', '/c', command],
+        shellEscaped: true,
+        useOemDecoder: isWin
+      };
     case 'powershell':
+    case 'pwsh': {
+      // On Windows, PowerShell's pipe-mode stdout defaults to the system OEM
+      // code page. We fix this by prepending a UTF-8 setup block.
+      //
+      // In .NET Framework (PS 5.x) [Console]::OutputEncoding only rewires
+      // Console.Out; Console.Error keeps the OEM encoding. We also call
+      // SetError() to cover stderr. Both calls are wrapped in try/catch so
+      // they degrade gracefully when the standard streams are not available.
+      //
+      // LIMITATION: PowerShell parse-time errors (syntax errors detected
+      // before any code runs, e.g. using `||` in PS 5.x) will still be in
+      // the system OEM encoding because our setup code never executes.
+      // The fix for parse errors is to use a shell that accepts the syntax
+      // (e.g. shell=pwsh for PS7 which supports ||) or rewrite the command.
+      const utf8Block = isWin
+        ? `$__e=[System.Text.Encoding]::UTF8;[Console]::OutputEncoding=$__e;$OutputEncoding=$__e;try{$__ew=[System.IO.StreamWriter]::new([Console]::OpenStandardError(),$__e);$__ew.AutoFlush=$true;[Console]::SetError($__ew)}catch{};`
+        : '';
+      const exe = resolved === 'pwsh' ? 'pwsh' : 'powershell.exe';
+      const baseArgs = resolved === 'pwsh'
+        ? ['-NoProfile', '-NoLogo', '-Command']
+        : ['-NoProfile', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-Command'];
       return {
-        exe: 'powershell.exe',
-        args: ['-NoProfile', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-Command', command],
+        exe,
+        args: [...baseArgs, `${utf8Block}${command}`],
         shellEscaped: true
       };
-    case 'pwsh':
-      return {
-        exe: 'pwsh',
-        args: ['-NoProfile', '-NoLogo', '-Command', command],
-        shellEscaped: true
-      };
+    }
     case 'bash':
       return { exe: 'bash', args: ['-lc', command], shellEscaped: true };
     case 'sh':
@@ -62,6 +95,71 @@ function planSpawn(kind: ShellKind, command: string): SpawnPlan {
       // Should be unreachable; fall back to platform default.
       return planSpawn('auto', command);
   }
+}
+
+/**
+ * Lazily detect the Windows system OEM code page via `chcp` and return an
+ * appropriate TextDecoder.  Cached after first call.
+ *
+ * Background: when Node.js spawns cmd.exe with stdio:'pipe' there is no
+ * attached console, so SetConsoleOutputCP / `chcp 65001` silently fails and
+ * native programs (ipconfig.exe, netstat.exe, …) keep writing bytes in the
+ * system OEM code page (CP936 / GBK on Chinese Windows, CP932 on Japanese, …).
+ * We detect the code page once and decode accordingly.
+ */
+let _winOemDecoder: TextDecoder | undefined;
+function getWinOemDecoder(): TextDecoder {
+  if (_winOemDecoder !== undefined) return _winOemDecoder;
+  if (process.platform !== 'win32') return (_winOemDecoder = new TextDecoder('utf-8'));
+  const nameMap: Record<string, string> = {
+    '936': 'gb18030', '54936': 'gb18030',   // Chinese Simplified
+    '950': 'big5',   '951': 'big5',         // Chinese Traditional
+    '932': 'shift_jis',                      // Japanese
+    '949': 'euc-kr',                         // Korean
+    '1250': 'windows-1250', '1251': 'windows-1251',
+    '1252': 'windows-1252', '1253': 'windows-1253',
+    '65001': 'utf-8',
+  };
+  const tryDecode = (cpNum: string): TextDecoder | undefined => {
+    const name = nameMap[cpNum] ?? `windows-${cpNum}`;
+    try { return new TextDecoder(name); } catch { return undefined; }
+  };
+  // Primary: read the system OEM code page from the registry.
+  // This is the value Windows was configured with at install time and is
+  // NOT affected by SetConsoleOutputCP / chcp or Electron overrides.
+  try {
+    const raw = cp.execFileSync('reg', [
+      'query', 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage',
+      '/v', 'OEMCP'
+    ], { encoding: 'ascii', timeout: 3000, windowsHide: true }) as unknown as string;
+    const m = raw.match(/OEMCP\s+REG_SZ\s+(\d+)/i);
+    if (m) {
+      const dec = tryDecode(m[1]);
+      if (dec) return (_winOemDecoder = dec);
+    }
+  } catch { /* fall through to chcp probe */ }
+  // Fallback: ask the current cmd session what code page it is using.
+  try {
+    const raw = cp.execFileSync('cmd.exe', ['/d', '/c', 'chcp'], {
+      encoding: 'ascii', timeout: 3000, windowsHide: true
+    }) as unknown as string;
+    const m = raw.match(/(\d+)/);
+    if (m) {
+      const dec = tryDecode(m[1]);
+      if (dec) return (_winOemDecoder = dec);
+    }
+  } catch { /* probe failed */ }
+  return (_winOemDecoder = new TextDecoder('utf-8'));
+}
+
+/** Strip ANSI/VT escape sequences and normalise CR for plain-text progress display. */
+function stripAnsiForProgress(s: string): string {
+  return s
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')      // CSI sequences (colours, cursor)
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '') // OSC sequences (hyperlinks, titles)
+    .replace(/\x1b[^[\\]/g, '')                  // other ESC sequences
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
 }
 
 function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
@@ -154,7 +252,7 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
 
       const defaultTimeout = clampNumber(cfg.get<number>('defaultTimeoutMs'), 60000, 1000, 600000);
       const timeoutMs = clampNumber(args.timeoutMs, defaultTimeout, 1000, 600000);
-      const maxOutputBytes = clampNumber(cfg.get<number>('maxOutputBytes'), 32768, 1024, 524288);
+      const maxOutputBytes = clampNumber(cfg.get<number>('maxOutputBytes'), 131072, 1024, 524288);
       const autoApprove = cfg.get<boolean>('autoApprove') === true;
 
       // ---- Approval gate -------------------------------------------------
@@ -203,9 +301,17 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
       return await new Promise<ToolResult>((resolve) => {
         let proc: cp.ChildProcess;
         try {
+          // For OEM-decoded shells (cmd.exe on Windows) we do NOT override
+          // Python's encoding: if Python outputs UTF-8 while we decode as
+          // GBK/CP936, multi-byte chars would be garbled. Let Python follow
+          // the system OEM code page, which our decoder handles correctly.
+          // For UTF-8 shells (powershell/pwsh) we keep the UTF-8 hints.
+          const childEnv: NodeJS.ProcessEnv = plan.useOemDecoder
+            ? { ...process.env }
+            : { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' };
           proc = cp.spawn(plan.exe, plan.args, {
             cwd,
-            env: process.env,
+            env: childEnv,
             windowsHide: true,
             // Close stdin so commands that read input (npm init, git commit,
             // pause, Read-Host, [Y/n] prompts, …) see EOF immediately and
@@ -225,13 +331,39 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
           return;
         }
 
-        let stdout = '';
-        let stderr = '';
         const stdoutCap = maxOutputBytes;
         const stderrCap = maxOutputBytes;
+        // Ring-buffer capture: accumulate chunks and evict from the FRONT
+        // once the buffer exceeds the cap. On close we take the LAST cap
+        // bytes — errors and results live in the tail, not the head.
+        const stdoutChunks: Buffer[] = [];
+        let stdoutBufBytes = 0;
+        let stdoutDropped = false;
+        const stderrChunks: Buffer[] = [];
+        let stderrBufBytes = 0;
+        let stderrDropped = false;
         let timedOut = false;
         let settled = false;
         let forcedExit = false;
+
+        // Real-time progress streaming: accumulate output and flush to the UI
+        // every PROGRESS_THROTTLE_MS ms so the user sees live output instead
+        // of a frozen bubble. stdout and stderr are combined in arrival order.
+        const PROGRESS_THROTTLE_MS = 150;
+        let pendingProgressText = '';
+        let progressFlushTimer: ReturnType<typeof setTimeout> | null = null;
+        const flushProgress = (): void => {
+          progressFlushTimer = null;
+          if (pendingProgressText) {
+            ctx.emitProgress(pendingProgressText);
+            pendingProgressText = '';
+          }
+        };
+        const scheduleProgress = (): void => {
+          if (!progressFlushTimer) {
+            progressFlushTimer = setTimeout(flushProgress, PROGRESS_THROTTLE_MS);
+          }
+        };
 
         // Kill the shell AND every descendant it spawned. On Windows the
         // grandchildren (npm.exe, node.exe, …) do not die when the shell
@@ -305,13 +437,34 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
         });
 
         proc.stdout?.on('data', (chunk: Buffer) => {
-          if (Buffer.byteLength(stdout, 'utf8') < stdoutCap) {
-            stdout += chunk.toString('utf8');
+          stdoutChunks.push(chunk);
+          stdoutBufBytes += chunk.length;
+          // Evict oldest chunks while we can still afford to (i.e. we'd
+          // still have ≥ cap bytes left after eviction). Memory stays ≤
+          // cap + one chunk size at all times.
+          while (stdoutChunks.length > 1 && stdoutBufBytes - stdoutChunks[0].length >= stdoutCap) {
+            stdoutBufBytes -= stdoutChunks.shift()!.length;
+            stdoutDropped = true;
+          }
+          if (!settled) {
+            pendingProgressText += stripAnsiForProgress(
+              plan.useOemDecoder ? getWinOemDecoder().decode(chunk) : chunk.toString('utf8')
+            );
+            scheduleProgress();
           }
         });
         proc.stderr?.on('data', (chunk: Buffer) => {
-          if (Buffer.byteLength(stderr, 'utf8') < stderrCap) {
-            stderr += chunk.toString('utf8');
+          stderrChunks.push(chunk);
+          stderrBufBytes += chunk.length;
+          while (stderrChunks.length > 1 && stderrBufBytes - stderrChunks[0].length >= stderrCap) {
+            stderrBufBytes -= stderrChunks.shift()!.length;
+            stderrDropped = true;
+          }
+          if (!settled) {
+            pendingProgressText += stripAnsiForProgress(
+              plan.useOemDecoder ? getWinOemDecoder().decode(chunk) : chunk.toString('utf8')
+            );
+            scheduleProgress();
           }
         });
 
@@ -331,10 +484,31 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
           settled = true;
           clearTimeout(timer);
           cancelSub.dispose();
+          // Flush any output buffered by the throttle before resolving so
+          // the last lines are visible before the tool-call-end event fires.
+          if (progressFlushTimer !== null) { clearTimeout(progressFlushTimer); progressFlushTimer = null; }
+          flushProgress();
 
           const cancelled = ctx.cancellation.isCancellationRequested;
-          const stdoutTrunc = truncate(stdout, stdoutCap);
-          const stderrTrunc = truncate(stderr, stderrCap);
+          // Assemble final strings from the ring buffer, taking the LAST
+          // cap bytes (tail-biased: errors/results are at the end).
+          let stdoutBuf = Buffer.concat(stdoutChunks);
+          if (stdoutBuf.length > stdoutCap) {
+            stdoutDropped = true;
+            stdoutBuf = stdoutBuf.subarray(stdoutBuf.length - stdoutCap);
+          }
+          const decodeOutput = plan.useOemDecoder
+            ? (buf: Buffer) => getWinOemDecoder().decode(buf)
+            : (buf: Buffer) => buf.toString('utf8');
+          const stdout = decodeOutput(stdoutBuf);
+          let stderrBuf = Buffer.concat(stderrChunks);
+          if (stderrBuf.length > stderrCap) {
+            stderrDropped = true;
+            stderrBuf = stderrBuf.subarray(stderrBuf.length - stderrCap);
+          }
+          const stderr = decodeOutput(stderrBuf);
+          const stdoutTrunc = stdoutDropped ? { text: stdout, truncated: true } : { text: stdout, truncated: false };
+          const stderrTrunc = stderrDropped ? { text: stderr, truncated: true } : { text: stderr, truncated: false };
           const exitLabel = forcedExit
             ? 'forced (descendant kept stdio open)'
             : code === null
@@ -347,12 +521,14 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
             `# exit: ${exitLabel}${signal ? ` signal=${signal}` : ''}${timedOut ? ' (timed out)' : ''}${cancelled ? ' (cancelled by user)' : ''}`
           ];
           const sections: string[] = [headerLines.join('\n')];
-          sections.push(
-            `## stdout${stdoutTrunc.truncated ? ' (truncated)' : ''}\n${stdoutTrunc.text || '(empty)'}`
-          );
-          sections.push(
-            `## stderr${stderrTrunc.truncated ? ' (truncated)' : ''}\n${stderrTrunc.text || '(empty)'}`
-          );
+          const stdoutLabel = stdoutTrunc.truncated
+            ? ` (showing last ${stdoutCap} bytes — earlier output omitted)`
+            : '';
+          const stderrLabel = stderrTrunc.truncated
+            ? ` (showing last ${stderrCap} bytes — earlier output omitted)`
+            : '';
+          sections.push(`## stdout${stdoutLabel}\n${stdoutTrunc.text || '(empty)'}`);
+          sections.push(`## stderr${stderrLabel}\n${stderrTrunc.text || '(empty)'}`);
 
           resolve({
             content: sections.join('\n\n'),

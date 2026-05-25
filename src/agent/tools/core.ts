@@ -25,7 +25,9 @@ export function buildReadFileTool(applier?: HunkApplier): Tool {
       function: {
         name: 'read_file',
         description:
-          'Read a slice of a workspace file with 1-indexed line numbers. Use this to inspect code regions; prefer reading targeted ranges over whole files.',
+          'Read a slice of a workspace file with 1-indexed line numbers. ' +
+          'Use for a SINGLE targeted follow-up read when you already know the exact file and line range. ' +
+          'To read 2+ files or combine a read with a grep, use collect_context instead — it runs everything concurrently in one round-trip.',
         parameters: {
           type: 'object',
           properties: {
@@ -120,7 +122,9 @@ export const workspaceOutlineTool: Tool = {
     function: {
       name: 'workspace_outline',
       description:
-        'Return a tree-shaped overview of the workspace (or a sub-path) to help locate files before reading them. Useful when the system prompt outline was truncated or you need to drill deeper into a specific folder. Respects .gitignore and skips common build/junk dirs (node_modules, dist, out, .git, ...).',
+        'Return a tree-shaped overview of the workspace (or a sub-path). ' +
+        'Use for a SINGLE outline when you need to drill into one specific path. ' +
+        'To combine an outline with reads or greps, use collect_context instead.',
       parameters: {
         type: 'object',
         properties: {
@@ -174,7 +178,9 @@ export const listDirTool: Tool = {
     type: 'function',
     function: {
       name: 'list_dir',
-      description: 'List files and directories under a path (workspace-relative or absolute).',
+      description:
+        'List files and directories under a path (workspace-relative or absolute). ' +
+        'For a single directory listing on its own. To combine with reads or greps, use collect_context.',
       parameters: {
         type: 'object',
         properties: {
@@ -215,7 +221,8 @@ export const grepSearchTool: Tool = {
     function: {
       name: 'grep_search',
       description:
-        'Search for a regex or literal text across the workspace using ripgrep. Returns matches with file:line.',
+        'Search for a regex or literal text across the workspace using ripgrep. Returns matches with file:line. ' +
+        'Use for a SINGLE targeted search. To run multiple searches or combine with file reads, use collect_context instead.',
       parameters: {
         type: 'object',
         properties: {
@@ -325,6 +332,154 @@ export function buildWriteFileTool(): Tool {
       } catch (err) {
         return { content: `write_file failed: ${String((err as Error).message ?? err)}`, isError: true };
       }
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// collect_context — gather multiple reads / greps / lists / outlines in ONE
+// tool call. All sub-operations run concurrently; results are returned as a
+// single labelled bundle. This eliminates the N sequential LLM round-trips
+// that occur when a model issues read_file / grep_search one at a time.
+// ---------------------------------------------------------------------------
+
+/** Maximum number of each kind of sub-operation per call (DOS guard). */
+const CC_MAX_READS = 16;
+const CC_MAX_GREPS = 16;
+const CC_MAX_LISTS = 8;
+const CC_MAX_OUTLINES = 8;
+
+export function buildCollectContextTool(applier?: HunkApplier): Tool {
+  const readFileTool = buildReadFileTool(applier);
+
+  return {
+    name: 'collect_context',
+    parallelSafe: true,
+    noTimeout: true,
+    schema: {
+      type: 'function',
+      function: {
+        name: 'collect_context',
+        description:
+          'Collect multiple kinds of workspace context in ONE round-trip. ' +
+          'Pass any combination of files to read, patterns to grep, directories to list, ' +
+          'and paths to outline — all sub-operations execute concurrently. ' +
+          'Use this as the FIRST move on any non-trivial question instead of issuing ' +
+          'read_file / grep_search one at a time across multiple turns.',
+        parameters: {
+          type: 'object',
+          properties: {
+            reads: {
+              type: 'array',
+              description: `Up to ${CC_MAX_READS} file regions to read. Same args as read_file.`,
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string', description: 'Workspace-relative or absolute path.' },
+                  startLine: { type: 'number', description: '1-indexed start line (inclusive). Defaults to 1.' },
+                  endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200.' }
+                },
+                required: ['path']
+              }
+            },
+            greps: {
+              type: 'array',
+              description: `Up to ${CC_MAX_GREPS} ripgrep searches. Same args as grep_search.`,
+              items: {
+                type: 'object',
+                properties: {
+                  query: { type: 'string', description: 'Regex pattern (or literal when fixedStrings=true).' },
+                  fixedStrings: { type: 'boolean' },
+                  glob: { type: 'string', description: 'Optional glob filter, e.g. **/*.ts' },
+                  maxResults: { type: 'number' }
+                },
+                required: ['query']
+              }
+            },
+            lists: {
+              type: 'array',
+              description: `Up to ${CC_MAX_LISTS} directory listings. Same args as list_dir.`,
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string', description: 'Defaults to workspace root.' }
+                }
+              }
+            },
+            outlines: {
+              type: 'array',
+              description: `Up to ${CC_MAX_OUTLINES} workspace outlines. Same args as workspace_outline.`,
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string' },
+                  depth: { type: 'number' },
+                  maxBytes: { type: 'number' }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    async execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+      type TaskSpec = { label: string; promise: Promise<ToolResult> };
+      const tasks: TaskSpec[] = [];
+
+      const reads = Array.isArray(args.reads) ? (args.reads as Record<string, unknown>[]).slice(0, CC_MAX_READS) : [];
+      const greps = Array.isArray(args.greps) ? (args.greps as Record<string, unknown>[]).slice(0, CC_MAX_GREPS) : [];
+      const lists = Array.isArray(args.lists) ? (args.lists as Record<string, unknown>[]).slice(0, CC_MAX_LISTS) : [];
+      const outlines = Array.isArray(args.outlines) ? (args.outlines as Record<string, unknown>[]).slice(0, CC_MAX_OUTLINES) : [];
+
+      for (const r of reads) {
+        const label = `read_file ${String(r.path)}${r.startLine != null ? `:${r.startLine}` : ''}${r.endLine != null ? `-${r.endLine}` : ''}`;
+        tasks.push({ label, promise: readFileTool.execute(r, ctx) });
+      }
+      for (const g of greps) {
+        const label = `grep_search ${String(g.query)}${g.glob ? ` [${g.glob}]` : ''}`;
+        tasks.push({ label, promise: grepSearchTool.execute(g, ctx) });
+      }
+      for (const l of lists) {
+        const label = `list_dir ${String(l.path ?? '.')}`;
+        tasks.push({ label, promise: listDirTool.execute(l, ctx) });
+      }
+      for (const o of outlines) {
+        const label = `workspace_outline ${String(o.path ?? '.')}`;
+        tasks.push({ label, promise: workspaceOutlineTool.execute(o, ctx) });
+      }
+
+      if (tasks.length === 0) {
+        return {
+          content: 'collect_context: nothing to collect — provide at least one entry in reads / greps / lists / outlines.',
+          isError: true
+        };
+      }
+
+      ctx.emitProgress(`Collecting ${tasks.length} context source(s) concurrently…`);
+
+      const settled = await Promise.allSettled(tasks.map((t) => t.promise));
+
+      const sections: string[] = [];
+      let errorCount = 0;
+      settled.forEach((s, i) => {
+        const label = tasks[i].label;
+        if (s.status === 'fulfilled') {
+          if (s.value.isError) errorCount++;
+          const tag = s.value.isError ? ' [error]' : '';
+          sections.push(`===== ${label}${tag} =====\n${s.value.content}`);
+        } else {
+          errorCount++;
+          sections.push(`===== ${label} [failed] =====\n${String(s.reason)}`);
+        }
+      });
+
+      const header = `# collect_context: ${tasks.length} source(s), ${errorCount} error(s)`;
+      return {
+        content: `${header}\n\n${sections.join('\n\n')}`,
+        meta: { tasks: tasks.length, errors: errorCount },
+        isError: errorCount === tasks.length
+      };
     }
   };
 }

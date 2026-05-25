@@ -861,12 +861,37 @@ export class AgentLoop {
         if (cancellation.isCancellationRequested) break;
         if (isUnsafe(prepared[cursor])) {
           const c = prepared[cursor];
-          const result = await executeOne(c);
-          results[cursor] = result;
-          while (progressQueue.length > 0) {
-            const p = progressQueue.shift()!;
-            yield { type: 'tool-progress', payload: { id: p.callId, name: p.name, message: p.message } };
+          // Run the unsafe tool and drain its progress events in real-time.
+          // Uses the same resolveWaiter mechanism as the parallel-safe batch
+          // loop below: emitProgress() calls wake the drain loop immediately
+          // instead of accumulating until executeOne() returns.
+          let unsafeDone = false;
+          let unsafeResult: ToolResult | undefined;
+          executeOne(c).then((res) => {
+            unsafeResult = res;
+            unsafeDone = true;
+            const r = resolveWaiter;
+            resolveWaiter = null;
+            r?.();
+          });
+          while (!unsafeDone || progressQueue.length > 0) {
+            if (cancellation.isCancellationRequested) break;
+            while (progressQueue.length > 0) {
+              const p = progressQueue.shift()!;
+              yield { type: 'tool-progress', payload: { id: p.callId, name: p.name, message: p.message } };
+            }
+            if (!unsafeDone) {
+              // Wait for either a progress event or tool completion.
+              // 500 ms fallback prevents a missed wakeup from hanging forever.
+              await new Promise<void>((r) => {
+                resolveWaiter = r;
+                setTimeout(r, 500);
+              });
+              resolveWaiter = null;
+            }
           }
+          const result = unsafeResult ?? { content: 'Tool did not produce a result.', isError: true };
+          results[cursor] = result;
           yield {
             type: 'tool-call-end',
             payload: { name: c.name, id: c.callId, result: result.content, isError: !!result.isError, meta: result.meta }
