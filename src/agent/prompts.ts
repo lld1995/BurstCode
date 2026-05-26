@@ -201,25 +201,27 @@ MUST aggressively batch independent tool calls into one turn whenever possible.
 
 FIRST MOVE — collect_context:
 For any non-trivial question (anything requiring > 1 file or > 1 grep), your
-FIRST assistant turn should be a single collect_context call that declares ALL
-the files you want to read, ALL the patterns you want to grep, and any dirs or
-outlines you need — everything runs concurrently and comes back in one result.
+FIRST assistant turn should be a single collect_context call. Before emitting
+it, THINK AHEAD: list every file, grep pattern, dir, and outline you could
+possibly need for this task, and include ALL of them in that one call.
+Over-requesting is cheap; a second round-trip is expensive.
+Everything runs concurrently and comes back in one result.
 
 collect_context applies per user message — each time the user sends a new
 message a fresh run starts and a new collect_context sweep is appropriate.
 
 After receiving a collect_context result, follow these rules:
+  - If the result contains everything you need → move DIRECTLY to analysis
+    and action (propose_edit, answer, etc.) with NO further reads.
   - Files / patterns that returned useful content: do NOT re-read them.
-    You already have the data; repeating the same read wastes a round-trip.
-  - Entries that returned empty results or errors (wrong path, no matches):
-    you MAY issue a corrective collect_context with the fixed paths / patterns
-    — this is a legitimate second sweep. Omit the items that already succeeded.
-  - Entirely new leads discovered from the result (a file path or line number
-    you didn't know before): if there are 2+ new items to fetch, batch them
-    into a second collect_context; if there is just 1, use a targeted
-    read_file or grep_search instead.
-  - If the result contains everything you need, move directly to analysis
-    and action (propose_edit, answer, etc.) without any further reads.
+  - Entries that returned empty / error results: DISCARD them — treat that
+    content as if it never existed. Do NOT reference or repeat it.
+    You MAY issue ONE corrective collect_context for the failed items only,
+    with fixed paths / patterns. This is the MAXIMUM allowed second sweep.
+  - New leads discovered (a path or line number you didn't know before):
+    fold them into the corrective sweep above if one is needed, or issue a
+    single targeted read_file / grep_search if only 1 new item is needed.
+  - NEVER issue more than 4 collect_context calls per user message.
 
 Only use individual read_file / grep_search / list_dir calls when:
   - You already have the full context you need (from workspace_layout or a
@@ -267,7 +269,12 @@ const RULES = `RULES:
 - Preserve existing indentation and EOL style.
 - If a language server is not ready (tool returns "Language plugin missing" or similar),
   fall back to grep_search / read_file rather than failing the turn.
-- Be concise in your visible messages — log progress in tool calls instead.`;
+- Be concise in your visible messages — log progress in tool calls instead.
+- When mentioning a file in your reply, format it as a markdown link: [filename](file:relative/or/absolute/path).
+  With a line number: [filename:42](file:relative/path:42). With a line range: [filename:10-20](file:relative/path:10-20).
+- When mentioning a function/method/class by name, format it as: [funcName()](sym:funcName).
+  For methods: [Class.method()](sym:Class.method).
+- These are the ONLY two formats. Do NOT use bare paths like \`src/foo.ts\` or plain backtick function names like \`tick()\` — always wrap in the link format so the UI can make them clickable.`;
 
 export function buildSystemPrompt(input: SystemPromptInput = {}): string {
   // ── STABLE PREFIX ─────────────────────────────────────────────────────────

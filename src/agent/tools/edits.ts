@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { Tool, ToolResult } from './types';
 import { HunkApplier, ProposedEditFile } from '../../edits/HunkApplier';
+import { repairJsonControlChars, repairJsonUnescapedQuotes } from '../../util/jsonRepair';
 
 /**
  * Return the first string-typed value found at any of `keys` on `obj`, along
@@ -20,6 +21,107 @@ function pickFirstString(
     if (typeof v === 'string') return { value: v, key: k };
   }
   return undefined;
+}
+
+function findLooseJsonStringEnd(text: string, start: number): number {
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escape = true;
+      continue;
+    }
+    if (ch !== '"') continue;
+    let j = i + 1;
+    while (j < text.length && /\s/.test(text[j])) j++;
+    const next = j < text.length ? text[j] : '';
+    if (next === ',' || next === '}' || next === ']' || next === '') return i;
+  }
+  return -1;
+}
+
+function decodeLooseJsonString(raw: string): string {
+  return raw
+    .replace(/\\r/g, '\r')
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\');
+}
+
+function pickLooseStringField(
+  text: string,
+  keys: string[]
+): { value: string; key: string; end: number } | undefined {
+  for (const key of keys) {
+    const re = new RegExp(`"${key}"\\s*:\\s*"`, 'g');
+    const m = re.exec(text);
+    if (!m) continue;
+    const start = m.index + m[0].length;
+    const end = findLooseJsonStringEnd(text, start);
+    if (end < 0) return undefined;
+    return { key, value: decodeLooseJsonString(text.slice(start, end)), end };
+  }
+  return undefined;
+}
+
+function pickLooseNumberField(text: string, key: string): number | undefined {
+  const m = new RegExp(`"${key}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`).exec(text);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function parseLooseStringifiedEdits(text: string): unknown[] {
+  const edits: unknown[] = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const objectStart = text.indexOf('{', pos);
+    if (objectStart < 0) break;
+    const rest = text.slice(objectStart);
+    const pathPicked = pickLooseStringField(rest, [
+      'path',
+      'file',
+      'filePath',
+      'filename',
+      'fileName',
+      'target',
+      'targetFile',
+      'uri'
+    ]);
+    const newTextPicked = pickLooseStringField(rest, [
+      'newText',
+      'new_text',
+      'replacement',
+      'code',
+      'content',
+      'text'
+    ]);
+    if (!pathPicked || !newTextPicked) {
+      pos = objectStart + 1;
+      continue;
+    }
+    const segment = rest.slice(0, Math.max(pathPicked.end, newTextPicked.end) + 1);
+    edits.push({
+      [pathPicked.key]: pathPicked.value,
+      newText: newTextPicked.value,
+      ...(pickLooseNumberField(segment, 'startLine') !== undefined
+        ? { startLine: pickLooseNumberField(segment, 'startLine') }
+        : {}),
+      ...(pickLooseNumberField(segment, 'endLine') !== undefined
+        ? { endLine: pickLooseNumberField(segment, 'endLine') }
+        : {}),
+      ...(pickLooseStringField(segment, ['oldText', 'old_text', 'original', 'search'])?.value !== undefined
+        ? { oldText: pickLooseStringField(segment, ['oldText', 'old_text', 'original', 'search'])?.value }
+        : {})
+    });
+    pos = objectStart + newTextPicked.end + 1;
+  }
+  return edits;
 }
 
 /** A single answer choice presented to the user. */
@@ -116,7 +218,41 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
               (k) => k !== 'edits' && Array.isArray((args as Record<string, unknown>)[k])
             )
           : undefined;
-      const rawEdits = Array.isArray(rawEditsCandidate) ? rawEditsCandidate : [];
+      let rawEdits: unknown[];
+      let stringifiedEditsParseFailed = false;
+      if (Array.isArray(rawEditsCandidate)) {
+        rawEdits = rawEditsCandidate;
+      } else if (typeof rawEditsCandidate === 'string') {
+        try {
+          const parsed = JSON.parse(rawEditsCandidate);
+          rawEdits = Array.isArray(parsed) ? parsed : [];
+        } catch {
+          // LLM often emits literal newlines/tabs inside JSON string values.
+          // Try the same control-char repair used for top-level tool args.
+          // Pass 1: fix raw control chars (literal \n, \t, etc. inside strings).
+          const controlRepaired = repairJsonControlChars(rawEditsCandidate);
+          const afterControl = controlRepaired ?? rawEditsCandidate;
+          let parsedInner: unknown = null;
+          try {
+            parsedInner = JSON.parse(afterControl);
+          } catch {
+            // Pass 2: fix unescaped " inside strings (e.g. Python """ docstrings).
+            const quoteRepaired = repairJsonUnescapedQuotes(afterControl);
+            if (quoteRepaired !== null) {
+              try { parsedInner = JSON.parse(quoteRepaired); } catch { /* give up */ }
+            }
+          }
+          if (Array.isArray(parsedInner)) {
+            rawEdits = parsedInner;
+          } else {
+            const quoteRepaired = repairJsonUnescapedQuotes(afterControl);
+            rawEdits = parseLooseStringifiedEdits(quoteRepaired ?? afterControl);
+            stringifiedEditsParseFailed = rawEdits.length === 0;
+          }
+        }
+      } else {
+        rawEdits = [];
+      }
       // Top-level path fallback: when the model emits {summary, path, edits:
       // [{oldText, newText}, ...]} (a single-file convenience form it
       // sometimes invents), propagate that path to every hunk that lacks
@@ -191,7 +327,9 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
         const diagnosis = !Array.isArray(editsField)
           ? editsField === undefined
             ? `'edits' field is missing. Received top-level keys: [${presentKeys.join(', ') || '(none)'}]. The schema requires {summary: string, edits: array<{path, newText, oldText?, startLine?, endLine?}>}`
-            : `'edits' was not an array (got ${typeof editsField}: ${JSON.stringify(editsField).slice(0, 120)})`
+            : typeof editsField === 'string' && stringifiedEditsParseFailed
+              ? `'edits' was a string and could not be parsed as a complete edits array. It is likely malformed or truncated inside a large newText value (received ${editsField.length} chars; head: ${JSON.stringify(editsField).slice(0, 160)}). Re-emit smaller propose_edit calls, one file/hunk at a time. Do not switch to write_file for user project source changes; write_file bypasses review/rollback and is only appropriate for temporary/generated files that will be executed immediately.`
+              : `'edits' was not an array (got ${typeof editsField}: ${JSON.stringify(editsField).slice(0, 120)})`
           : editsField.length === 0
             ? "'edits' array was empty"
             : `all ${editsField.length} edit(s) were skipped: ${skipReasons.join('; ')}`;

@@ -5,6 +5,7 @@ import { FALLBACK_SYSTEM_PROMPT } from './prompts';
 import { compressMessages, defaultCompressorConfig, normalizeToolResult } from '../context/Compressor';
 import { estimateMessagesTokens } from '../llm/tokenizer';
 import { Logger } from '../util/Logger';
+import { repairJsonControlChars, repairJsonUnescapedQuotes } from '../util/jsonRepair';
 import { HunkApplier } from '../edits/HunkApplier';
 import { AskUserFn } from './tools/edits';
 
@@ -14,6 +15,7 @@ export interface AgentEvent {
     | 'assistant-message'
     | 'reasoning-delta'
     | 'tool-call-start'
+    | 'tool-call-args-delta'
     | 'tool-call-end'
     | 'tool-progress'
     | 'iteration-start'
@@ -389,6 +391,8 @@ export class AgentLoop {
         number,
         { id?: string; name: string; arguments: string }
       >();
+      const preAnnounced = new Set<number>();
+      const argDeltaBuffers = new Map<string, string>(); // id -> buffered arg text not yet emitted
       let finishReason: string | undefined;
 
       // Auto-resume on transient stream errors. We retry the whole turn
@@ -406,6 +410,8 @@ export class AgentLoop {
         assistantText = '';
         reasoningText = '';
         toolCallAccumulator.clear();
+        preAnnounced.clear();
+        argDeltaBuffers.clear();
         finishReason = undefined;
         // Overall timeout for the LLM stream: if chunks stop arriving for
         // 120s, treat it as a stream error and either retry or surface it.
@@ -463,6 +469,26 @@ export class AgentLoop {
               if (chunk.toolCallDelta.name) entry.name = chunk.toolCallDelta.name;
               if (chunk.toolCallDelta.argumentsDelta) entry.arguments += chunk.toolCallDelta.argumentsDelta;
               toolCallAccumulator.set(idx, entry);
+              // Pre-announce: emit tool-call-start as soon as the tool NAME is known.
+              // Do NOT require entry.id — many OpenAI-compatible models omit id from
+              // streaming deltas and only set it in the final assistant message.
+              if (!preAnnounced.has(idx) && entry.name) {
+                preAnnounced.add(idx);
+                yield { type: 'tool-call-start', payload: { name: entry.name, id: entry.id, args: {}, streaming: true } };
+              }
+              // Stream argument text to UI. Use idx (stable integer index) as the
+              // buffer key so we don't need entry.id, which may be absent.
+              if (preAnnounced.has(idx) && chunk.toolCallDelta.argumentsDelta) {
+                const bufKey = String(idx);
+                const prev = argDeltaBuffers.get(bufKey) ?? '';
+                const next = prev + chunk.toolCallDelta.argumentsDelta;
+                if (next.length >= 40) {
+                  argDeltaBuffers.set(bufKey, '');
+                  yield { type: 'tool-call-args-delta', payload: { id: entry.id, delta: next } };
+                } else {
+                  argDeltaBuffers.set(bufKey, next);
+                }
+              }
             }
             if (chunk.finishReason) finishReason = chunk.finishReason;
           }
@@ -471,6 +497,13 @@ export class AgentLoop {
             return;
           }
           streamOk = true;
+          // Flush any buffered arg delta text that didn't reach the 40-char threshold.
+          // The buffer keys are String(idx), not entry.id — send id:undefined so the
+          // webview falls back to activeStreamingToolEl for element lookup.
+          for (const [, buf] of argDeltaBuffers) {
+            if (buf) yield { type: 'tool-call-args-delta', payload: { id: undefined, delta: buf } };
+          }
+          argDeltaBuffers.clear();
           // Empty response with no finish_reason = transient backend issue (silent
           // dropped body, vLLM/sglang returning nothing).  Treat exactly like a
           // stream error: auto-resume up to maxResumes times, then terminate the
@@ -763,17 +796,24 @@ export class AgentLoop {
             // Try a tolerant repair pass — escape control chars that lie
             // INSIDE string literals — before declaring defeat.
             const repaired = repairJsonControlChars(tc.arguments);
-            if (repaired !== null) {
-              try {
-                parsed = JSON.parse(repaired);
-                this.logger.info(
-                  `Tool args ${tc.name}: parsed after lenient control-char repair`
-                );
-              } catch (err2) {
+            const afterControl = repaired ?? tc.arguments;
+            try {
+              parsed = JSON.parse(afterControl);
+              if (repaired !== null)
+                this.logger.info(`Tool args ${tc.name}: parsed after control-char repair`);
+            } catch (err2) {
+              // Also try escaping unescaped quotes (e.g. Python """ docstrings in newText).
+              const quoteRepaired = repairJsonUnescapedQuotes(afterControl);
+              if (quoteRepaired !== null) {
+                try {
+                  parsed = JSON.parse(quoteRepaired);
+                  this.logger.info(`Tool args ${tc.name}: parsed after unescaped-quote repair`);
+                } catch (err3) {
+                  parseError = err3 instanceof Error ? err3.message : String(err3);
+                }
+              } else {
                 parseError = err2 instanceof Error ? err2.message : String(err2);
               }
-            } else {
-              parseError = err instanceof Error ? err.message : String(err);
             }
             if (parseError) {
               this.logger.warn('Tool args parse failed', tc.name, parseError, tc.arguments);
@@ -793,9 +833,10 @@ export class AgentLoop {
 
       // Emit tool-call-start events in original order so the chat panel
       // renders a stable left-to-right tree, even when we run them in
-      // parallel below.
+      // parallel below. Tools already pre-announced during streaming get an
+      // update (args now resolved) instead of a fresh insert.
       for (const c of prepared) {
-        yield { type: 'tool-call-start', payload: { name: c.name, args: c.parsed, id: c.callId } };
+        yield { type: 'tool-call-start', payload: { name: c.name, args: c.parsed, id: c.callId, update: preAnnounced.has(c.index) } };
       }
 
       const executeOne = async (c: PreparedCall): Promise<ToolResult> => {
@@ -1109,61 +1150,3 @@ export class AgentLoop {
   }
 }
 
-/**
- * Walk a JSON-ish string and escape any RAW control character (codes < 0x20)
- * that lies INSIDE a string literal. This is the LLM's single most common
- * malformed-JSON failure mode for code-edit tools: the model copies a chunk
- * of source straight into a JSON string value and forgets that JSON requires
- * tabs / newlines / CR to be \\t / \\n / \\r. We don't try to repair other
- * forms of malformed JSON (unbalanced braces, unescaped quotes, half-finished
- * escapes) — those would risk silently changing the model's intent.
- *
- * Returns the rewritten string when at least one control character was
- * escaped, or `null` when the input contains no in-string control bytes
- * (so the caller can surface the original parse error verbatim).
- */
-function repairJsonControlChars(input: string): string | null {
-  let out = '';
-  let inString = false;
-  let escape = false;
-  let changed = false;
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i];
-    const code = ch.charCodeAt(0);
-    if (escape) {
-      // Preserve the next character verbatim — it's the second half of an
-      // escape sequence (\\n, \\t, \\u..., etc). We don't validate these
-      // here; if they're invalid, the second JSON.parse pass will surface it.
-      out += ch;
-      escape = false;
-      continue;
-    }
-    if (inString) {
-      if (ch === '\\') {
-        out += ch;
-        escape = true;
-        continue;
-      }
-      if (ch === '"') {
-        out += ch;
-        inString = false;
-        continue;
-      }
-      if (code < 0x20) {
-        changed = true;
-        if (code === 0x09) out += '\\t';
-        else if (code === 0x0a) out += '\\n';
-        else if (code === 0x0d) out += '\\r';
-        else if (code === 0x08) out += '\\b';
-        else if (code === 0x0c) out += '\\f';
-        else out += '\\u' + code.toString(16).padStart(4, '0');
-        continue;
-      }
-      out += ch;
-      continue;
-    }
-    out += ch;
-    if (ch === '"') inString = true;
-  }
-  return changed ? out : null;
-}

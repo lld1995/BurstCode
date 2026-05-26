@@ -768,6 +768,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.broadcastLessons();
         break;
       }
+      case 'open-file': {
+        const p = (msg.payload ?? {}) as { path?: string; line?: number };
+        const filePath = String(p.path ?? '').trim();
+        if (!filePath) break;
+        try {
+          let uri: vscode.Uri;
+          if (filePath.startsWith('/') || (filePath.length > 2 && filePath[1] === ':')) {
+            uri = vscode.Uri.file(filePath);
+          } else {
+            const folder = vscode.workspace.workspaceFolders?.[0];
+            if (!folder) break;
+            uri = vscode.Uri.joinPath(folder.uri, filePath);
+          }
+          const doc = await vscode.workspace.openTextDocument(uri);
+          const line = typeof p.line === 'number' && p.line > 0 ? p.line - 1 : 0;
+          await vscode.window.showTextDocument(doc, {
+            selection: new vscode.Range(line, 0, line, 0),
+            preserveFocus: false
+          });
+        } catch (err) {
+          this.logger.warn('open-file failed', String(err));
+        }
+        break;
+      }
+      case 'find-symbol': {
+        const p = (msg.payload ?? {}) as { name?: string };
+        const symbolName = String(p.name ?? '').trim();
+        if (!symbolName) break;
+        try {
+          const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+            'vscode.executeWorkspaceSymbolProvider', symbolName
+          );
+          if (symbols && symbols.length > 0) {
+            const sym = symbols[0];
+            const doc = await vscode.workspace.openTextDocument(sym.location.uri);
+            await vscode.window.showTextDocument(doc, {
+              selection: sym.location.range,
+              preserveFocus: false
+            });
+          }
+        } catch (err) {
+          this.logger.warn('find-symbol failed', String(err));
+        }
+        break;
+      }
       default:
         this.logger.warn('Unknown webview message', msg.type);
     }
@@ -1139,6 +1184,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           case 'tool-call-end':
             postLive({ type: 'tool-call-end', payload: event.payload });
             break;
+          case 'tool-call-args-delta':
+            postLive({ type: 'tool-call-args-delta', payload: event.payload });
+            break;
           case 'tool-progress':
             postLive({ type: 'tool-progress', payload: event.payload });
             break;
@@ -1282,6 +1330,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private renderHtml(webview: vscode.Webview): string {
     const nonce = Math.random().toString(36).slice(2);
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
     const csp = [
       `default-src 'none'`,
       `style-src ${webview.cspSource} 'unsafe-inline'`,
@@ -1574,6 +1623,14 @@ setTimeout(() => {
   .md hr { border: none; border-top: 1px solid var(--vscode-panel-border); margin: 1em 0; }
   .md a { color: var(--vscode-textLink-foreground); text-decoration: none; }
   .md a:hover { text-decoration: underline; color: var(--vscode-textLink-activeForeground); }
+  .md .file-link { color: var(--vscode-textLink-foreground); text-decoration: none; cursor: pointer; }
+  .md .file-link:hover { text-decoration: underline; color: var(--vscode-textLink-activeForeground); }
+  .md .file-link code { border-color: color-mix(in srgb, var(--vscode-textLink-foreground) 50%, var(--vscode-panel-border)); }
+  .md pre .code-head .file-link { font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 1em; opacity: 1; color: var(--vscode-textLink-foreground); }
+  .md pre .code-head .file-link:hover { text-decoration: underline; color: var(--vscode-textLink-activeForeground); }
+  .md .symbol-link { color: var(--vscode-symbolIcon-functionForeground, var(--vscode-textLink-foreground)); text-decoration: none; cursor: pointer; }
+  .md .symbol-link:hover { text-decoration: underline; }
+  .md .symbol-link code { border-color: color-mix(in srgb, var(--vscode-symbolIcon-functionForeground, var(--vscode-textLink-foreground)) 50%, var(--vscode-panel-border)); }
   .md code { font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 0.92em; background: var(--vscode-textCodeBlock-background); padding: 1px 5px; border-radius: 3px; border: 1px solid var(--vscode-panel-border); }
   .md pre { margin: 0.6em 0; padding: 0; border-radius: 6px; background: var(--vscode-textCodeBlock-background); border: 1px solid var(--vscode-panel-border); overflow: hidden; }
   .md pre .code-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; font-family: var(--vscode-font-family); font-size: 0.74em; opacity: 0.7; border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); user-select: none; }
@@ -1610,6 +1667,7 @@ setTimeout(() => {
   .tool[data-error="true"] summary { color: var(--vscode-errorForeground); }
   .tool pre { margin: 4px 0 4px 4px; padding: 6px 8px; max-height: 260px; overflow: auto; white-space: pre-wrap; background: var(--vscode-textCodeBlock-background); border-radius: 4px; font-size: 0.95em; }
   .tool .tool-progress-log { max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  .tool .tool-args-stream { max-height: 300px; overflow: auto; white-space: pre-wrap; word-break: break-all; opacity: 0.8; }
   .tool[data-running="true"] summary::after { content: ''; display: inline-block; width: 7px; height: 7px; margin-left: 8px; border-radius: 50%; background: var(--vscode-charts-yellow); animation: pulse 1.1s ease-in-out infinite; vertical-align: middle; }
 
   .iter-pill { margin: 8px 0 4px; opacity: 0.55; font-size: 0.8em; }
@@ -1884,6 +1942,7 @@ setTimeout(() => {
 <script nonce="${nonce}">
 ${diagScript}
 const vscode = acquireVsCodeApi();
+const WORKSPACE_ROOT = ${JSON.stringify(workspaceRoot)};
 const log = document.getElementById('log');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('sendBtn');
@@ -1999,6 +2058,8 @@ const statusLabel = statusEl.querySelector('.label');
 const statusElapsed = statusEl.querySelector('.elapsed');
 
 let activeAssistantEl = null;
+let activeStreamingToolEl = null; // the <details> element currently receiving arg-stream content
+let renderScheduled = false;
 let activeReasoningEl = null;
 let toolElements = new Map();
 let runningTools = new Map(); // id -> { name, startedAt }
@@ -2025,6 +2086,20 @@ function isLogAtBottom() {
 function markManualScrollIntent() {
   lastManualScrollAt = Date.now();
 }
+// File-path and symbol link click delegation
+document.addEventListener('click', (ev) => {
+  const a = ev.target.closest && ev.target.closest('a[data-file-path], a[data-symbol-name]');
+  if (!a) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  if (a.dataset.symbolName) {
+    vscode.postMessage({ type: 'find-symbol', payload: { name: a.dataset.symbolName } });
+  } else {
+    const path = a.dataset.filePath || '';
+    const line = parseInt(a.dataset.fileLine || '0', 10);
+    if (path) vscode.postMessage({ type: 'open-file', payload: { path, line } });
+  }
+});
 log.addEventListener('wheel', markManualScrollIntent, { passive: true });
 log.addEventListener('touchmove', markManualScrollIntent, { passive: true });
 log.addEventListener('pointerdown', markManualScrollIntent, { passive: true });
@@ -2061,6 +2136,21 @@ function scrollToBottom() {
 function forceScrollToBottom() {
   autoScroll = true;
   scheduleScrollToBottom(true);
+}
+function scheduleRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    renderScheduled = false;
+    if (!activeAssistantEl) return;
+    const raw = activeAssistantEl.dataset.raw || '';
+    const mdEl = activeAssistantEl.querySelector('.md');
+    if (mdEl) {
+      mdEl.innerHTML = renderMarkdown(raw);
+      bindCodeCopy(mdEl);
+    }
+    scheduleScrollToBottom(false);
+  });
 }
 
 function fmtElapsed(ms) {
@@ -2746,6 +2836,7 @@ function renderTranscript(entries) {
   toolElements.clear();
   activeAssistantEl = null;
   activeReasoningEl = null;
+  activeStreamingToolEl = null;
   if (!entries || entries.length === 0) {
     showEmptyState();
     return;
@@ -2985,11 +3076,31 @@ function renderMarkdown(src) {
 
   let html = out.join('\\n');
 
-  // Restore inline code (escape its body)
-  html = html.replace(/\\u0000INLINECODE(\\d+)\\u0000/g, (m, idx) => '<code>' + escapeHtml(inlineCodes[+idx]) + '</code>');
-  // Restore fenced code blocks
+  // Restore inline code — detect @file-path citations and make them clickable
+  html = html.replace(/\\u0000INLINECODE(\\d+)\\u0000/g, (m, idx) => {
+    const raw = inlineCodes[+idx];
+    const fp = parseFilePath(raw);
+    if (fp) {
+      const label = escapeHtml(fileDisplayLabel(fp.path, fp.line, fp.end));
+      return '<a class="file-link" href="#" data-file-path="' + escapeHtml(fp.path) + '" data-file-line="' + fp.line + '" title="' + escapeHtml(fp.path + (fp.line ? ':' + fp.line : '')) + '"><code>' + label + '</code></a>';
+    }
+    const sym = /^([A-Za-z_$][\w$.]*)\(\s*\)$/.exec(raw.trim());
+    if (sym) {
+      return '<a class="symbol-link" href="#" data-symbol-name="' + escapeHtml(sym[1]) + '" title="Go to: ' + escapeHtml(sym[1]) + '"><code>' + escapeHtml(raw) + '</code></a>';
+    }
+    return '<code>' + escapeHtml(raw) + '</code>';
+  });
+  // Restore fenced code blocks — detect @file-path lang to render clickable header
   html = html.replace(/\\u0000CODEBLOCK(\\d+)\\u0000/g, (m, idx) => {
     const { lang, code } = codeBlocks[+idx];
+    const fp = lang ? parseFilePath(lang) : null;
+    if (fp) {
+      const ext = fp.path.split('.').pop() || 'text';
+      const langAttr = ' class="language-' + escapeHtml(ext) + '"';
+      const label = escapeHtml(fileDisplayLabel(fp.path, fp.line, fp.end));
+      const head = '<div class="code-head"><a class="file-link" href="#" data-file-path="' + escapeHtml(fp.path) + '" data-file-line="' + fp.line + '" title="' + escapeHtml(fp.path + (fp.line ? ':' + fp.line : '')) + '">' + label + '</a><button class="copy" type="button" title="Copy">⧉</button></div>';
+      return '<pre>' + head + '<code' + langAttr + '>' + escapeHtml(code) + '</code></pre>';
+    }
     const langAttr = lang ? ' class="language-' + escapeHtml(lang) + '"' : '';
     const head = '<div class="code-head"><span class="lang">' + (lang ? escapeHtml(lang) : 'text') + '</span><button class="copy" type="button" title="Copy">⧉</button></div>';
     return '<pre>' + head + '<code' + langAttr + '>' + escapeHtml(code) + '</code></pre>';
@@ -3004,10 +3115,35 @@ function splitTableRow(line) {
   return s.split('|').map((c) => c.trim());
 }
 
-function applyInline(s) {
-  // Links [text](url)
+function parseFilePath(raw) {
+  const m = /^@?((?:[A-Za-z]:[\\\\/]|\\/)[^:]*?|(?:[\w.-]+[\\/])+[\w.-]+\.[\w]{1,8})(?::(\\d+)(?:-(\\d+))?)?$/.exec(String(raw).trim());
+  if (!m) return null;
+  return { path: m[1], line: m[2] ? parseInt(m[2], 10) : 0, end: m[3] ? parseInt(m[3], 10) : 0 };
+}
+function fileDisplayLabel(path, line, end) {
+  const name = path.split(/[\\\\/]/).pop() || path;
+  return name + (line ? ':' + line + (end ? '-' + end : '') : '');
+}
+function applyInline(s) {  // [label](file:path:line) — primary file link format
+  s = s.replace(/\\[([^\\]]+)\\]\\(file:([^)]+)\\)/g, (m, label, ref) => {
+    const rm = /^(.*?)(?::(\\d+)(?:-(\\d+))?)?$/.exec(ref);
+    const path = rm ? rm[1] : ref;
+    const line = rm && rm[2] ? parseInt(rm[2], 10) : 0;
+    return '<a class="file-link" href="#" data-file-path="' + escapeHtml(path) + '" data-file-line="' + line + '" title="' + escapeHtml(path + (line ? ':' + line : '')) + '">' + escapeHtml(label) + '</a>';
+  });
+  // [label](sym:name) — primary symbol link format
+  s = s.replace(/\\[([^\\]]+)\\]\\(sym:([^)]+)\\)/g, (m, label, name) => {
+    return '<a class="symbol-link" href="#" data-symbol-name="' + escapeHtml(name) + '" title="Go to: ' + escapeHtml(name) + '">' + escapeHtml(label) + '</a>';
+  });
+// Links [text](url)
   s = s.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, (m, label, url) => {
     return '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer">' + label + '</a>';
+  });
+  // File path citations: @/abs/path.ts:line or @C:\path.ts:line in plain text
+  s = s.replace(/@((?:[A-Za-z]:[\\\\/]|\\/)\\S+?)(?::(\\d+)(?:-(\\d+))?)?(?=[\\s,;!?<]|$)/g, (m, p, l1, l2) => {
+    const line = l1 ? parseInt(l1, 10) : 0;
+    const label = escapeHtml(fileDisplayLabel(p, line, l2 ? parseInt(l2, 10) : 0));
+    return '<a class="file-link" href="#" data-file-path="' + p + '" data-file-line="' + line + '" title="' + p + (l1 ? ':' + l1 : '') + '"><code>' + label + '</code></a>';
   });
   // Bold ** or __
   s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
@@ -3241,6 +3377,7 @@ window.addEventListener('message', (e) => {
       log.innerHTML = '';
       activeAssistantEl = null;
       activeReasoningEl = null;
+      activeStreamingToolEl = null;
       toolElements.clear();
       runningTools.clear();
       currentIter = 0;
@@ -3345,6 +3482,7 @@ window.addEventListener('message', (e) => {
     case 'run-start': {
       activeAssistantEl = null;
       activeReasoningEl = null;
+      activeStreamingToolEl = null;
       runningTools.clear();
       currentIter = 0;
       runStartedAt = 0;
@@ -3391,6 +3529,15 @@ window.addEventListener('message', (e) => {
       }
       activeAssistantEl = null;
       activeReasoningEl = null;
+      activeStreamingToolEl = null;
+      // Remove all running tool elements — execution never started (stream failed).
+      for (const [key, det] of Array.from(toolElements.entries())) {
+        if (det.dataset.running === 'true') {
+          if (det.parentNode) det.parentNode.removeChild(det);
+          toolElements.delete(key);
+          runningTools.delete(key);
+        }
+      }
       const attempt = (msg.payload && msg.payload.attempt) || 1;
       const max = (msg.payload && msg.payload.max) || 1;
       const errText = (msg.payload && msg.payload.error) ? String(msg.payload.error) : 'stream interrupted';
@@ -3428,14 +3575,8 @@ window.addEventListener('message', (e) => {
           setStatus('busy', currentIter ? 'Streaming (iter ' + currentIter + ')...' : 'Streaming...');
         }
       }
-      const raw = (activeAssistantEl.dataset.raw || '') + msg.payload.text;
-      activeAssistantEl.dataset.raw = raw;
-      const mdEl = activeAssistantEl.querySelector('.md');
-      if (mdEl) {
-        mdEl.innerHTML = renderMarkdown(raw);
-        bindCodeCopy(mdEl);
-      }
-      scrollToBottom();
+      activeAssistantEl.dataset.raw = (activeAssistantEl.dataset.raw || '') + msg.payload.text;
+      scheduleRender();
       break;
     }
     case 'assistant-message':
@@ -3465,20 +3606,55 @@ window.addEventListener('message', (e) => {
       break;
     case 'tool-call-start': {
       clearEmptyState();
+      const existingKey = msg.payload.id || msg.payload.name + Date.now();
+      if (toolElements.has(existingKey)) {
+        const existingDet = toolElements.get(existingKey);
+        const existingSum = existingDet.querySelector('summary');
+        if (existingSum) existingSum.textContent = '\u{1F527} ' + msg.payload.name + '(' + JSON.stringify(msg.payload.args).slice(0, 200) + ') \u00b7 running...';
+        delete existingDet.dataset.streaming;
+        activeStreamingToolEl = null;
+        break;
+      }
       const det = document.createElement('details');
       det.className = 'tool';
       det.dataset.running = 'true';
-      det.open = false;
+      if (msg.payload.streaming) {
+        det.dataset.streaming = 'true';
+        activeStreamingToolEl = det;
+        det.open = true;
+      } else {
+        det.open = false;
+      }
       const sum = document.createElement('summary');
       sum.textContent = '\u{1F527} ' + msg.payload.name + '(' + JSON.stringify(msg.payload.args).slice(0, 200) + ') \u00b7 running...';
       det.appendChild(sum);
       log.appendChild(det);
-      const key = msg.payload.id || msg.payload.name + Date.now();
+      const key = existingKey;
       toolElements.set(key, det);
       runningTools.set(key, { name: msg.payload.name, startedAt: Date.now() });
       const names = Array.from(runningTools.values()).map((t) => t.name).join(', ');
       setStatus('tool', 'Running ' + names + '...');
       scrollToBottom();
+      break;
+    }
+    case 'tool-call-args-delta': {
+      const argKey = msg.payload && msg.payload.id;
+      // Prefer id-based lookup; fall back to the currently-streaming element.
+      // Some models omit id from streaming deltas, so we can't rely on it.
+      const argDet = (argKey && toolElements.get(argKey)) || activeStreamingToolEl;
+      if (argDet) {
+        argDet.dataset.argsBuf = (argDet.dataset.argsBuf || '') + msg.payload.delta;
+        const buf = argDet.dataset.argsBuf;
+        if (buf.length > 8000) argDet.dataset.argsBuf = '...' + buf.slice(-7000);
+        let argPre = argDet.querySelector('.tool-args-stream');
+        if (!argPre) {
+          argPre = document.createElement('pre');
+          argPre.className = 'tool-args-stream';
+          argDet.appendChild(argPre);
+        }
+        argPre.textContent = argDet.dataset.argsBuf;
+        scrollToBottom();
+      }
       break;
     }
     case 'tool-progress': {
@@ -3758,6 +3934,14 @@ window.addEventListener('message', (e) => {
     case 'error':
       addErrorMsg('⚠ ' + (typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload)));
       setBusy(false);
+      for (const [key, det] of Array.from(toolElements.entries())) {
+        if (det.dataset.running === 'true') {
+          det.dataset.running = 'false';
+          const s = det.querySelector('summary');
+          if (s) s.textContent = '\u26a0 ' + ((runningTools.get(key) || {}).name || '?') + ' \u00b7 cancelled';
+        }
+      }
+      activeStreamingToolEl = null;
       runningTools.clear();
       setStatus('error', 'Error');
       break;
@@ -3776,6 +3960,16 @@ window.addEventListener('message', (e) => {
         'aborted-stuck': 'Stopped: aborted after repeated tool-calls'
       };
       const errorish = reason === 'cancelled' || reason === 'max_iterations' || reason === 'stuck' || reason === 'aborted-stuck';
+      // Cancel any leftover pre-announced tool elements that never ran.
+      for (const [key, det] of toolElements) {
+        if (det.dataset.streaming === 'true') {
+          det.dataset.running = 'false';
+          delete det.dataset.streaming;
+          const s = det.querySelector('summary');
+          if (s) s.textContent = '\u26a0 ' + ((runningTools.get(key) || {}).name || '?') + ' \u00b7 cancelled';
+          toolElements.delete(key); runningTools.delete(key);
+        }
+      }
       setStatus(errorish ? 'error' : 'done', labels[reason] || ('Done (' + reason + ')'));
       break;
     }
