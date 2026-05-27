@@ -167,8 +167,11 @@ const PROTOCOL = `WORKING PROTOCOL:
      immediately execute or read back. Writes to disk instantly, no review step.
 
 9. After propose_edit you may continue with verification (read_file to confirm context,
-   plan updates, additional propose_edit calls to refine) or end the turn with a brief
-   summary. Do NOT wait for the user — they accept/reject asynchronously.
+   plan updates, additional propose_edit calls to refine, run_shell to build/test) or end
+   the turn with a brief summary. Do NOT wait for the user — they accept/reject
+   asynchronously. NEVER say "please accept the pending edits before building/testing" —
+   the edits are ALREADY ON DISK the moment propose_edit returns. Build and test
+   immediately without any user action required.
 
 10. If you call propose_edit multiple times for the same file, prefer non-overlapping hunks.
     Overlapping hunks replace the earlier queued ones.
@@ -225,18 +228,18 @@ This agent loop can execute MULTIPLE tool calls from a single assistant message
 CONCURRENTLY. Each round-trip to me is expensive (tokens + latency), so you
 MUST aggressively batch independent tool calls into one turn whenever possible.
 
-FIRST MOVE — collect_context:
-For any non-trivial question (anything requiring > 1 file or > 1 grep), your
-FIRST assistant turn should be a single collect_context call. Before emitting
-it, THINK AHEAD: list every file, grep pattern, dir, and outline you could
-possibly need for this task, and include ALL of them in that one call.
-Over-requesting is cheap; a second round-trip is expensive.
-Everything runs concurrently and comes back in one result.
+FIRST MOVE — launch_subagent (exploration) OR collect_context (targeted pre-edit):
 
-collect_context applies per user message — each time the user sends a new
-message a fresh run starts and a new collect_context sweep is appropriate.
+  • Broad exploration (2+ files, unknown area, grep sweep, subsystem):
+      → launch_subagent with a focused objective. It reads inside its OWN
+        isolated context window; only its concise summary comes back here.
+        Do NOT call collect_context / read_file directly for this.
 
-After receiving a collect_context result, follow these rules:
+  • Targeted pre-edit lookup (you know the exact file, range, about to propose_edit):
+      → collect_context or read_file for that ONE specific file/range ONLY.
+        After reading, go directly to propose_edit — no further reads.
+
+After receiving a collect_context / read_file result, follow these rules:
   - If the result contains everything you need → move DIRECTLY to analysis
     and action (propose_edit, answer, etc.) with NO further reads.
   - Files / patterns that returned useful content: do NOT re-read them.
@@ -245,9 +248,9 @@ After receiving a collect_context result, follow these rules:
     You MAY issue ONE corrective collect_context for the failed items only,
     with fixed paths / patterns. This is the MAXIMUM allowed second sweep.
   - New leads discovered (a path or line number you didn't know before):
-    fold them into the corrective sweep above if one is needed, or issue a
+    fold them into a corrective sweep if one is needed, or issue a
     single targeted read_file / grep_search if only 1 new item is needed.
-  - NEVER issue more than 4 collect_context calls per user message.
+  - NEVER issue more than 2 collect_context calls per user message.
 
 Only use individual read_file / grep_search / list_dir calls when:
   - You already have the full context you need (from workspace_layout or a
@@ -255,18 +258,16 @@ Only use individual read_file / grep_search / list_dir calls when:
   - You are following up on exactly ONE new lead found in a previous result.
 
 When to emit MULTIPLE tool_calls in ONE assistant message:
-  - You need to read 2+ files / file regions to understand a feature
-      → emit N parallel read_file calls in one turn (NOT one at a time).
   - You need to look at the same symbol from different angles
       → emit find_references_by_name + find_definition + hover_info together.
   - You need both text-shape and semantic-shape evidence
       → emit grep_search + document_symbols in one turn.
-  - You are exploring an unknown sub-tree
-      → emit list_dir + workspace_outline + grep_search for the keyword in one turn.
   - You are about to propose edits to multiple INDEPENDENT files
       → emit N parallel propose_edit calls in one turn.
   - You need to write a script AND read a file to prepare arguments for it
       → emit write_file + read_file in one turn, then run_shell in the next.
+  - You need to read 2+ files right before propose_edit (tight pre-edit pass)
+      → emit N parallel read_file calls in one turn (tight line ranges only).
 
 When NOT to batch:
   - The 2nd call's arguments DEPEND on the 1st call's result (e.g. you need a
@@ -282,9 +283,9 @@ Heuristic: before emitting any tool_call, ask yourself "what ELSE do I need
 to know that does NOT depend on this call's result?" — if there are 2+ such
 questions, emit them all in this turn.
 
-For LARGE independent fan-outs (3+ tasks that can each take many tool calls),
-consider launch_subagent instead — it runs each task in its own focused agent
-loop with its own context budget.`;
+For ANY fan-out requiring 2+ file reads for understanding (not immediate editing),
+use launch_subagent — it runs each task in its own isolated context window and
+returns only a concise summary, keeping THIS context window lean.`;
 
 const RULES = `RULES:
 - Never guess file paths. Either they appear in <workspace_layout>, or you confirmed them

@@ -241,31 +241,21 @@ export function normalizeToolResult(toolName: string, content: string): string {
   // Nothing to compress
   if (content.length < 200) return content;
 
-  // grep_search: strip matched file paths that are purely informational after
-  // the model has already seen them; keep only the first 60 match lines.
+  // grep_search: no storage-time cap; zone compression handles old results.
   if (toolName === 'grep_search') {
-    const lines = content.split('\n');
-    if (lines.length > 62) {
-      const header = lines[0];
-      const kept = lines.slice(1, 61);
-      return `${header}\n${kept.join('\n')}\n...[${lines.length - 61} more lines omitted]`;
-    }
     return content;
   }
 
-  // read_file: cap at 4000 chars (tighter than AgentLoop's 6000 global cap)
+  // read_file: no storage-time cap. The tool itself limits output to at most
+  // endLine-startLine+1 lines (default 200); zone compression in compressMessages
+  // handles truncating stale reads. Capping here would hide content from the
+  // model even on the current turn, which breaks large-file editing.
   if (toolName === 'read_file') {
-    if (content.length > 4000) {
-      return content.slice(0, 4000) + `\n...[truncated ${content.length - 4000} chars]`;
-    }
     return content;
   }
 
-  // list_dir / workspace_outline: cap at 1500 chars
+  // list_dir / workspace_outline: no storage-time cap.
   if (toolName === 'list_dir' || toolName === 'workspace_outline') {
-    if (content.length > 1500) {
-      return content.slice(0, 1500) + `\n...[truncated]`;
-    }
     return content;
   }
 
@@ -303,40 +293,24 @@ export function normalizeToolResult(toolName: string, content: string): string {
     return sections.join('\n\n');
   }
 
-  // LSP reference / implementation tools: header + locations + optional
-  // snippets. Snippets dominate the byte count, so cap how many we keep.
+  // LSP reference / implementation tools: no storage-time cap.
   if (
     toolName === 'find_references' ||
     toolName === 'find_references_by_name' ||
     toolName === 'find_implementations' ||
     toolName === 'find_definition'
   ) {
-    if (content.length <= 4000) return content;
-    // Snippets are separated by blank lines after the locations block. We
-    // keep the header + locations in full and clip the snippet tail.
-    const blocks = content.split(/\n\n+/);
-    if (blocks.length <= 3) return truncateMiddle(content, 2500, 1200);
-    const kept = blocks.slice(0, 8);
-    const omitted = blocks.length - kept.length;
-    return kept.join('\n\n') + `\n\n...[${omitted} more snippet block(s) omitted]`;
-  }
-
-  // workspace_symbols / document_symbols: flat lists; cap line count.
-  if (toolName === 'workspace_symbols' || toolName === 'document_symbols') {
-    const lines = content.split('\n');
-    if (lines.length > 82) {
-      return `${lines.slice(0, 80).join('\n')}\n...[${lines.length - 80} more symbol(s) omitted]`;
-    }
     return content;
   }
 
-  // hover_info: docstring-heavy markdown; squeeze blank lines and cap.
+  // workspace_symbols / document_symbols: no storage-time cap.
+  if (toolName === 'workspace_symbols' || toolName === 'document_symbols') {
+    return content;
+  }
+
+  // hover_info: squeeze consecutive blank lines but no hard cap.
   if (toolName === 'hover_info') {
-    const squeezed = content.replace(/\n{3,}/g, '\n\n');
-    if (squeezed.length > 2000) {
-      return squeezed.slice(0, 2000) + `\n...[truncated]`;
-    }
-    return squeezed;
+    return content.replace(/\n{3,}/g, '\n\n');
   }
 
   // launch_subagent: concatenated per-task reports; keep head + tail so the
@@ -348,11 +322,8 @@ export function normalizeToolResult(toolName: string, content: string): string {
     return content;
   }
 
-  // get_function_range: similar to read_file but always whole-function; cap.
+  // get_function_range: no storage-time cap, same rationale as read_file above.
   if (toolName === 'get_function_range') {
-    if (content.length > 4000) {
-      return content.slice(0, 4000) + `\n...[truncated ${content.length - 4000} chars]`;
-    }
     return content;
   }
 

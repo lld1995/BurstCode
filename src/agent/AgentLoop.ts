@@ -40,7 +40,7 @@ const AUTO_COMPRESS_TARGET_RATIO = 0.4;
  * collection to launch_subagent so the sub-agent's independent context window
  * absorbs the raw content and only the summary returns to the main conversation.
  */
-const CONTEXT_OFFLOAD_HINT_THRESHOLD = 3;
+const CONTEXT_OFFLOAD_HINT_THRESHOLD = 1;
 
 /**
  * After how many CONSECUTIVE turns of identical tool-call batches we consider
@@ -426,7 +426,7 @@ export class AgentLoop {
         ...defaultCompressorConfig,
         contextWindow: this.options.contextWindow,
         inputBudgetRatio: 0.6,
-        keepLastN: 3
+        keepLastN: 1
       });
 
       let assistantText = '';

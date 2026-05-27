@@ -187,11 +187,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // sees what the user did in between turns. The model will read this as
       // ordinary user-side context and react accordingly.
       if (state.recentDecision && this.currentSession) {
-        this.currentSession.messages.push({
-          role: 'user',
-          content: `(System note) The user reviewed the previously queued edits — ${state.recentDecision}. Take this into account on the next instruction.`
-        });
-        void this.persistCurrentSession();
+        // Only inject the inter-turn note when no agent run is active for
+        // this session. When a run IS active, AgentLoop's decisionBuffer
+        // already captures this same event and injects it at the correct
+        // iteration boundary — injecting here too would duplicate the message.
+        if (!this.runs.has(this.currentSession.id)) {
+          this.currentSession.messages.push({
+            role: 'user',
+            content: `(System note) The user reviewed the previously queued edits — ${state.recentDecision}. Take this into account on the next instruction.`
+          });
+          void this.persistCurrentSession();
+        }
       }
     });
     this.context.subscriptions.push({

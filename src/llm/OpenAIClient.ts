@@ -405,6 +405,49 @@ function normalizeReasoningContent(messages: ChatMessage[]): ChatMessage[] {
   });
 }
 
+/**
+ * Prepare messages for the target model, applying model-specific normalisation:
+ *
+ * Claude (native Anthropic API or OpenAI-compatible proxies that translate to it):
+ *   1. Strip `reasoning_content` entirely — proxies convert this field into an
+ *      Anthropic `thinking` content block and then reject the request because they
+ *      cannot synthesise a valid `signature`, producing:
+ *        400 messages.1.content.0.thinking.signature: Field required
+ *   2. Strip `thinking`-type content blocks that lack a valid `signature` — such
+ *      blocks arise when a session was saved without the original signature (e.g.
+ *      after a cancelled stream or a schema migration) and trigger the same error
+ *      on round-trip.
+ *
+ * All other models (Qwen/DashScope, DeepSeek, …):
+ *   Backfill `reasoning_content: ''` when the field is absent so Qwen-thinking
+ *   endpoints always receive a shape-correct request body.
+ */
+function prepareMessagesForModel(messages: ChatMessage[], model: string): ChatMessage[] {
+  if (model.toLowerCase().includes('claude')) {
+    return messages.map((m) => {
+      if (m.role !== 'assistant') return m;
+      // 1. Drop reasoning_content so no proxy can synthesise a thinking block.
+      const { reasoning_content: _rc, ...rest } =
+        m as ChatMessage & { reasoning_content?: unknown };
+      let msg = rest as ChatMessage;
+      // 2. Strip thinking blocks that are missing a valid signature.
+      if (Array.isArray(msg.content)) {
+        const filtered = (msg.content as Array<unknown>).filter((block) => {
+          if (!block || typeof block !== 'object') return true;
+          const b = block as Record<string, unknown>;
+          if (b.type !== 'thinking') return true;
+          return typeof b.signature === 'string' && b.signature.length > 0;
+        });
+        if (filtered.length !== (msg.content as Array<unknown>).length) {
+          msg = { ...msg, content: filtered.length > 0 ? (filtered as typeof msg.content) : null } as ChatMessage;
+        }
+      }
+      return msg;
+    });
+  }
+  return normalizeReasoningContent(messages);
+}
+
 export class OpenAIClient {
   private client: OpenAI;
 
@@ -449,19 +492,9 @@ export class OpenAIClient {
       }
     });
 
-    // DashScope / Qwen-thinking strictly enforces that any assistant message
-    // returned by a thinking model must round-trip the `reasoning_content`
-    // field on subsequent requests — the server replies with
-    //   400 The `reasoning_content` in the thinking mode must be passed back
-    //       to the API.
-    // when the field is missing on ANY assistant message in the history. We
-    // already attach it on freshly-streamed turns (see AgentLoop), but stale
-    // sessions, mid-stream cancellations, and turns where the model chose not
-    // to think can all leave the field absent. Backfill an empty string here
-    // so the request body is always shape-correct without losing the original
-    // chain-of-thought when one was captured. Other OpenAI-compatible servers
-    // simply ignore unknown fields, so this is safe to send unconditionally.
-    const safeMessages = normalizeReasoningContent(messages);
+    // Normalise the message history for the target model before sending.
+    // See prepareMessagesForModel for the per-model rules.
+    const safeMessages = prepareMessagesForModel(messages, this.config.model);
 
     // Some models (e.g. claude-* via OpenAI-compatible endpoints, or the same
     // models accessed via OpenRouter as "anthropic/claude-*") reject the

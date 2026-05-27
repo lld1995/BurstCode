@@ -220,7 +220,7 @@ async function runTask(
     maxAutoContinues: 1,
     autoResumeOnStreamError: true,
     maxAutoResumes: 1,
-    maxStuckRepeats: 1,
+    maxStuckRepeats: 2,
     autoContinueOnPrematureStop: true,
     maxPrematureStopContinues: 2,
     systemPrompt: buildTaskSystemPrompt(task, options.systemPrompt)
@@ -229,6 +229,8 @@ async function runTask(
   // Accumulate ALL assistant turns so partial findings from mid-run iterations
   // are not lost when the sub-agent hits max_iterations or stuck.
   const assistantTurns: string[] = [];
+  const toolErrors: string[] = [];
+  const toolCallNames: string[] = [];
   let toolCalls = 0;
   let errors = 0;
   let doneReason = 'unknown';
@@ -242,9 +244,15 @@ async function runTask(
       onProgress?.(`  → ${String(payload?.name ?? 'tool')}`);
     } else if (event.type === 'tool-call-end') {
       toolCalls++;
-      const payload = event.payload as { name?: unknown; isError?: unknown } | undefined;
-      if (payload?.isError) errors++;
-      onProgress?.(`  ✓ ${String(payload?.name ?? 'tool')}${payload?.isError ? ' (error)' : ''}`);
+      const payload = event.payload as { name?: unknown; isError?: unknown; result?: unknown } | undefined;
+      const toolName = String(payload?.name ?? 'tool');
+      toolCallNames.push(toolName);
+      if (payload?.isError) {
+        errors++;
+        const errContent = String(payload?.result ?? '').slice(0, 400).trim();
+        if (errContent) toolErrors.push(`[${toolName}] ${errContent}`);
+      }
+      onProgress?.(`  ✓ ${toolName}${payload?.isError ? ' (error)' : ''}`);
     } else if (event.type === 'tool-progress') {
       const payload = event.payload as { message?: unknown } | undefined;
       onProgress?.(String(payload?.message ?? ''));
@@ -263,7 +271,18 @@ async function runTask(
 
   if (assistantTurns.length === 0) {
     const status = errors > 0 ? 'completed_with_errors' : 'completed';
-    return `[${task.id}] ${status} mode=${task.mode} reason=${doneReason} toolCalls=${toolCalls}${fileLine}\n(no report produced)`;
+    let detail: string;
+    if (toolErrors.length > 0) {
+      detail = `\nTool errors (${toolErrors.length}):\n${toolErrors.join('\n')}`;
+    } else if (toolCallNames.length > 0) {
+      const counts = new Map<string, number>();
+      for (const n of toolCallNames) counts.set(n, (counts.get(n) ?? 0) + 1);
+      const summary = [...counts.entries()].map(([n, c]) => c > 1 ? `${n}×${c}` : n).join(', ');
+      detail = `\n(no text report; tools called: ${summary})`;
+    } else {
+      detail = '\n(no report produced)';
+    }
+    return `[${task.id}] ${status} mode=${task.mode} reason=${doneReason} toolCalls=${toolCalls}${fileLine}${detail}`;
   }
 
   // For partial runs (max_iterations / stuck), merge all turns into one clean

@@ -462,12 +462,81 @@ export class HunkApplier implements vscode.Disposable {
         return { h, modStart, modEnd, delta, isEmpty: added === 0 };
       });
 
+      // Auto-expand new hunks that partially overlap PENDING (not accepted) hunks.
+      // A partial overlap — where the new hunk clips one end of an existing pending
+      // hunk but does not fully contain it — is the most common source of spurious
+      // "overlap rejected" errors: the model issues a large hunk that slightly
+      // bleeds into a previously-queued hunk's range. Rather than forcing the model
+      // to re-read and re-submit, we extend the new hunk to fully contain the
+      // pending one, stitching the pending hunk's uncovered "tail" or "head" lines
+      // into the new hunk's newText so no content is silently dropped.
+      //   Overlap from above (new ends inside pending): extend endLine to
+      //     pendingModEnd and append the pending hunk's tail lines.
+      //   Overlap from below (new starts inside pending): extend startLine to
+      //     pendingModStart and prepend the pending hunk's head lines.
+      // After expansion the pending hunk becomes fully contained (case 1 below)
+      // and is dropped via last-write-wins. Accepted hunks are excluded: that
+      // region is locked in for review and must not be silently overwritten.
+      {
+        const autoExpanded = f.hunks.map((nh) => {
+          if (nh.startLine > nh.endLine) return nh; // pure insertion — nothing to expand
+          let { startLine, endLine, newText } = nh;
+          for (const ann of annotated) {
+            if (ann.isEmpty || ann.h.status === 'accepted') continue;
+            const overlaps = !(endLine < ann.modStart || ann.modEnd < startLine);
+            if (!overlaps) continue;
+            const newContains = startLine <= ann.modStart && ann.modEnd <= endLine;
+            const existingContains = ann.modStart <= startLine && endLine <= ann.modEnd;
+            if (newContains || existingContains) continue; // handled by main classification
+            const pendingLines = splitLogicalLines(ann.h.hunk.newText);
+            if (startLine <= ann.modStart) {
+              // Overlap from above: new hunk ends inside pending → extend endLine forward.
+              const tail = pendingLines.slice(endLine - ann.modStart + 1);
+              if (tail.length > 0) {
+                newText = (newText.endsWith('\n') ? newText : newText + '\n') +
+                          tail.join('\n') + '\n';
+              }
+              endLine = ann.modEnd;
+            } else {
+              // Overlap from below: new hunk starts inside pending → extend startLine back.
+              const head = pendingLines.slice(0, startLine - ann.modStart);
+              if (head.length > 0) {
+                newText = head.join('\n') + '\n' + newText;
+              }
+              startLine = ann.modStart;
+            }
+          }
+          if (startLine === nh.startLine && endLine === nh.endLine) return nh;
+          return { startLine, endLine, newText };
+        });
+        // Guard: if expansion made two new hunks overlap each other (rare — only
+        // when two new hunks each straddle the same pending hunk from opposite
+        // ends), abandon the expansion and let the error path below fire instead.
+        let expansionSafe = true;
+        outer: for (let i = 0; i < autoExpanded.length; i++) {
+          const a = autoExpanded[i];
+          if (a.startLine > a.endLine) continue;
+          for (let j = i + 1; j < autoExpanded.length; j++) {
+            const b = autoExpanded[j];
+            if (b.startLine > b.endLine) continue;
+            if (!(a.endLine < b.startLine || b.endLine < a.startLine)) {
+              expansionSafe = false;
+              break outer;
+            }
+          }
+        }
+        if (expansionSafe) {
+          f = { path: f.path, hunks: autoExpanded };
+        }
+      }
+
       // Classify each new hunk against existing annotated hunks. Four cases:
       //   1. New hunk fully CONTAINS a pending hunk        -> drop pending (last-write-wins).
       //   2. Pending hunk fully CONTAINS the new hunk      -> splice the new
       //      hunk's newText into the pending hunk's newText (refinement).
-      //   3. New hunk PARTIALLY overlaps a pending hunk    -> reject (silent
-      //      corruption otherwise — part of the pending newText would vanish).
+      //   3. New hunk PARTIALLY overlaps a pending hunk    -> auto-expanded above;
+      //      only reaches here if expansion was unsafe (two new hunks straddle the
+      //      same pending hunk from opposite ends), in which case we reject.
       //   4. New hunk overlaps an ACCEPTED hunk            -> reject (the
       //      accepted region is locked in for review; refining its newText
       //      via line numbers is fragile, ask the model to re-read instead).

@@ -57,7 +57,7 @@ export function buildReadFileTool(applier?: HunkApplier): Tool {
         ) {
           rawLines.pop();
         }
-        pendingNote = ' [pending edits applied — already written to disk, awaiting user accept/reject]';
+        pendingNote = ' [pending edits on disk — compile/run/test can proceed NOW without accepting; Accept confirms, Reject reverts]';
       } else {
         const doc = await vscode.workspace.openTextDocument(uri);
         rawLines = [];

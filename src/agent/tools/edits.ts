@@ -348,10 +348,10 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
         return {
           content:
             `propose_edit error(s): ${message}\n` +
-            `Files NOT named above were queued successfully and remain pending in the banner. ` +
-            `For each named file, re-read it with read_file (the line numbers you saw earlier may be stale) ` +
-            `and re-issue propose_edit with corrected oldText / non-overlapping ranges. ` +
-            `Prefer the oldText form so line drift no longer matters.`,
+            `ACTION REQUIRED for the files named in the error above ONLY: re-read each with read_file ` +
+            `(line numbers may be stale) and re-issue propose_edit with corrected oldText / non-overlapping ranges. ` +
+            `Prefer the oldText form so line drift no longer matters.\n` +
+            `Any files NOT named in the error were queued successfully — do NOT re-submit those; they are already staged and do not need further action from you.`,
           isError: true
         };
       }
