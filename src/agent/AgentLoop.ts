@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { ChatMessage, OpenAIClient, ToolDef } from '../llm/OpenAIClient';
 import { Tool, ToolResult } from './tools/types';
 import { FALLBACK_SYSTEM_PROMPT } from './prompts';
-import { compressMessages, defaultCompressorConfig, normalizeToolResult } from '../context/Compressor';
+import { compressMessages, defaultCompressorConfig, normalizeToolResult, pruneOrphanedToolResults } from '../context/Compressor';
 import { estimateMessagesTokens } from '../llm/tokenizer';
 import { Logger } from '../util/Logger';
 import { repairJsonControlChars, repairJsonUnescapedQuotes } from '../util/jsonRepair';
@@ -33,6 +33,14 @@ export interface AgentEvent {
 const AUTO_COMPRESS_TRIGGER_RATIO = 0.9;
 /** Target post-compression budget (input ratio) so we free at least half of the in-use space. */
 const AUTO_COMPRESS_TARGET_RATIO = 0.4;
+
+/**
+ * After this many cumulative read_file / collect_context calls in a single run,
+ * inject a one-shot hint suggesting the model delegate further heavy file
+ * collection to launch_subagent so the sub-agent's independent context window
+ * absorbs the raw content and only the summary returns to the main conversation.
+ */
+const CONTEXT_OFFLOAD_HINT_THRESHOLD = 3;
 
 /**
  * After how many CONSECUTIVE turns of identical tool-call batches we consider
@@ -337,6 +345,12 @@ export class AgentLoop {
       if (state.recentDecision) decisionBuffer.push(state.recentDecision);
     });
 
+    // ---- context-offload hint state ----
+    // Counts cumulative read_file + collect_context calls this run.
+    // A one-shot hint is injected once the threshold is crossed.
+    let cumulativeReadCalls = 0;
+    let offloadHintInjected = false;
+
     try {
     outerLoop: for (let iter = 0; iter < this.options.maxIterations; iter++) {
       if (cancellation.isCancellationRequested) {
@@ -368,6 +382,22 @@ export class AgentLoop {
       // session that gets persisted to disk.
       const ctxMax = this.options.contextWindow;
       let usedTokens = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
+
+      // ── Orphan-prune pass (runs every turn, very cheap) ───────────────────
+      // Collapse tool results whose file paths are never referenced again in
+      // later messages. Runs BEFORE zone compression so the compressor has
+      // less to work with. Safe: never deletes messages, never touches the
+      // last keepLastN exchanges, only prunes when ALL extracted paths are
+      // absent from all downstream content.
+      const pruneCount = pruneOrphanedToolResults(messages, defaultCompressorConfig.keepLastN);
+      if (pruneCount > 0) {
+        const afterPrune = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
+        this.logger.info(
+          `Orphan-prune: collapsed ${pruneCount} stale tool result(s); ${usedTokens} → ${afterPrune} tokens.`
+        );
+        usedTokens = afterPrune;
+      }
+
       if (ctxMax > 0 && usedTokens / ctxMax > AUTO_COMPRESS_TRIGGER_RATIO) {
         const before = usedTokens;
         const compacted = compressMessages(messages, {
@@ -1092,12 +1122,40 @@ export class AgentLoop {
         const c = prepared[i];
         const result = results[i];
         if (!result) continue; // can happen if cancelled mid-batch
+        // Track cumulative heavy-read calls for context-offload hint.
+        if (c.name === 'read_file' || c.name === 'collect_context') {
+          cumulativeReadCalls++;
+        }
         const storedContent = normalizeToolResult(c.name, result.content);
         messages.push({
           role: 'tool',
           tool_call_id: c.callId,
           content: storedContent
         } as ChatMessage);
+      }
+
+      // Inject a one-shot context-offload hint once the cumulative read budget
+      // is exhausted. We append it as a user message so it appears at the
+      // top of the NEXT model turn (after all tool replies are pushed above).
+      // The hint is injected only once per run to avoid repeating itself.
+      if (!offloadHintInjected && cumulativeReadCalls >= CONTEXT_OFFLOAD_HINT_THRESHOLD) {
+        offloadHintInjected = true;
+        messages.push({
+          role: 'user',
+          content:
+            `[context-offload hint] You have now called read_file / collect_context ` +
+            `${cumulativeReadCalls} times in this run. Each call injects raw file content into ` +
+            `the shared context window, which grows without bound and forces expensive ` +
+            `compression. If you still need to read more files or gather more workspace ` +
+            `context, STRONGLY PREFER delegating that work to launch_subagent: give the ` +
+            `sub-agent a focused objective and let it read/grep inside its own isolated ` +
+            `context window — only the concise summary comes back here. Reserve direct ` +
+            `read_file / collect_context calls for single targeted lookups that cannot ` +
+            `be delegated (e.g. re-reading a file you are about to propose_edit on).`
+        });
+        this.logger.info(
+          `Context-offload hint injected after ${cumulativeReadCalls} cumulative read calls.`
+        );
       }
       // propose_edit is non-blocking: the model gets a "queued" tool reply and
       // we just keep iterating. The user can accept/reject the queued edits

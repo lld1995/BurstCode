@@ -444,6 +444,208 @@ export function sanitizeToolPairing(messages: ChatMessage[]): ChatMessage[] {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Orphan-prune pass
+// ---------------------------------------------------------------------------
+
+/**
+ * Tool names whose results are purely "exploratory reads" — they are safe to
+ * prune once we can prove they are no longer referenced by later messages.
+ * Results from write/action/UI tools (propose_edit, run_shell, ask_user, …)
+ * are intentionally excluded: those carry decision history that the model
+ * may still need even if no file path appears downstream.
+ */
+const PRUNABLE_TOOLS = new Set([
+  'read_file',
+  'collect_context',
+  'grep_search',
+  'workspace_outline',
+  'list_dir',
+  'document_symbols',
+  'workspace_symbols',
+  'find_references',
+  'find_references_by_name',
+  'find_implementations',
+  'find_definition',
+  'hover_info',
+  'get_function_range',
+]);
+
+/**
+ * Extract file-path-like tokens from a tool result string so we can check
+ * whether those paths appear in later messages.
+ *
+ * Strategy per tool:
+ *  - read_file / get_function_range: the header `# <path> (lines …)` is canonical.
+ *  - collect_context: section headers `===== read_file <path> … =====`.
+ *  - grep_search: leading `<path>:<line>:` tokens.
+ *  - everything else: generic path heuristic (word chars + separators + extension).
+ *
+ * Returns an empty set when no paths can be reliably extracted (→ no prune).
+ */
+function extractPathsFromToolResult(toolName: string, content: string): Set<string> {
+  const paths = new Set<string>();
+
+  if (toolName === 'read_file' || toolName === 'get_function_range') {
+    // Header: `# src/agent/AgentLoop.ts (lines 1-200 of 1201)`
+    const m = content.match(/^# (.+?) \(lines \d/);
+    if (m) paths.add(m[1].trim());
+    return paths;
+  }
+
+  if (toolName === 'collect_context') {
+    // Section headers: `===== read_file src/foo/bar.ts:10-50 =====`
+    //                  `===== grep_search someQuery [**/*.ts] =====`
+    // We only care about tokens that look like file paths (contain / or \ and a dot).
+    const sectionRe = /={5} \S+ (\S+)/g;
+    let sm: RegExpExecArray | null;
+    while ((sm = sectionRe.exec(content)) !== null) {
+      const token = sm[1].split(':')[0]; // strip :lineNo suffix
+      if (/[\/\\]/.test(token) && /\.\w+$/.test(token)) {
+        paths.add(token);
+      }
+    }
+    // Also pick up `# path (lines …)` headers inside the sections.
+    const headerRe = /^# (.+?) \(lines \d/gm;
+    let hm: RegExpExecArray | null;
+    while ((hm = headerRe.exec(content)) !== null) {
+      paths.add(hm[1].trim());
+    }
+    return paths;
+  }
+
+  if (toolName === 'grep_search') {
+    // Match lines: `src/foo/bar.ts:42:  some code`
+    const lineRe = /^([\w./\\][\w./\\-]+\.\w+):\d+:/gm;
+    let lm: RegExpExecArray | null;
+    while ((lm = lineRe.exec(content)) !== null) {
+      paths.add(lm[1]);
+    }
+    return paths;
+  }
+
+  // Generic: scan for anything that looks like a relative file path.
+  // Require at least one / or \ separator and a file extension to avoid
+  // false positives on short identifiers.
+  const genericRe = /(?:^|\s|["'`(])([\w][\w./\\-]*\/[\w./\\-]+\.\w{1,6})(?:\s|["'`),:]|$)/gm;
+  let gm: RegExpExecArray | null;
+  while ((gm = genericRe.exec(content)) !== null) {
+    paths.add(gm[1]);
+  }
+  return paths;
+}
+
+/**
+ * Build a single string containing all downstream message content
+ * (from index `fromIdx` to end) for fast path-presence checks.
+ */
+function buildDownstreamText(messages: ChatMessage[], fromIdx: number): string {
+  const parts: string[] = [];
+  for (let i = fromIdx; i < messages.length; i++) {
+    const m = messages[i];
+    parts.push(stringifyContent(m.content));
+    // Also scan tool_call arguments on assistant messages (propose_edit path/oldText).
+    const calls = (m as { tool_calls?: Array<{ function: { arguments: string } }> }).tool_calls;
+    if (calls) {
+      for (const c of calls) parts.push(c.function.arguments ?? '');
+    }
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Walk the messages array and collapse tool results that are safe to prune.
+ *
+ * A tool result at index `i` is prunable when ALL of the following hold:
+ *   1. Its tool name is in PRUNABLE_TOOLS.
+ *   2. It is NOT in the protected zone (last keepLastN exchanges).
+ *   3. The content is longer than MIN_PRUNE_CHARS (not already tiny).
+ *   4. Every file path extracted from its content does NOT appear anywhere
+ *      in the messages that come AFTER it (i+1 … end).
+ *      → If even one path still appears downstream, the result is kept intact
+ *        because the model may still need it for propose_edit or a follow-up read.
+ *
+ * Pruned content is replaced with a one-line sentinel:
+ *   `[pruned: <toolName> <primary-path-or-summary> — not referenced in later turns]`
+ * The message itself is kept so tool pairing (assistant ↔ tool) stays valid.
+ *
+ * Returns the number of messages pruned (for logging).
+ */
+export function pruneOrphanedToolResults(
+  messages: ChatMessage[],
+  keepLastN: number
+): number {
+  const MIN_PRUNE_CHARS = 300;
+
+  // Determine the protected boundary (last keepLastN exchanges from the end).
+  // An "exchange" boundary is a user message; we count back keepLastN of them.
+  let protectedFrom = messages.length;
+  let exchangeCount = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') {
+      exchangeCount++;
+      if (exchangeCount >= keepLastN) {
+        protectedFrom = i;
+        break;
+      }
+    }
+  }
+
+  // Build a name-lookup from tool_call_id → tool name using assistant messages.
+  const callIdToName = new Map<string, string>();
+  for (const m of messages) {
+    const calls = (m as { tool_calls?: Array<{ id: string; function: { name: string } }> }).tool_calls;
+    if (calls) {
+      for (const c of calls) callIdToName.set(c.id, c.function.name);
+    }
+  }
+
+  let pruned = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role !== 'tool') continue;
+    if (i >= protectedFrom) continue; // in protected zone — never touch
+
+    const toolCallId = (m as ChatMessage & { tool_call_id?: string }).tool_call_id ?? '';
+    const toolName = callIdToName.get(toolCallId) ?? '';
+    if (!PRUNABLE_TOOLS.has(toolName)) continue;
+
+    const content = stringifyContent(m.content);
+    if (content.length <= MIN_PRUNE_CHARS) continue;
+    // Already pruned in a previous pass.
+    if (content.startsWith('[pruned:')) continue;
+
+    // Extract file paths referenced by this result.
+    const paths = extractPathsFromToolResult(toolName, content);
+
+    // If we can't extract any paths, be conservative: don't prune.
+    // (Unknown content shape → might be something we'd regret deleting.)
+    if (paths.size === 0) continue;
+
+    // Build downstream text ONCE per candidate (lazily, covers i+1…end).
+    const downstream = buildDownstreamText(messages, i + 1);
+
+    // If ANY of the paths still appear downstream, keep the result intact.
+    let stillReferenced = false;
+    for (const p of paths) {
+      if (downstream.includes(p)) {
+        stillReferenced = true;
+        break;
+      }
+    }
+    if (stillReferenced) continue;
+
+    // Safe to prune. Build a one-line sentinel so the model knows it once
+    // had this context (useful for self-awareness) without storing the bulk.
+    const primary = [...paths][0];
+    const sentinel = `[pruned: ${toolName} ${primary}${paths.size > 1 ? ` (+${paths.size - 1} more)` : ''} — not referenced in later turns]`;
+    messages[i] = { ...m, content: sentinel } as ChatMessage;
+    pruned++;
+  }
+
+  return pruned;
+}
+
 function stringifyContent(content: unknown): string {
   if (typeof content === 'string') return content;
   if (content == null) return '';

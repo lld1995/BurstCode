@@ -226,14 +226,17 @@ async function runTask(
     systemPrompt: buildTaskSystemPrompt(task, options.systemPrompt)
   } satisfies AgentOptions);
 
-  let lastAssistant = '';
+  // Accumulate ALL assistant turns so partial findings from mid-run iterations
+  // are not lost when the sub-agent hits max_iterations or stuck.
+  const assistantTurns: string[] = [];
   let toolCalls = 0;
   let errors = 0;
   let doneReason = 'unknown';
   for await (const event of agent.run(messages, cancellation)) {
     if (event.type === 'assistant-message') {
       const payload = event.payload as { text?: unknown } | undefined;
-      lastAssistant = String(payload?.text ?? '').trim() || lastAssistant;
+      const text = String(payload?.text ?? '').trim();
+      if (text) assistantTurns.push(text);
     } else if (event.type === 'tool-call-start') {
       const payload = event.payload as { name?: unknown } | undefined;
       onProgress?.(`  → ${String(payload?.name ?? 'tool')}`);
@@ -250,21 +253,77 @@ async function runTask(
       doneReason = String(payload?.reason ?? doneReason);
     } else if (event.type === 'error') {
       errors++;
-      lastAssistant = `${lastAssistant}\n${String(event.payload ?? '')}`.trim();
+      const errText = String(event.payload ?? '').trim();
+      if (errText) assistantTurns.push(`[error] ${errText}`);
     }
   }
 
-  const report = lastAssistant || '(no final report produced)';
-  const status = errors > 0 ? 'completed_with_errors' : 'completed';
+  const isPartial = doneReason === 'max_iterations' || doneReason === 'stuck';
   const fileLine = task.allowedFiles.length ? `\nfiles: ${task.allowedFiles.join(', ')}` : '';
+
+  if (assistantTurns.length === 0) {
+    const status = errors > 0 ? 'completed_with_errors' : 'completed';
+    return `[${task.id}] ${status} mode=${task.mode} reason=${doneReason} toolCalls=${toolCalls}${fileLine}\n(no report produced)`;
+  }
+
+  // For partial runs (max_iterations / stuck), merge all turns into one clean
+  // report — deduplicate identical sentences and strip empty turns, but keep
+  // every distinct piece of information the sub-agent found.
+  const report = (() => {
+    if (!isPartial || assistantTurns.length === 1) return assistantTurns[assistantTurns.length - 1];
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    for (const turn of assistantTurns) {
+      for (const line of turn.split('\n')) {
+        const key = line.trim();
+        if (key && !seen.has(key)) {
+          seen.add(key);
+          lines.push(line);
+        }
+      }
+    }
+    return lines.join('\n');
+  })();
+
+  const status = isPartial ? 'partial' : errors > 0 ? 'completed_with_errors' : 'completed';
   return `[${task.id}] ${status} mode=${task.mode} reason=${doneReason} toolCalls=${toolCalls}${fileLine}\n${report}`;
+}
+
+/**
+ * Strip sections from the parent system prompt that reference tools the
+ * sub-agent does not have (launch_subagent). Leaving those instructions in
+ * causes the sub-agent to attempt calling a non-existent tool, which
+ * triggers the stuck-detection loop and terminates the task early.
+ *
+ * We remove:
+ *   - The CONTEXT HYGIENE block (bounded by its heading line and the next
+ *     blank-line-then-uppercase-heading or end-of-string).
+ *   - Any sentence/bullet that mentions "launch_subagent" in BATCH_PROTOCOL.
+ */
+function stripSubagentUnsafeSections(prompt: string): string {
+  // Remove the entire CONTEXT HYGIENE fenced block.
+  // The block starts with a line that begins "CONTEXT HYGIENE" and ends
+  // just before the next all-caps section heading or end of string.
+  let out = prompt.replace(
+    /CONTEXT HYGIENE[\s\S]*?(?=\n[A-Z][A-Z\s\-]{3,}:|$)/g,
+    ''
+  );
+  // Remove individual lines / bullets mentioning launch_subagent.
+  out = out
+    .split('\n')
+    .filter((line) => !/launch_subagent/.test(line))
+    .join('\n');
+  // Collapse runs of 3+ blank lines left behind by removals.
+  out = out.replace(/\n{3,}/g, '\n\n');
+  return out.trim();
 }
 
 function buildTaskSystemPrompt(task: SubagentTask, parentSystemPrompt: string): string {
   const writePolicy = task.mode === 'write'
     ? `You may propose edits ONLY to these files: ${task.allowedFiles.join(', ')}. Use propose_edit for all code changes. Do not edit or create any other file.`
     : 'Read-only task. Do not call propose_edit or attempt to modify files.';
-  return `${parentSystemPrompt}\n\n<subagent_policy>\nYou are a focused sub-agent running inside BurstCode. Work only on the assigned objective. Do not ask the user questions. Do not update the parent plan. Return a concise report with files inspected, key findings, and any edits queued. ${writePolicy}\n</subagent_policy>`;
+  const safePrompt = stripSubagentUnsafeSections(parentSystemPrompt);
+  return `${safePrompt}\n\n<subagent_policy>\nYou are a focused sub-agent running inside BurstCode. Work only on the assigned objective. Do not ask the user questions. Do not update the parent plan. Return a concise report with files inspected, key findings, and any edits queued. ${writePolicy}\n</subagent_policy>`;
 }
 
 function buildTaskUserPrompt(task: SubagentTask): string {

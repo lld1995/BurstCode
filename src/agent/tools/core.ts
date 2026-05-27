@@ -247,8 +247,18 @@ export const grepSearchTool: Tool = {
     return new Promise<ToolResult>((resolve, reject) => {
       const cliArgs = ['--vimgrep', '--no-heading', '--color', 'never', '--max-count', '50'];
       if (fixed) cliArgs.push('-F');
-      if (glob) cliArgs.push('-g', glob);
-      cliArgs.push('--', query, root);
+
+      // Determine search target: if glob has no wildcards it is a concrete file
+      // or directory path — resolve it and pass directly as the search path so
+      // ripgrep doesn't try to match it as a glob pattern (which fails for
+      // paths like "src/agent/prompts.ts" when the cwd != root).
+      // Otherwise use -g for wildcard glob filtering over the whole root.
+      const isLiteralPath = glob && !/[*?\[{]/.test(glob);
+      const searchTarget = isLiteralPath
+        ? resolveUri(glob!).fsPath   // absolute path → works regardless of cwd
+        : root;
+      if (glob && !isLiteralPath) cliArgs.push('-g', glob);
+      cliArgs.push('--', query, searchTarget);
       const proc = cp.spawn(rgPath, cliArgs);
       let stdout = '';
       let stderr = '';
