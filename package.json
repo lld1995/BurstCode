@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.37",
+  "version": "0.1.38",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -183,7 +183,7 @@
         },
         "burstcode.llm.chat.contextWindow": {
           "type": "number",
-          "default": 32768,
+          "default": 131072,
           "description": "Chat profile · total context window in tokens."
         },
         "burstcode.llm.chat.allowSelfSignedCerts": {
@@ -231,7 +231,7 @@
         },
         "burstcode.llm.background.contextWindow": {
           "type": "number",
-          "default": 32768,
+          "default": 131072,
           "order": 25,
           "description": "Background profile · total context window in tokens."
         },

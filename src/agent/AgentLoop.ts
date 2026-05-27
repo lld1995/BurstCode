@@ -220,6 +220,19 @@ function describeCalls(calls: Array<{ name: string; arguments: string }>): strin
   return calls.map((c) => c.name).join(', ');
 }
 
+function isContextLengthError(err: unknown): boolean {
+  const msg = String(err).toLowerCase();
+  if (msg.includes('context_length_exceeded')) return true;
+  if (msg.includes('maximum context length')) return true;
+  if (msg.includes('reduce the length')) return true;
+  if (msg.includes('context window') && (msg.includes('exceed') || msg.includes('too long'))) return true;
+  if (err !== null && typeof err === 'object') {
+    const e = err as Record<string, unknown>;
+    if (e.code === 'context_length_exceeded') return true;
+  }
+  return false;
+}
+
 export interface AgentOptions {
   contextWindow: number;
   maxIterations: number;
@@ -297,6 +310,7 @@ export class AgentLoop {
 
     let consecutiveAutoContinues = 0;
     let consecutivePrematureStopContinues = 0;
+    let consecutiveContextErrors = 0;
     const autoContinueOnPrematureStop = this.options.autoContinueOnPrematureStop ?? true;
     const maxPrematureStopContinues = Math.max(
       0,
@@ -324,7 +338,7 @@ export class AgentLoop {
     });
 
     try {
-    for (let iter = 0; iter < this.options.maxIterations; iter++) {
+    outerLoop: for (let iter = 0; iter < this.options.maxIterations; iter++) {
       if (cancellation.isCancellationRequested) {
         yield { type: 'done', payload: { reason: 'cancelled' } };
         return;
@@ -568,6 +582,36 @@ export class AgentLoop {
             yield { type: 'done', payload: { reason: 'cancelled' } };
             return;
           }
+          // Context-length errors cannot be fixed by retrying the same request.
+          // Force-compress the persistent message array and retry via the outer
+          // loop so the model gets a fresh (smaller) context window.
+          if (isContextLengthError(err)) {
+            if (consecutiveContextErrors >= 3) {
+              const detail = `Context length exceeded and compression failed to reduce it sufficiently: ${String(err)}`;
+              this.logger.error(detail);
+              yield { type: 'error', payload: detail };
+              return;
+            }
+            consecutiveContextErrors++;
+            const ctxMaxForCompress = ctxMax > 0 ? ctxMax : defaultCompressorConfig.contextWindow;
+            const before = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
+            const targetRatio = Math.max(0.15, 0.35 - consecutiveContextErrors * 0.08);
+            const compacted = compressMessages(messages, {
+              ...defaultCompressorConfig,
+              contextWindow: ctxMaxForCompress,
+              inputBudgetRatio: targetRatio
+            });
+            messages.splice(0, messages.length, ...compacted);
+            const after = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
+            this.logger.warn(
+              `Context length error — force-compressed: ${before} → ${after} tokens (attempt ${consecutiveContextErrors}/3, targetRatio=${targetRatio})`
+            );
+            yield {
+              type: 'context-compressed',
+              payload: { before, after, max: ctxMaxForCompress, forced: true }
+            };
+            continue outerLoop;
+          }
           if (resumeAttempt >= maxResumes) {
             this.logger.error('LLM stream error', String(err));
             const detail = String(err);
@@ -626,6 +670,10 @@ export class AgentLoop {
           }
         }
       }
+
+      // Successful stream — reset context-error counter so a single context error
+      // in a long session doesn't permanently reduce the 3-attempt budget.
+      consecutiveContextErrors = 0;
 
       let toolCalls = Array.from(toolCallAccumulator.entries())
         .sort((a, b) => a[0] - b[0])

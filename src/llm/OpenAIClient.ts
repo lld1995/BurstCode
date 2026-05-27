@@ -45,7 +45,7 @@ const DEFAULT_BASE_URL = 'http://localhost:11434/v1';
 const DEFAULT_API_KEY = '';
 const DEFAULT_MODEL = 'qwen2.5-coder:7b';
 const DEFAULT_TEMPERATURE = 0.2;
-const DEFAULT_CONTEXT_WINDOW = 32768;
+const DEFAULT_CONTEXT_WINDOW = 131072;
 
 /**
  * Read every field of a profile via individual flat-key lookups
