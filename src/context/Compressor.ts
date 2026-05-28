@@ -521,7 +521,12 @@ function buildDownstreamText(messages: ChatMessage[], fromIdx: number): string {
       for (const c of calls) parts.push(c.function.arguments ?? '');
     }
   }
-  return parts.join('\n');
+  // Normalize path separators so Windows absolute paths (`e:\\project\\src\\foo.ts`
+  // in JSON-encoded args, or `e:\project\src\foo.ts` in raw content) still match
+  // relative forward-slash paths extracted from tool result headers (`src/foo.ts`).
+  // Two-pass: first collapse JSON-escaped double backslashes, then remaining singles.
+  const joined = parts.join('\n');
+  return joined.replace(/\\\\/g, '/').replace(/\\/g, '/');
 }
 
 /**
@@ -609,7 +614,7 @@ export function pruneOrphanedToolResults(
     // Safe to prune. Build a one-line sentinel so the model knows it once
     // had this context (useful for self-awareness) without storing the bulk.
     const primary = [...paths][0];
-    const sentinel = `[pruned: ${toolName} ${primary}${paths.size > 1 ? ` (+${paths.size - 1} more)` : ''} — not referenced in later turns]`;
+    const sentinel = `[pruned: ${toolName} ${primary}${paths.size > 1 ? ` (+${paths.size - 1} more)` : ''} — content removed, no longer needed]`;
     messages[i] = { ...m, content: sentinel } as ChatMessage;
     pruned++;
   }

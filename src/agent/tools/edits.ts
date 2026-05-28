@@ -365,8 +365,9 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
       const aliasNote = aliasNotes.length
         ? `\nNote: ${aliasNotes.join('; ')}. Accepted this time — please use the canonical field names ('edits', 'path') on subsequent calls.`
         : '';
+      const filePaths = files.map((f) => f.path).join(', ');
       return {
-        content: `Queued edits for ${files.length} file(s) — pending user review (non-blocking). You may call propose_edit again to add or replace hunks, or move on to the next step.${aliasNote}`,
+        content: `Queued edits for ${files.length} file(s): ${filePaths} — pending user review (non-blocking). You may call propose_edit again to add or replace hunks, or move on to the next step.${aliasNote}`,
         meta: { files: files.map((f) => f.path), summary }
       };
     }

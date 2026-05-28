@@ -85,7 +85,7 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
       function: {
         name: 'launch_subagent',
         description:
-          'Run focused sub-agents concurrently for independent fan-out tasks. Write tasks require mode="write", independent=true, allowedFiles. See BATCH_PROTOCOL for when to prefer this over inline tool batching.',
+          'Run focused sub-agents concurrently for independent fan-out tasks. Write tasks require mode="write", independent=true, allowedFiles. See BATCH_PROTOCOL for when to prefer this over inline tool batching.\n\nWHEN TO USE — prefer launch_subagent when EITHER: (1) the context window is already large and you need more heavy file reads / grep sweeps (offload to avoid bloat), OR (2) the task is fully independent and isolated — exploring an unfamiliar subsystem or module where you only need a summary back, with no immediate propose_edit depending on the raw file content. For everything else (context still small, or you need exact file content for an edit), use collect_context / read_file directly — they are faster and cheaper.',
         parameters: {
           type: 'object',
           properties: {

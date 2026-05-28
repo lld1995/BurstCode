@@ -52,26 +52,33 @@ call's arguments depend on a result you don't have yet.
 CONTEXT HYGIENE — PROTECT THE SHARED CONTEXT WINDOW:
 Every collect_context / read_file / grep_search call injects raw file content that
 permanently occupies the shared context window. This is the #1 cause of context
-overflow. Follow these rules unconditionally:
+overflow. Follow these rules:
 
-  DEFAULT — delegate to launch_subagent:
-    Whenever you need to read 2+ files, run broad grep sweeps, explore a subsystem,
-    or gather any context that is not immediately tied to a propose_edit you are
-    about to make — launch a sub-agent instead. Give it a focused objective; only
-    its concise text summary comes back into THIS context.
+  DEFAULT — use collect_context / read_file / grep_search directly:
+    For most tasks the context window is not yet full, so direct reads are faster
+    and cheaper than spawning a sub-agent. Read files inline unless you have a
+    specific reason not to.
 
-  EXCEPTION — use collect_context / read_file / grep_search directly ONLY when:
-    1. You are about to call propose_edit and need the exact current content of
-       that specific file (one targeted re-read, tight line range).
-    2. You need a single quick symbol lookup (hover_info / find_definition on
-       one known location) that cannot be delegated.
-    3. A sub-agent already completed its sweep and you need ONE follow-up
-       clarification on a specific line it surfaced.
+  SWITCH TO launch_subagent when EITHER of these is true:
+    1. The context window is already substantially occupied and you still need
+       heavy file reading / broad grep sweeps — offload to keep THIS context lean.
+    2. The task is fully independent: you only need a summary back (no precise
+       file content needed for an immediate propose_edit), and the work involves
+       exploring an isolated area of the codebase (a subsystem, an unfamiliar
+       module, a cross-cutting grep sweep across many files).
+    The sub-agent reads in its own isolated context window; only its concise
+    summary returns here.
 
-  NEVER: issue collect_context / read_file back-to-back across multiple turns
-  just because each individual call feels small — the damage is cumulative.
-  NEVER: use collect_context as a "first move" for broad exploration; that is
-  exactly the kind of work that belongs inside a sub-agent.`;
+  ALWAYS fine to read directly (regardless of file count):
+    1. Reading any number of files when the context window is still small.
+    2. Reading files for an edit you are about to make.
+    3. Quick symbol lookups (hover_info / find_definition / document_symbols).
+
+  AVOID:
+    • Re-reading the same file multiple times across turns without making an edit.
+    • Broad file dumps (entire large files) when a tight line range suffices.
+    • NEVER: use collect_context as a "first move" for broad exploration when you
+      already know the context window is large.`;
 
 const STATE_POINTER = `WORKSPACE STATE: a snapshot of the current workspace layout,
 recorded lessons, and active plan is appended at the END of this prompt (after
@@ -107,11 +114,11 @@ const PROTOCOL = `WORKING PROTOCOL:
    ┌────────────────────────────────────────────────┬─────────────────────────────────────────┐
    │ Question shape                                 │ First-choice tool                       │
    ├────────────────────────────────────────────────┼─────────────────────────────────────────┤
-   │ "Explore / understand an unfamiliar area"       │ launch_subagent (read mode)             │
-   │ "Read 2+ unrelated files / broad grep sweep"   │ launch_subagent (read mode)             │
+   │ "Read files / grep (context still small)"        │ collect_context (direct)                │
+   │ "Explore isolated area, only summary needed"     │ launch_subagent (read mode)             │
+   │ "Context large, need more heavy reads"           │ launch_subagent (read mode)             │
    │ "Where is symbol X used?"                      │ find_references_by_name(name=X)         │
    │ "Where is X defined? what is its type?"        │ find_definition / hover_info            │
-   │ "What classes implement interface I?"          │ find_implementations                    │
    │ "What are all the symbols in file F?"          │ document_symbols(F)                     │
    │ "Find a symbol by name across the workspace"   │ workspace_symbols(query)                │
    │ "Show me the body of function F containing L"  │ get_function_range                      │
@@ -129,7 +136,7 @@ const PROTOCOL = `WORKING PROTOCOL:
        overloads and re-exports; text search does not. Only fall back to grep_search when
        a tool returns "Language plugin missing" or 0 results.
      • Do NOT read entire files. Use document_symbols first to learn the shape, then read_file
-       on the specific range you need — and prefer doing this inside a sub-agent.
+       on the specific range you need.
      • Trust the <workspace_layout> at the end of this prompt — it is freshly-built and
        reflects the current on-disk structure. Don't call workspace_outline for paths shown.
      • BATCH independent tool calls in ONE assistant message instead of doing them sequentially.
@@ -228,12 +235,21 @@ This agent loop can execute MULTIPLE tool calls from a single assistant message
 CONCURRENTLY. Each round-trip to me is expensive (tokens + latency), so you
 MUST aggressively batch independent tool calls into one turn whenever possible.
 
-FIRST MOVE — launch_subagent (exploration) OR collect_context (targeted pre-edit):
+FIRST MOVE — collect_context (default) OR launch_subagent (large context):
 
-  • Broad exploration (2+ files, unknown area, grep sweep, subsystem):
-      → launch_subagent with a focused objective. It reads inside its OWN
-        isolated context window; only its concise summary comes back here.
-        Do NOT call collect_context / read_file directly for this.
+  • Small / moderate context (short conversation, few reads so far):
+      → Use collect_context or read_file directly. Reading 1–4 files inline is
+        cheaper and faster than a sub-agent round-trip. This is the DEFAULT.
+
+  • Large context OR independent isolated exploration:
+      → launch_subagent with a focused objective when EITHER:
+        (a) the context is already substantial (many turns, several reads made)
+            and you need more heavy file reading / grep sweeps, OR
+        (b) the task is fully independent — you only need a summary (not raw
+            file content) to proceed, and it explores an isolated area of the
+            codebase with no immediate propose_edit depending on the raw text.
+        The sub-agent reads in its OWN isolated context window; only its
+        concise summary comes back here.
 
   • Targeted pre-edit lookup (you know the exact file, range, about to propose_edit):
       → collect_context or read_file for that ONE specific file/range ONLY.
@@ -250,13 +266,13 @@ After receiving a collect_context / read_file result, follow these rules:
   - New leads discovered (a path or line number you didn't know before):
     fold them into a corrective sweep if one is needed, or issue a
     single targeted read_file / grep_search if only 1 new item is needed.
-  - NEVER issue more than 2 collect_context calls per user message.
+  - NEVER issue more than 2 collect_context calls per user message when the
+    context window is already large.
 
 Only use individual read_file / grep_search / list_dir calls when:
   - You already have the full context you need (from workspace_layout or a
     prior collect_context result), OR
   - You are following up on exactly ONE new lead found in a previous result.
-
 When to emit MULTIPLE tool_calls in ONE assistant message:
   - You need to look at the same symbol from different angles
       → emit find_references_by_name + find_definition + hover_info together.

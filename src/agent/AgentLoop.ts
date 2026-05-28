@@ -35,12 +35,18 @@ const AUTO_COMPRESS_TRIGGER_RATIO = 0.9;
 const AUTO_COMPRESS_TARGET_RATIO = 0.4;
 
 /**
- * After this many cumulative read_file / collect_context calls in a single run,
- * inject a one-shot hint suggesting the model delegate further heavy file
- * collection to launch_subagent so the sub-agent's independent context window
- * absorbs the raw content and only the summary returns to the main conversation.
+ * Minimum cumulative read_file / collect_context calls before we even consider
+ * injecting the context-offload hint. Below this count the context window is
+ * almost certainly small enough that inline reads are fine.
  */
-const CONTEXT_OFFLOAD_HINT_THRESHOLD = 1;
+const CONTEXT_OFFLOAD_MIN_READS = 3;
+
+/**
+ * Only inject the offload hint when messages already occupy at least this
+ * fraction of the model's context window. If the context is still small,
+ * direct reads are cheaper and faster than spawning a sub-agent.
+ */
+const CONTEXT_OFFLOAD_TOKEN_RATIO = 0.4;
 
 /**
  * After how many CONSECUTIVE turns of identical tool-call batches we consider
@@ -1134,28 +1140,41 @@ export class AgentLoop {
         } as ChatMessage);
       }
 
-      // Inject a one-shot context-offload hint once the cumulative read budget
-      // is exhausted. We append it as a user message so it appears at the
-      // top of the NEXT model turn (after all tool replies are pushed above).
-      // The hint is injected only once per run to avoid repeating itself.
-      if (!offloadHintInjected && cumulativeReadCalls >= CONTEXT_OFFLOAD_HINT_THRESHOLD) {
-        offloadHintInjected = true;
-        messages.push({
-          role: 'user',
-          content:
-            `[context-offload hint] You have now called read_file / collect_context ` +
-            `${cumulativeReadCalls} times in this run. Each call injects raw file content into ` +
-            `the shared context window, which grows without bound and forces expensive ` +
-            `compression. If you still need to read more files or gather more workspace ` +
-            `context, STRONGLY PREFER delegating that work to launch_subagent: give the ` +
-            `sub-agent a focused objective and let it read/grep inside its own isolated ` +
-            `context window — only the concise summary comes back here. Reserve direct ` +
-            `read_file / collect_context calls for single targeted lookups that cannot ` +
-            `be delegated (e.g. re-reading a file you are about to propose_edit on).`
-        });
-        this.logger.info(
-          `Context-offload hint injected after ${cumulativeReadCalls} cumulative read calls.`
-        );
+      // Inject a one-shot context-offload hint only when the context window is
+      // already getting large AND the model has made several read calls.
+      // Conditions (both must be true):
+      //   1. cumulativeReadCalls >= CONTEXT_OFFLOAD_MIN_READS — don't nudge on
+      //      the very first reads; small context means subagent overhead isn't
+      //      worth it.
+      //   2. Current messages already occupy >= CONTEXT_OFFLOAD_TOKEN_RATIO of
+      //      the model's context window — only then is offloading worthwhile.
+      if (!offloadHintInjected && cumulativeReadCalls >= CONTEXT_OFFLOAD_MIN_READS) {
+        const usedTokens = estimateMessagesTokens(messages);
+        const contextWindow = this.options.contextWindow ?? 128_000;
+        const usageRatio = usedTokens / contextWindow;
+        if (usageRatio >= CONTEXT_OFFLOAD_TOKEN_RATIO) {
+          offloadHintInjected = true;
+          messages.push({
+            role: 'user',
+            content:
+              `[context-offload hint] You have now called read_file / collect_context ` +
+              `${cumulativeReadCalls} times in this run. Each call injects raw file content into ` +
+              `the shared context window, which grows without bound and forces expensive ` +
+              `compression. If you still need to read more files or gather more workspace ` +
+              `context, STRONGLY PREFER delegating that work to launch_subagent: give the ` +
+              `sub-agent a focused objective and let it read/grep inside its own isolated ` +
+              `context window — only the concise summary comes back here. Reserve direct ` +
+              `read_file / collect_context calls for single targeted lookups that cannot ` +
+              `be delegated (e.g. re-reading a file you are about to propose_edit on).`
+          });
+          this.logger.info(
+            `Context-offload hint injected after ${cumulativeReadCalls} reads (context usage: ${(usageRatio * 100).toFixed(1)}% of ${contextWindow} tokens).`
+          );
+        } else {
+          this.logger.debug(
+            `Context-offload hint suppressed: ${cumulativeReadCalls} reads but context only at ${(usageRatio * 100).toFixed(1)}% (threshold: ${(CONTEXT_OFFLOAD_TOKEN_RATIO * 100).toFixed(0)}%).`
+          );
+        }
       }
       // propose_edit is non-blocking: the model gets a "queued" tool reply and
       // we just keep iterating. The user can accept/reject the queued edits
