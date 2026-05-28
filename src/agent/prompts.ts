@@ -217,10 +217,14 @@ USE: before editing a file/symbol, scan for lessons whose scope matches and
 follow them. Critical rules apply unconditionally unless the user overrides
 this turn. When a lesson conflicts with what you were about to do, follow it.
 
-RECORD (call record_lesson) whenever the user corrects you ("不对", "wrong",
-"don't do X"), reveals a project convention, or states a project-wide rule
-("记住", "important: always X", "全局规则"). Set important=true for project-
-wide rules. Capture the file/symbol involved + one imperative sentence.
+RECORD (call record_lesson) in ANY of these situations:
+  • The user corrects you ("不对", "wrong", "don't do X", "这里有问题").
+  • You discover and fix a bug, omission, or design mistake — even without
+    an explicit user correction. Capture: what was wrong, what the correct
+    approach is, and which file/symbol it affects.
+  • The user reveals a project convention or states a project-wide rule
+    ("记住", "important: always X", "全局规则"). Set important=true.
+Capture the file/symbol involved + one imperative sentence.
 
 FORGET (call forget_lesson) when the user negates a listed lesson or asks
 you to do exactly what one forbids. Use the lesson id from <lessons_learned>.
@@ -232,8 +236,9 @@ comments, or your own internal reasoning.`;
 // chars vs 1100+ for the full version above.
 const LESSONS_PROTOCOL_SHORT = `LESSONS: call record_lesson when the user
 corrects you ("不对", "wrong"), reveals a project convention, or states a
-project-wide rule ("important: always X", "记住"). Set important=true for
-project-wide rules. No lessons recorded yet for this workspace.`;
+project-wide rule ("important: always X", "记住"), OR when you discover and
+fix a bug or omission yourself. Set important=true for project-wide rules.
+No lessons recorded yet for this workspace.`;
 
 const BATCH_PROTOCOL = `BATCH TOOL CALLS — MINIMIZE LLM ROUND-TRIPS:
 
@@ -326,7 +331,11 @@ save_topic_doc:
   Call when you have completed (or are wrapping up) a significant investigation —
   found root cause, understood a module, solved a bug — AND the findings would help
   a future session skip re-reading the same code.
-  Good triggers: task completed successfully, topic about to switch, user says thanks.
+  Good triggers:
+    • Task completed successfully (user got what they asked for).
+    • You fixed a non-trivial bug or corrected an omission — document what was
+      wrong, which files/symbols were involved, and what the fix was.
+    • Topic about to switch, or user says thanks / 谢谢.
   Skip for trivial 1-turn Q&A that adds no reusable knowledge.
   Write precise file paths, symbol names, and one-sentence learnings. Not vague prose.
   The doc is saved to .burstcode/topics/ and is readable by future sessions via
