@@ -11,10 +11,23 @@ function workspaceRoot(): string | undefined {
 
 function resolveUri(target: string): vscode.Uri {
   if (target.startsWith('file:')) return vscode.Uri.parse(target);
-  if (path.isAbsolute(target)) return vscode.Uri.file(target);
-  const root = workspaceRoot();
-  if (!root) throw new Error('No workspace folder open.');
-  return vscode.Uri.file(path.join(root, target));
+  let absPath: string;
+  if (path.isAbsolute(target)) {
+    absPath = target;
+  } else {
+    const root = workspaceRoot();
+    if (!root) throw new Error('No workspace folder open.');
+    absPath = path.join(root, target);
+  }
+  // On Windows, path.join produces backslash-separated paths. vscode.Uri.file()
+  // is supposed to normalize them to forward slashes, but some VS Code builds
+  // fail to do so when the path contains non-ASCII characters (e.g. Chinese),
+  // resulting in %5C (encoded backslash) in the URI which then causes
+  // openTextDocument / readDirectory to fail. Normalize explicitly here.
+  if (process.platform === 'win32') {
+    absPath = absPath.replace(/\\/g, '/');
+  }
+  return vscode.Uri.file(absPath);
 }
 
 export function buildReadFileTool(applier?: HunkApplier): Tool {
