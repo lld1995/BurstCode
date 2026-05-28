@@ -151,12 +151,15 @@ export function buildTranscript(
       const text = typeof m.content === 'string' ? m.content : '';
       // Skip internal messages injected by the agent loop that were never
       // shown to the user as real input: system notes, auto-continue nudges,
-      // stuck-detector corrections, and length-truncation continue prompts.
+      // stuck-detector corrections, length-truncation continue prompts,
+      // decision-buffer feedback, and context-offload hints.
       const isInternal =
         !text ||
         text.startsWith('(System note)') ||
         text.startsWith('[auto-continue]') ||
         text.startsWith('[stuck-detector]') ||
+        text.startsWith('[user-decision]') ||
+        text.startsWith('[context-offload hint]') ||
         text.startsWith('Your previous response was cut off');
       if (!isInternal) {
         entries.push({
