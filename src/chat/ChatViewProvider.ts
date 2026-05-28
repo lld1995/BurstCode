@@ -28,6 +28,7 @@ import { buildEditTools, AskUserSpec } from '../agent/tools/edits';
 import { buildPlanTool, PlanStep } from '../agent/tools/plan';
 import { buildLessonTools } from '../agent/tools/lessons';
 import { buildShellTools } from '../agent/tools/shell';
+import { buildContextTools } from '../agent/tools/context';
 import { buildSubagentTool } from '../agent/tools/subagent';
 import { LessonStore, renderLessonsBlock } from '../memory/LessonStore';
 import { CheckpointInfo, GitCheckpoint } from '../git/GitCheckpoint';
@@ -857,7 +858,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         outlineTruncated: outline.truncated,
         lessonsBlock: lessonsRender.text,
         lessonsTruncated: lessonsRender.truncated,
-        currentPlan
+        currentPlan,
+        contextToolsAvailable: true
       });
     } catch (err) {
       this.logger.warn('Failed to build workspace outline', String(err));
@@ -865,7 +867,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         workspaceRoot: root,
         lessonsBlock: lessonsRender.text,
         lessonsTruncated: lessonsRender.truncated,
-        currentPlan
+        currentPlan,
+        contextToolsAvailable: true
       });
     }
   }
@@ -1171,7 +1174,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let doneReason: string | undefined;
     let sawError = false;
     try {
-      for await (const event of agent.run(session.messages, cts.token)) {
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const runTools = workspaceRoot
+        ? buildContextTools(
+            session.messages,
+            workspaceRoot,
+            llmCfg.contextWindow,
+            () => { session.checkpoints = []; }
+          )
+        : [];
+      for await (const event of agent.run(session.messages, cts.token, runTools)) {
         // Update the per-session live snapshot FIRST so it stays consistent
         // whether or not the webview is currently showing this session.
         this.applyEventToLive(ctx, event);
@@ -2873,9 +2885,17 @@ function renderTranscript(entries) {
 // transcript is already rendered by load-session at this point.
 function replayLiveState(snap) {
   clearEmptyState();
-  // Iter / auto-continue / auto-resume pills (in order).
+  // Only render pills for the CURRENT (last) iteration. Historical iter pills
+  // are interleaved with transcript content during a live run but their
+  // corresponding messages are already shown by renderTranscript — appending
+  // all pills here would place them out of order (below all finalized content).
   const pills = Array.isArray(snap.pills) ? snap.pills : [];
-  for (const p of pills) {
+  let lastIterIdx = -1;
+  for (let i = pills.length - 1; i >= 0; i--) {
+    if (pills[i].kind === 'iteration') { lastIterIdx = i; break; }
+  }
+  const currentPills = lastIterIdx >= 0 ? pills.slice(lastIterIdx) : pills;
+  for (const p of currentPills) {
     if (p.kind === 'iteration') {
       const pill = document.createElement('div');
       pill.className = 'iter-pill';

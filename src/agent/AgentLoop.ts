@@ -305,11 +305,23 @@ export class AgentLoop {
   /**
    * Drive the multi-turn loop.
    * `messages` is mutated in-place (used as conversation memory across calls).
+   * `runTools` are additional per-run tools (e.g. compress_context, save_topic_doc)
+   * that capture run-specific state (live messages array, workspace root) via closure.
    */
   async *run(
     messages: ChatMessage[],
-    cancellation: vscode.CancellationToken
+    cancellation: vscode.CancellationToken,
+    runTools?: Tool[]
   ): AsyncGenerator<AgentEvent, void, void> {
+    // Merge base tools with per-run tools. Per-run tools shadow base tools of
+    // the same name (allowing overrides) and capture run-specific state via closure.
+    const runToolMap = new Map(this.toolMap);
+    for (const t of runTools ?? []) runToolMap.set(t.name, t);
+    const allToolDefs: ToolDef[] = [
+      ...this.tools.map((t) => t.schema),
+      ...(runTools ?? []).map((t) => t.schema)
+    ];
+
     // Always materialize the freshest system prompt at the head of the
     // conversation. For new sessions this seeds the system message; for
     // resumed sessions it replaces a stale prompt (e.g. previous outline
@@ -480,7 +492,7 @@ export class AgentLoop {
         // the wire, exactly the "大量并发相同的请求" symptom.
         const streamIter = this.client.streamChat(
           compressed,
-          this.toolDefs(),
+          allToolDefs,
           cancellation
         )[Symbol.asyncIterator]();
         let streamConsumed = false;
@@ -909,7 +921,7 @@ export class AgentLoop {
           name: tc.name,
           callId,
           parsed,
-          tool: this.toolMap.get(tc.name),
+          tool: runToolMap.get(tc.name),
           parseError,
           rawArgs: tc.arguments
         });

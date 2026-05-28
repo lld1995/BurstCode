@@ -1,10 +1,19 @@
 import * as vscode from 'vscode';
+import * as child_process from 'child_process';
 import { Tool, ToolResult } from './types';
 
 /**
  * Language-specific tools that wrap private commands of language extensions.
- * They are no-ops (returning isError) when the host extension is not installed.
+ * They are no-ops (returning isError) when the host extension is not installed
+ * or when the extension has not yet registered its commands (e.g. not yet
+ * activated, or no relevant project is open).
  */
+
+function isCommandNotFound(e: unknown): boolean {
+  const msg = String(e).toLowerCase();
+  return msg.includes('command') && msg.includes('not found');
+}
+
 export function buildLangTools(): Tool[] {
   const eslintFix: Tool = {
     name: 'eslint_fix',
@@ -24,6 +33,9 @@ export function buildLangTools(): Tool[] {
         await vscode.commands.executeCommand('eslint.executeAutofix');
         return { content: 'eslint auto-fix executed' };
       } catch (e) {
+        if (isCommandNotFound(e)) {
+          return { content: 'eslint.executeAutofix command not found — extension may not be fully activated. Use run_shell with `npx eslint --fix <file>` instead.', isError: true };
+        }
         return { content: `eslint fix failed: ${String(e)}`, isError: true };
       }
     }
@@ -47,6 +59,9 @@ export function buildLangTools(): Tool[] {
         await vscode.commands.executeCommand('avalonia.preview');
         return { content: 'avalonia preview opened' };
       } catch (e) {
+        if (isCommandNotFound(e)) {
+          return { content: 'avalonia.preview command not found — extension may not be fully activated or no .axaml file is open.', isError: true };
+        }
         return { content: `avalonia preview failed: ${String(e)}`, isError: true };
       }
     }
@@ -54,24 +69,50 @@ export function buildLangTools(): Tool[] {
 
   const dotnetBuild: Tool = {
     name: 'dotnet_build',
+    parallelSafe: false,
     schema: {
       type: 'function',
       function: {
         name: 'dotnet_build',
-        description: 'Build the active .NET project to validate the code compiles. Requires C# Dev Kit.',
-        parameters: { type: 'object', properties: {} }
+        description:
+          'Run `dotnet build` to compile the .NET project and return the full build output. ' +
+          'Optionally specify a project/solution path; otherwise builds from the workspace root.',
+        parameters: {
+          type: 'object',
+          properties: {
+            project: {
+              type: 'string',
+              description:
+                'Workspace-relative path to a .csproj, .sln, or directory to build. ' +
+                'Leave empty to build from the workspace root.'
+            }
+          }
+        }
       }
     },
-    async execute(): Promise<ToolResult> {
-      if (!vscode.extensions.getExtension('ms-dotnettools.csdevkit')) {
-        return { content: 'C# Dev Kit not installed', isError: true };
+    async execute(args): Promise<ToolResult> {
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!workspaceRoot) {
+        return { content: 'No workspace folder open.', isError: true };
       }
-      try {
-        await vscode.commands.executeCommand('dotnet.build');
-        return { content: 'dotnet build triggered' };
-      } catch (e) {
-        return { content: `dotnet build failed: ${String(e)}`, isError: true };
-      }
+      const projectArg = typeof args.project === 'string' && args.project.trim()
+        ? args.project.trim()
+        : '';
+      const cmdArgs = ['build', ...(projectArg ? [projectArg] : [])];
+      return new Promise((resolve) => {
+        child_process.execFile('dotnet', cmdArgs, { cwd: workspaceRoot, timeout: 120_000 }, (err, stdout, stderr) => {
+          const output = [stdout, stderr].filter(Boolean).join('\n').trim();
+          if (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+              resolve({ content: '`dotnet` CLI not found in PATH. Ensure the .NET SDK is installed and on PATH.', isError: true });
+            } else {
+              resolve({ content: `dotnet build failed:\n${output || String(err)}`, isError: true });
+            }
+          } else {
+            resolve({ content: `dotnet build succeeded:\n${output}` });
+          }
+        });
+      });
     }
   };
 

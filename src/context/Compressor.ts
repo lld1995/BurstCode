@@ -38,6 +38,22 @@ function zoneFor(exchangeDistance: number, keepLastN: number): 0 | 1 | 2 | 3 {
 }
 
 /**
+ * Tools whose results must not be zone-truncated. These are structural reads
+ * (symbol outlines, reference lists) that the model needs intact for as long as
+ * the file is being worked on — orphan pruning already removes them once they
+ * are no longer referenced downstream. Consistent with normalizeToolResult which
+ * also applies no storage-time cap for the same tools.
+ */
+const NO_ZONE_TRUNCATE_TOOLS = new Set([
+  'document_symbols',
+  'workspace_symbols',
+  'find_references',
+  'find_references_by_name',
+  'find_implementations',
+  'find_definition',
+]);
+
+/**
  * Layered compression strategy:
  *  1. Always keep system message + last `keepLastN` exchanges in full (zone 0).
  *  2. Unconditionally compress older tool/assistant content by zone (distance-based).
@@ -46,6 +62,16 @@ function zoneFor(exchangeDistance: number, keepLastN: number): 0 | 1 | 2 | 3 {
 export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig): ChatMessage[] {
   const result = [...messages];
   const systemIdx = result.findIndex((m) => m.role === 'system');
+
+  // Build a tool_call_id → tool name map so Pass 1 can exempt structural reads
+  // (document_symbols, workspace_symbols, LSP tools) from zone truncation.
+  const callIdToName = new Map<string, string>();
+  for (const m of result) {
+    const calls = (m as { tool_calls?: Array<{ id: string; function: { name: string } }> }).tool_calls;
+    if (calls) {
+      for (const c of calls) callIdToName.set(c.id, c.function.name);
+    }
+  }
 
   // ── Pass 1: unconditional distance-based tiered compression ──────────────
   // Walk backwards counting "exchange" boundaries (each user message or the
@@ -103,6 +129,13 @@ export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig)
     if (zone === 0) continue;
     const cap = ZONE_CAPS[zone];
     const msg = result[i]; // may have been rewritten by reasoning strip above
+    // Skip zone truncation for structural tool results (symbol outlines, LSP
+    // references). Orphan pruning handles their eventual removal; truncating
+    // them mid-conversation destroys the model's orientation in the file.
+    if (msg.role === 'tool') {
+      const id = (msg as ChatMessage & { tool_call_id?: string }).tool_call_id ?? '';
+      if (NO_ZONE_TRUNCATE_TOOLS.has(callIdToName.get(id) ?? '')) continue;
+    }
     let original = stringifyContent(msg.content);
     // For older `read_file` replies, the `   123\t` line-number prefix on
     // every line is dead weight — the model only needs current line numbers

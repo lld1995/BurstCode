@@ -26,6 +26,12 @@ export interface SystemPromptInput {
    * skip planning entirely on follow-up complex requests.
    */
   currentPlan?: Array<{ id: string; content: string; status: string }>;
+  /**
+   * When true, the context-management tool section is included in the prompt.
+   * Set to true whenever compress_context / save_topic_doc are available as
+   * run tools (i.e. a workspace root is known).
+   */
+  contextToolsAvailable?: boolean;
 }
 
 const HEADER = `You are BurstCode, an autonomous coding agent embedded in VS Code.
@@ -303,6 +309,29 @@ For ANY fan-out requiring 2+ file reads for understanding (not immediate editing
 use launch_subagent — it runs each task in its own isolated context window and
 returns only a concise summary, keeping THIS context window lean.`;
 
+const CONTEXT_MANAGEMENT = `CONTEXT MANAGEMENT — two tools to keep sessions lean:
+
+compress_context:
+  Call ONLY when the user's new request is COMPLETELY UNRELATED to everything this
+  session has worked on so far — different module, different bug, different feature,
+  with no shared files or symbols. Signs of a genuine topic switch: user explicitly
+  starts a new unrelated task, references entirely different areas of the codebase.
+  DO NOT call when: user is still debugging the same issue from a new angle, doing a
+  follow-up or refinement on the same area, or asking a clarifying question about
+  prior work. When in doubt, DO NOT compress — compression is irreversible.
+  ALWAYS call save_topic_doc FIRST (before compressing) if the current topic produced
+  useful findings worth preserving for future sessions.
+
+save_topic_doc:
+  Call when you have completed (or are wrapping up) a significant investigation —
+  found root cause, understood a module, solved a bug — AND the findings would help
+  a future session skip re-reading the same code.
+  Good triggers: task completed successfully, topic about to switch, user says thanks.
+  Skip for trivial 1-turn Q&A that adds no reusable knowledge.
+  Write precise file paths, symbol names, and one-sentence learnings. Not vague prose.
+  The doc is saved to .burstcode/topics/ and is readable by future sessions via
+  list_dir / read_file before doing heavy code collection.`;
+
 const RULES = `RULES:
 - Never guess file paths. Either they appear in <workspace_layout>, or you confirmed them
   via workspace_symbols / list_dir / workspace_outline / grep_search first.
@@ -333,6 +362,7 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): string {
     !!input.lessonsBlock && input.lessonsBlock.trim().length > 0 &&
     !/^\(no lessons/.test(input.lessonsBlock.trim());
   stable.push(hasLessons ? LESSONS_PROTOCOL_FULL : LESSONS_PROTOCOL_SHORT);
+  if (input.contextToolsAvailable) stable.push(CONTEXT_MANAGEMENT);
   stable.push(RULES);
   stable.push(STATE_POINTER);
 
@@ -373,6 +403,22 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): string {
       .join('\n');
     volatile.push(
       `<current_plan>\n${planLines}\n</current_plan>\n(Plan from an earlier turn. Per PROTOCOL step 3, decide whether to REPLACE / extend / skip.)`
+    );
+  }
+
+  if (input.contextToolsAvailable) {
+    volatile.push(
+      `<burstcode_topics>
+` +
+      `Past investigation summaries are stored in .burstcode/topics/ (workspace-relative).
+` +
+      `Before doing heavy code collection on a topic, call list_dir(".burstcode/topics") to
+` +
+      `see available docs, then read_file on any that look relevant — their findings and
+` +
+      `key file paths may let you skip several collect_context / grep_search calls.
+` +
+      `</burstcode_topics>`
     );
   }
 
