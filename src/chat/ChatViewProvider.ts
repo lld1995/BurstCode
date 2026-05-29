@@ -2078,7 +2078,6 @@ const statusElapsed = statusEl.querySelector('.elapsed');
 
 let activeAssistantEl = null;
 let activeStreamingToolEl = null; // the <details> element currently receiving arg-stream content
-let renderScheduled = false;
 let activeReasoningEl = null;
 let toolElements = new Map();
 let runningTools = new Map(); // id -> { name, startedAt }
@@ -2156,14 +2155,25 @@ function forceScrollToBottom() {
   autoScroll = true;
   scheduleScrollToBottom(true);
 }
-function scheduleRender() {
-  if (renderScheduled) return;
-  renderScheduled = true;
+// Capture the assistant element AT SCHEDULE TIME. The previous version read the
+// global activeAssistantEl inside the rAF callback, so if the turn ended
+// (assistant-message sets it to null) or a new turn started a new bubble before
+// the frame fired, the queued render either silently dropped the final tokens or
+// wrote markdown into the WRONG bubble -- producing the interleaved/torn output
+// that only a full session re-render (renderTranscript) could repair. Now each
+// target element carries its own pending flag and the callback renders exactly
+// the element it was scheduled for.
+function scheduleRender(targetEl) {
+  const el = targetEl || activeAssistantEl;
+  if (!el) return;
+  if (el.dataset.renderPending === 'true') return;
+  el.dataset.renderPending = 'true';
   requestAnimationFrame(() => {
-    renderScheduled = false;
-    if (!activeAssistantEl) return;
-    const raw = activeAssistantEl.dataset.raw || '';
-    const mdEl = activeAssistantEl.querySelector('.md');
+    delete el.dataset.renderPending;
+    // The element may have been removed from the DOM (e.g. empty turn pruned).
+    if (!el.isConnected) return;
+    const raw = el.dataset.raw || '';
+    const mdEl = el.querySelector('.md');
     if (mdEl) {
       mdEl.innerHTML = renderMarkdown(raw);
       bindCodeCopy(mdEl);
@@ -3603,7 +3613,7 @@ window.addEventListener('message', (e) => {
         }
       }
       activeAssistantEl.dataset.raw = (activeAssistantEl.dataset.raw || '') + msg.payload.text;
-      scheduleRender();
+      scheduleRender(activeAssistantEl);
       break;
     }
     case 'assistant-message':
