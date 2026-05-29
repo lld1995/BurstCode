@@ -10,3 +10,4 @@ esbuild.js
 tsconfig.json
 scripts/**
 *.vsix
+.burstcode/**
