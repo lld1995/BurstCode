@@ -490,9 +490,20 @@ const PRUNABLE_TOOLS = new Set([
 function extractPathsFromToolResult(toolName: string, content: string): Set<string> {
   const paths = new Set<string>();
 
-  if (toolName === 'read_file' || toolName === 'get_function_range') {
+  if (toolName === 'read_file') {
     // Header: `# src/agent/AgentLoop.ts (lines 1-200 of 1201)`
     const m = content.match(/^# (.+?) \(lines \d/);
+    if (m) paths.add(m[1].trim());
+    return paths;
+  }
+
+  if (toolName === 'get_function_range') {
+    // Header: `# Method run [311-1287]` — `# <SymbolKind> <name> [start-end]`.
+    // There is NO path here, so we use the symbol NAME as the reference token:
+    // if the name no longer appears downstream the body is safe to prune.
+    // (Previously this shared read_file's `(lines …)` regex, which never matched
+    //  this header → the set was always empty → the body was never pruned.)
+    const m = content.match(/^# \S+ (\S+) \[\d+-\d+\]/);
     if (m) paths.add(m[1].trim());
     return paths;
   }
@@ -515,12 +526,27 @@ function extractPathsFromToolResult(toolName: string, content: string): Set<stri
     while ((hm = headerRe.exec(content)) !== null) {
       paths.add(hm[1].trim());
     }
+    // IMPORTANT: collect_context can embed grep_search sub-results whose bodies
+    // are `src/foo/bar.ts:42:3:code` lines. Those paths live neither in the
+    // section header (which holds the query, not a path) nor in a `# path`
+    // header, so without this pass they'd be invisible to the prune guard and
+    // the result could be wrongly deleted while still referenced downstream.
+    // Reuse the same grep line heuristic to capture them.
+    const grepLineRe = /^((?:[A-Za-z]:[\\/])?[\w./\\][\w./\\-]+\.\w+):\d+:/gm;
+    let glm: RegExpExecArray | null;
+    while ((glm = grepLineRe.exec(content)) !== null) {
+      paths.add(glm[1]);
+    }
     return paths;
   }
 
   if (toolName === 'grep_search') {
-    // Match lines: `src/foo/bar.ts:42:  some code`
-    const lineRe = /^([\w./\\][\w./\\-]+\.\w+):\d+:/gm;
+    // Match lines: `src/foo/bar.ts:42:  code` (relative) or
+    //              `e:\project\src\foo.ts:42:3:code` (Windows absolute, drive
+    //              letter prefix). The optional `[A-Za-z]:[\\/]` head is required
+    //              so the drive-letter colon isn't mistaken for the line-number
+    //              separator (which previously truncated the path at `e`).
+    const lineRe = /^((?:[A-Za-z]:[\\/])?[\w./\\][\w./\\-]+\.\w+):\d+:/gm;
     let lm: RegExpExecArray | null;
     while ((lm = lineRe.exec(content)) !== null) {
       paths.add(lm[1]);
@@ -582,7 +608,15 @@ function buildDownstreamText(messages: ChatMessage[], fromIdx: number): string {
  */
 export function pruneOrphanedToolResults(
   messages: ChatMessage[],
-  keepLastN: number
+  keepLastN: number,
+  /**
+   * Recent-read grace period: the most recent `graceRecentToolResults` PRUNABLE
+   * tool results are kept intact even when their paths are absent downstream.
+   * The model very often returns to the same file a few turns later to issue a
+   * propose_edit; deleting a just-read result forces a wasteful re-read. Set to
+   * 0 to disable the grace window (legacy aggressive behaviour).
+   */
+  graceRecentToolResults = 0
 ): number {
   const MIN_PRUNE_CHARS = 300;
 
@@ -609,11 +643,29 @@ export function pruneOrphanedToolResults(
     }
   }
 
+  // Compute the boundary for the recent-read grace window: any prunable tool
+  // result at index >= graceFrom is considered "recently read" and exempt. Walk
+  // backwards collecting prunable tool-result indices until we have
+  // `graceRecentToolResults` of them; the earliest one becomes the boundary.
+  let graceFrom = messages.length;
+  if (graceRecentToolResults > 0) {
+    let seen = 0;
+    for (let i = messages.length - 1; i >= 0 && seen < graceRecentToolResults; i--) {
+      const m = messages[i];
+      if (m.role !== 'tool') continue;
+      const id = (m as ChatMessage & { tool_call_id?: string }).tool_call_id ?? '';
+      if (!PRUNABLE_TOOLS.has(callIdToName.get(id) ?? '')) continue;
+      seen++;
+      graceFrom = i;
+    }
+  }
+
   let pruned = 0;
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m.role !== 'tool') continue;
     if (i >= protectedFrom) continue; // in protected zone — never touch
+    if (i >= graceFrom) continue; // recently read — grace window, never touch yet
 
     const toolCallId = (m as ChatMessage & { tool_call_id?: string }).tool_call_id ?? '';
     const toolName = callIdToName.get(toolCallId) ?? '';
@@ -635,9 +687,13 @@ export function pruneOrphanedToolResults(
     const downstream = buildDownstreamText(messages, i + 1);
 
     // If ANY of the paths still appear downstream, keep the result intact.
+    // Normalize each path's separators to forward slashes to match
+    // buildDownstreamText (which collapses all backslashes to `/`), otherwise
+    // Windows backslash paths extracted here would never match downstream text.
     let stillReferenced = false;
     for (const p of paths) {
-      if (downstream.includes(p)) {
+      const norm = p.replace(/\\/g, '/');
+      if (downstream.includes(norm)) {
         stillReferenced = true;
         break;
       }

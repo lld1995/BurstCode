@@ -33,6 +33,18 @@ export interface AgentEvent {
 const AUTO_COMPRESS_TRIGGER_RATIO = 0.9;
 /** Target post-compression budget (input ratio) so we free at least half of the in-use space. */
 const AUTO_COMPRESS_TARGET_RATIO = 0.4;
+/**
+ * Only start orphan-pruning tool results once usage crosses this fraction of
+ * the window. Below it the context is roomy, so pruning would only risk forcing
+ * the model to re-read files it still wants — a net token + latency loss.
+ */
+const ORPHAN_PRUNE_TRIGGER_RATIO = 0.6;
+/**
+ * Recent-read grace window for orphan pruning: never prune the most recent N
+ * prunable tool results even when their paths are absent downstream. Covers the
+ * common "read now, edit a couple turns later" pattern so we don't churn reads.
+ */
+const ORPHAN_PRUNE_RECENT_GRACE = 6;
 
 /**
  * Minimum cumulative read_file / collect_context calls before we even consider
@@ -401,13 +413,26 @@ export class AgentLoop {
       const ctxMax = this.options.contextWindow;
       let usedTokens = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
 
-      // ── Orphan-prune pass (runs every turn, very cheap) ───────────────────
+      // ── Orphan-prune pass (pressure-gated) ────────────────────────────────
       // Collapse tool results whose file paths are never referenced again in
       // later messages. Runs BEFORE zone compression so the compressor has
       // less to work with. Safe: never deletes messages, never touches the
       // last keepLastN exchanges, only prunes when ALL extracted paths are
       // absent from all downstream content.
-      const pruneCount = pruneOrphanedToolResults(messages, defaultCompressorConfig.keepLastN);
+      //
+      // Gated two ways to avoid forcing the model into wasteful re-reads:
+      //   1. Only run once usage crosses ORPHAN_PRUNE_TRIGGER_RATIO — while the
+      //      window is roomy, keeping reads around is cheaper than re-fetching.
+      //   2. Exempt the most recent ORPHAN_PRUNE_RECENT_GRACE tool results, so a
+      //      file read "now" survives long enough for a follow-up propose_edit.
+      const pruneCount =
+        ctxMax > 0 && usedTokens / ctxMax > ORPHAN_PRUNE_TRIGGER_RATIO
+          ? pruneOrphanedToolResults(
+              messages,
+              defaultCompressorConfig.keepLastN,
+              ORPHAN_PRUNE_RECENT_GRACE
+            )
+          : 0;
       if (pruneCount > 0) {
         const afterPrune = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
         this.logger.info(
@@ -1161,7 +1186,7 @@ export class AgentLoop {
       //   2. Current messages already occupy >= CONTEXT_OFFLOAD_TOKEN_RATIO of
       //      the model's context window — only then is offloading worthwhile.
       if (!offloadHintInjected && cumulativeReadCalls >= CONTEXT_OFFLOAD_MIN_READS) {
-        const usedTokens = estimateMessagesTokens(messages);
+        const usedTokens = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
         const contextWindow = this.options.contextWindow ?? 128_000;
         const usageRatio = usedTokens / contextWindow;
         if (usageRatio >= CONTEXT_OFFLOAD_TOKEN_RATIO) {
