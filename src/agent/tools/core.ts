@@ -502,7 +502,7 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
 
       if (tasks.length === 0) {
         return {
-          content: 'collect_context: nothing to collect — you called this tool with no reads, greps, lists, or outlines. Retry with at least one entry, e.g. {"greps": [{"query": "your search", "glob": "**/*.cs"}]} or {"reads": [{"path": "src/file.ts"}]}. If you genuinely have nothing to collect, stop calling this tool.',
+          content: 'collect_context: nothing to collect — you called collect_context with empty reads/greps/lists/outlines parameters. These are PARAMETERS of collect_context, NOT separate tools. Retry with at least one entry, e.g. collect_context({"greps": [{"query": "your search", "glob": "**/*.cs"}]}) or collect_context({"reads": [{"path": "src/file.ts"}]}). If you genuinely have nothing to collect, stop calling this tool.',
           isError: true
         };
       }

@@ -342,6 +342,11 @@ save_topic_doc:
   list_dir / read_file before doing heavy code collection.`;
 
 const RULES = `RULES:
+- ONLY call tools that are defined in the function definitions of this conversation.
+  Do NOT invent, guess, or hallucinate tool names (e.g. "greps", "lists", "RollOver",
+  "SwitchSymbol", "ChangeMon" are NOT real tools). If you need to grep, use grep_search
+  or the greps parameter inside collect_context. If you need to list a directory, use
+  list_dir or the lists parameter inside collect_context.
 - Never guess file paths. Either they appear in <workspace_layout>, or you confirmed them
   via workspace_symbols / list_dir / workspace_outline / grep_search first.
 - Never modify files without first reading them at the relevant lines.
