@@ -561,6 +561,15 @@ export class AgentLoop {
               // streaming deltas and only set it in the final assistant message.
               if (!preAnnounced.has(idx) && entry.name) {
                 preAnnounced.add(idx);
+                // Many OpenAI-compatible models omit id from streaming deltas.
+                // Generate a stable id now and store it back so the subsequent
+                // tool-call-start (update) and tool-call-end events share the
+                // same id — otherwise the webview creates duplicate elements
+                // and the streaming one stays "running" forever.
+                if (!entry.id) {
+                  entry.id = `call_${Date.now()}_${idx}`;
+                  toolCallAccumulator.set(idx, entry);
+                }
                 yield { type: 'tool-call-start', payload: { name: entry.name, id: entry.id, args: {}, streaming: true } };
               }
               // Stream argument text to UI. Use idx (stable integer index) as the
