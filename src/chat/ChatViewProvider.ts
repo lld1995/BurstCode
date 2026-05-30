@@ -1278,15 +1278,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         live.reasoningText = '';
         break;
       case 'tool-call-start': {
-        const p = (event.payload ?? {}) as { id?: string; name?: string; args?: unknown };
+        const p = (event.payload ?? {}) as { id?: string; name?: string; args?: unknown; streaming?: boolean };
         const id = String(p.id ?? `${p.name}_${Date.now()}`);
+        this.logger.info(`[applyEventToLive] tool-call-start event received. name=${p.name}, id=${id}, streaming=${!!p.streaming}, args=${JSON.stringify(p.args)}`);
         live.runningTools.set(id, { id, name: String(p.name ?? ''), args: p.args, startedAt: Date.now() });
         const names = Array.from(live.runningTools.values()).map((t) => t.name).join(', ');
         live.lastStatus = { state: 'tool', label: `Running ${names}...` };
         break;
       }
       case 'tool-call-end': {
-        const p = (event.payload ?? {}) as { id?: string };
+        const p = (event.payload ?? {}) as { id?: string; name?: string; result?: string; isError?: boolean };
+        this.logger.info(`[applyEventToLive] tool-call-end event received. name=${p.name}, id=${p.id}, isError=${!!p.isError}`);
         if (p.id) {
           live.runningTools.delete(p.id);
           live.toolProgress.delete(p.id);
@@ -3644,6 +3646,7 @@ window.addEventListener('message', (e) => {
     case 'tool-call-start': {
       clearEmptyState();
       const existingKey = msg.payload.id || msg.payload.name + Date.now();
+      console.log('[Webview] tool-call-start received. name=' + msg.payload.name + ', id=' + msg.payload.id + ', existingKey=' + existingKey + ', existsInToolElements=' + toolElements.has(existingKey) + ', args=' + JSON.stringify(msg.payload.args));
       if (toolElements.has(existingKey)) {
         const existingDet = toolElements.get(existingKey);
         const existingSum = existingDet.querySelector('summary');
@@ -3971,11 +3974,12 @@ window.addEventListener('message', (e) => {
     case 'error':
       addErrorMsg('⚠ ' + (typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload)));
       setBusy(false);
-      for (const [key, det] of Array.from(toolElements.entries())) {
-        if (det.dataset.running === 'true') {
+      for (const key of Array.from(runningTools.keys())) {
+        const det = toolElements.get(key);
+        if (det && det.dataset.running === 'true') {
           det.dataset.running = 'false';
           const s = det.querySelector('summary');
-          if (s) s.textContent = '\u26a0 ' + ((runningTools.get(key) || {}).name || '?') + ' \u00b7 cancelled';
+          if (s) s.textContent = '\u26a0 ' + (runningTools.get(key)?.name || '?') + ' \u00b7 cancelled';
         }
       }
       activeStreamingToolEl = null;
@@ -3984,7 +3988,6 @@ window.addEventListener('message', (e) => {
       break;
     case 'done': {
       setBusy(false);
-      runningTools.clear();
       const reason = (msg.payload && msg.payload.reason) || 'stop';
       const labels = {
         stop: 'Done',
@@ -3998,15 +4001,17 @@ window.addEventListener('message', (e) => {
       };
       const errorish = reason === 'cancelled' || reason === 'max_iterations' || reason === 'stuck' || reason === 'aborted-stuck';
       // Cancel any leftover pre-announced tool elements that never ran.
-      for (const [key, det] of toolElements) {
-        if (det.dataset.streaming === 'true') {
+      for (const key of Array.from(runningTools.keys())) {
+        const det = toolElements.get(key);
+        if (det && det.dataset.streaming === 'true') {
           det.dataset.running = 'false';
           delete det.dataset.streaming;
           const s = det.querySelector('summary');
-          if (s) s.textContent = '\u26a0 ' + ((runningTools.get(key) || {}).name || '?') + ' \u00b7 cancelled';
-          toolElements.delete(key); runningTools.delete(key);
+          if (s) s.textContent = '\u26a0 ' + (runningTools.get(key)?.name || '?') + ' \u00b7 cancelled';
+          toolElements.delete(key);
         }
       }
+      runningTools.clear();
       setStatus(errorish ? 'error' : 'done', labels[reason] || ('Done (' + reason + ')'));
       break;
     }

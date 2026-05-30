@@ -552,7 +552,7 @@ export class AgentLoop {
               const idx = chunk.toolCallDelta.index;
               const entry =
                 toolCallAccumulator.get(idx) ?? { id: undefined, name: '', arguments: '' };
-              if (chunk.toolCallDelta.id) entry.id = chunk.toolCallDelta.id;
+              if (chunk.toolCallDelta.id && !entry.id) entry.id = chunk.toolCallDelta.id;
               if (chunk.toolCallDelta.name) entry.name = chunk.toolCallDelta.name;
               if (chunk.toolCallDelta.argumentsDelta) entry.arguments += chunk.toolCallDelta.argumentsDelta;
               toolCallAccumulator.set(idx, entry);

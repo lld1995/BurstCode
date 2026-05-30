@@ -53,6 +53,12 @@ export function buildReadFileTool(applier?: HunkApplier): Tool {
       }
     },
     async execute(args: Record<string, unknown>): Promise<ToolResult> {
+      if (args.path === undefined || args.path === null || String(args.path).trim() === '' || String(args.path) === 'undefined') {
+        return {
+          content: 'Error: read_file requires a valid non-empty "path" argument.',
+          isError: true
+        };
+      }
       const target = String(args.path);
       const uri = resolveUri(target);
       let rawLines: string[];
@@ -251,6 +257,12 @@ export const grepSearchTool: Tool = {
   async execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
     const root = workspaceRoot();
     if (!root) throw new Error('No workspace folder open.');
+    if (args.query === undefined || args.query === null || String(args.query).trim() === '' || String(args.query) === 'undefined') {
+      return {
+        content: 'Error: grep_search requires a valid non-empty "query" argument.',
+        isError: true
+      };
+    }
     const query = String(args.query);
     const fixed = !!args.fixedStrings;
     const glob = args.glob ? String(args.glob) : undefined;
