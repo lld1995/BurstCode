@@ -388,7 +388,8 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
           'Pass any combination of files to read, patterns to grep, directories to list, ' +
           'and paths to outline — all sub-operations execute concurrently. ' +
           'Use this as the FIRST move on any non-trivial question instead of issuing ' +
-          'read_file / grep_search one at a time across multiple turns.',
+          'read_file / grep_search one at a time across multiple turns. ' +
+          'IMPORTANT: You MUST provide at least one entry across reads / greps / lists / outlines. Empty calls will fail — if you have nothing to collect, do not call this tool.',
         parameters: {
           type: 'object',
           properties: {
@@ -474,7 +475,7 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
 
       if (tasks.length === 0) {
         return {
-          content: 'collect_context: nothing to collect — provide at least one entry in reads / greps / lists / outlines.',
+          content: 'collect_context: nothing to collect — you called this tool with no reads, greps, lists, or outlines. Retry with at least one entry, e.g. {"greps": [{"query": "your search", "glob": "**/*.cs"}]} or {"reads": [{"path": "src/file.ts"}]}. If you genuinely have nothing to collect, stop calling this tool.',
           isError: true
         };
       }

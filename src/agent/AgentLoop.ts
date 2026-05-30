@@ -903,7 +903,12 @@ export class AgentLoop {
       const prepared: PreparedCall[] = [];
       for (let i = 0; i < toolCalls.length; i++) {
         const tc = toolCalls[i];
-        if (!tc.name) continue;
+        if (!tc.name) {
+          if (preAnnounced.has(i)) {
+            yield { type: 'tool-call-end', payload: { name: '', id: finalCalls[i]?.id, result: '[stream truncated — tool call discarded]', isError: true } };
+          }
+          continue;
+        }
         const callId = finalCalls[i]?.id ?? `call_${Date.now()}_${i}`;
         let parsed: Record<string, unknown> = {};
         let parseError: string | undefined;
@@ -961,7 +966,14 @@ export class AgentLoop {
       }
 
       const executeOne = async (c: PreparedCall): Promise<ToolResult> => {
-        if (!c.tool) return { content: `Unknown tool: ${c.name}`, isError: true };
+        if (!c.tool) {
+          const ccHints: Record<string, string> = { greps: 'grep_search', reads: 'read_file', lists: 'list_dir', outlines: 'workspace_outline' };
+          const standalone = ccHints[c.name];
+          const hint = standalone
+            ? ` Did you mean to call '${standalone}' directly, or use collect_context with { "${c.name}": [...] }?`
+            : '';
+          return { content: `Unknown tool: ${c.name}.${hint}`, isError: true };
+        }
         if (c.parseError) {
           // Show the model the actual parse error AND a head/tail snippet of
           // what we received, so it can see whether its JSON was truncated
