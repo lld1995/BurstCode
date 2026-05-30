@@ -269,6 +269,12 @@ export const grepSearchTool: Tool = {
     const max = Math.min(Number(args.maxResults) || 200, 1000);
 
     const rgPath = await findRipgrep();
+    if (!rgPath) {
+      return {
+        content: ripgrepMissingMessage(),
+        isError: true
+      };
+    }
     return new Promise<ToolResult>((resolve, reject) => {
       const cliArgs = ['--vimgrep', '--no-heading', '--color', 'never', '--max-count', '50'];
       if (fixed) cliArgs.push('-F');
@@ -298,6 +304,15 @@ export const grepSearchTool: Tool = {
       proc.on('error', (err) => {
         clearTimeout(internalTimer);
         cancelSub.dispose();
+        // A missing/un-spawnable ripgrep surfaces here as ENOENT. Don't let the
+        // raw error bubble up as an opaque "spawn rg.exe ENOENT" — invalidate
+        // the cached path (so a later install is re-detected) and return the
+        // same actionable guidance the pre-spawn check uses.
+        if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+          cachedRgPath = undefined;
+          resolve({ content: ripgrepMissingMessage(), isError: true });
+          return;
+        }
         reject(err);
       });
       proc.on('close', () => {
@@ -520,23 +535,119 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
   };
 }
 
-async function findRipgrep(): Promise<string> {
-  // VS Code ships ripgrep at <appRoot>/node_modules.asar.unpacked/@vscode/ripgrep/bin/rg(.exe)
-  const appRoot = vscode.env.appRoot;
+/**
+ * Cached ripgrep resolution. `undefined` = not yet resolved OR last resolution
+ * found nothing (we re-probe in that case so a freshly-installed rg is picked
+ * up). A non-empty string is a confirmed, on-disk (or PATH-resolved) binary.
+ */
+let cachedRgPath: string | undefined;
+
+function ripgrepMissingMessage(): string {
+  return (
+    'grep_search unavailable: could not locate a ripgrep (rg) binary. ' +
+    'BurstCode searches the VS Code install (appRoot) and your system PATH for ripgrep. ' +
+    'Fix by either (a) installing ripgrep and adding it to your PATH ' +
+    '(https://github.com/BurntSushi/ripgrep#installation), or ' +
+    '(b) setting "burstcode.ripgrepPath" to the full path of rg(.exe), then reloading the window. ' +
+    'In the meantime use read_file / collect_context (reads) / list_dir, which do not require ripgrep.'
+  );
+}
+
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    const fs = await import('fs/promises');
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Resolve `rg` from the system PATH (returns the bare exe name if found). */
+async function findRipgrepOnPath(exe: string): Promise<string | undefined> {
+  return new Promise<string | undefined>((resolve) => {
+    const probe = process.platform === 'win32' ? 'where' : 'which';
+    try {
+      const child = cp.spawn(probe, [exe]);
+      let out = '';
+      child.stdout?.on('data', (d) => (out += d.toString()));
+      child.on('error', () => resolve(undefined));
+      child.on('close', (code) => {
+        const first = out.split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+        resolve(code === 0 && first ? first : undefined);
+      });
+    } catch {
+      resolve(undefined);
+    }
+  });
+}
+
+/** Shallow recursive scan for an rg binary under `dir` (depth-limited). */
+async function scanForRipgrep(dir: string, exe: string, depth: number): Promise<string | undefined> {
+  if (depth < 0) return undefined;
+  let entries: import('fs').Dirent[];
+  try {
+    const fs = await import('fs/promises');
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  // Check files at this level first.
+  for (const e of entries) {
+    if (e.isFile() && e.name === exe) return path.join(dir, e.name);
+  }
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const found = await scanForRipgrep(path.join(dir, e.name), exe, depth - 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
+ * Locate a usable ripgrep binary. Strategy (first hit wins, result cached):
+ *   1. Explicit `burstcode.ripgrepPath` setting.
+ *   2. Known VS Code bundled locations under appRoot.
+ *   3. A depth-limited recursive scan of appRoot (covers builds/forks that
+ *      put rg in a non-standard subfolder — e.g. VSCodium, Cursor, portable).
+ *   4. The system PATH (`where`/`which`).
+ * Returns `undefined` when nothing is found so callers can show actionable
+ * guidance instead of letting `cp.spawn` throw an opaque ENOENT.
+ */
+async function findRipgrep(): Promise<string | undefined> {
+  if (cachedRgPath && (await pathExists(cachedRgPath))) return cachedRgPath;
+  cachedRgPath = undefined;
+
   const exe = process.platform === 'win32' ? 'rg.exe' : 'rg';
+
+  // 1. User override.
+  const override = vscode.workspace
+    .getConfiguration('burstcode')
+    .get<string>('ripgrepPath');
+  if (override && override.trim() && (await pathExists(override.trim()))) {
+    return (cachedRgPath = override.trim());
+  }
+
+  const appRoot = vscode.env.appRoot;
+
+  // 2. Known bundled locations.
   const candidates = [
     path.join(appRoot, 'node_modules.asar.unpacked', '@vscode', 'ripgrep', 'bin', exe),
+    path.join(appRoot, 'node_modules.asar.unpacked', 'vscode-ripgrep', 'bin', exe),
     path.join(appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', exe),
     path.join(appRoot, 'node_modules', 'vscode-ripgrep', 'bin', exe)
   ];
-  const fs = await import('fs/promises');
   for (const c of candidates) {
-    try {
-      await fs.access(c);
-      return c;
-    } catch {
-      /* keep looking */
-    }
+    if (await pathExists(c)) return (cachedRgPath = c);
   }
-  return exe; // fall back to PATH
+
+  // 3. Depth-limited recursive scan of appRoot (build/fork-specific layouts).
+  const scanned = await scanForRipgrep(appRoot, exe, 5);
+  if (scanned) return (cachedRgPath = scanned);
+
+  // 4. System PATH.
+  const onPath = await findRipgrepOnPath(exe);
+  if (onPath) return (cachedRgPath = onPath);
+
+  return undefined;
 }

@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Windsurf-style autonomous coding agent powered by local OpenAI-compatible LLMs.",
-  "version": "0.1.54",
+  "version": "0.1.55",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -328,6 +328,11 @@
           "type": "number",
           "default": 60000,
           "description": "Maximum time to wait for a language server to be ready."
+        },
+        "burstcode.ripgrepPath": {
+          "type": "string",
+          "default": "",
+          "description": "Full path to a ripgrep (rg / rg.exe) binary used by the grep_search and collect_context tools. Leave empty to auto-detect from the VS Code install and your system PATH. Set this if grep_search reports 'spawn rg ENOENT' / 'could not locate a ripgrep binary'. Reload the window after changing."
         },
         "burstcode.context.outlineBaseDepth": {
           "type": "number",

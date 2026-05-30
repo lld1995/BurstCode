@@ -289,6 +289,28 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
         'targetFile',
         'uri'
       ]);
+      // Flattened-single-edit fallback: the model FREQUENTLY emits a single
+      // edit's fields at the TOP LEVEL with no wrapping array at all —
+      // {summary, path, oldText, newText} — instead of the canonical
+      // {summary, edits: [{...}]}. When we ended up with zero edits but the
+      // top-level args themselves carry a usable edit (a path plus newText or
+      // oldText), synthesize a one-element edits array from them. This turns
+      // the most common first-call failure into a transparent success.
+      let synthesizedFromTopLevel = false;
+      if (rawEdits.length === 0 && topLevelPath) {
+        const topNewText = pickFirstString(argsRecord, ['newText', 'new_text', 'replacement', 'code', 'content', 'text']);
+        const topOldText = pickFirstString(argsRecord, ['oldText', 'old_text', 'original', 'search']);
+        if (topNewText || topOldText) {
+          rawEdits = [{
+            [topLevelPath.key]: topLevelPath.value,
+            ...(topNewText ? { [topNewText.key]: topNewText.value } : {}),
+            ...(topOldText ? { [topOldText.key]: topOldText.value } : {}),
+            ...(argsRecord.startLine !== undefined ? { startLine: argsRecord.startLine } : {}),
+            ...(argsRecord.endLine !== undefined ? { endLine: argsRecord.endLine } : {})
+          }];
+          synthesizedFromTopLevel = true;
+        }
+      }
       const grouped = new Map<string, ProposedEditFile>();
       const skipReasons: string[] = [];
       let aliasedPathKey: string | undefined;
@@ -377,6 +399,11 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
         };
       }
       const aliasNotes: string[] = [];
+      if (synthesizedFromTopLevel) {
+        aliasNotes.push(
+          "edit fields (path/newText/oldText) were sent at the TOP LEVEL with no 'edits' array; wrapped them into edits:[{...}] for you"
+        );
+      }
       if (usedAlias) {
         aliasNotes.push(`top-level field 'edits' was sent as '${usedAlias}'`);
       }
