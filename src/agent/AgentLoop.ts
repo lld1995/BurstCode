@@ -966,13 +966,16 @@ export class AgentLoop {
         });
       }
 
-      // Emit tool-call-start events in original order so the chat panel
-      // renders a stable left-to-right tree, even when we run them in
-      // parallel below. Tools already pre-announced during streaming get an
-      // update (args now resolved) instead of a fresh insert.
-      for (const c of prepared) {
-        yield { type: 'tool-call-start', payload: { name: c.name, args: c.parsed, id: c.callId, update: preAnnounced.has(c.index) } };
-      }
+      // Helper to emit a single tool-call-start event lazily (when the tool
+      // actually begins executing, not all at once upfront). This way the UI
+      // correctly reflects serialization: unsafe tools show as "running" only
+      // after prior parallel-safe batches have completed.
+      const emitStart = (c: PreparedCall) => {
+        // Avoid double-emitting for tools already pre-announced during streaming.
+        if (preAnnounced.has(c.index)) return;
+        preAnnounced.add(c.index);
+        return { type: 'tool-call-start' as const, payload: { name: c.name, args: c.parsed, id: c.callId, update: false } };
+      };
 
       const executeOne = async (c: PreparedCall): Promise<ToolResult> => {
         if (!c.tool) {
@@ -1044,6 +1047,9 @@ export class AgentLoop {
         if (cancellation.isCancellationRequested) break;
         if (isUnsafe(prepared[cursor])) {
           const c = prepared[cursor];
+          // Emit start lazily — only now that this tool is actually beginning.
+          const se = emitStart(c);
+          if (se) yield se;
           // Run the unsafe tool and drain its progress events in real-time.
           // Uses the same resolveWaiter mechanism as the parallel-safe batch
           // loop below: emitProgress() calls wake the drain loop immediately
@@ -1098,6 +1104,9 @@ export class AgentLoop {
         let batchSettled = false;
         for (let bi = 0; bi < batchSize; bi++) {
           const absIdx = batchStart + bi;
+          // Emit start lazily for each tool in the parallel batch.
+          const se = emitStart(prepared[absIdx]);
+          if (se) yield se;
           executeOne(prepared[absIdx]).then((res) => {
             // After batch timeout, batchSettled=true: discard the late result
             // rather than overwriting the sentinel and confusing callers.
