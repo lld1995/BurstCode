@@ -201,6 +201,27 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
       }
     },
     async execute(args): Promise<ToolResult> {
+      // Compression-artifact guard: the Compressor replaces the arguments of
+      // OLD historical tool_calls with an elided marker to save tokens. If the
+      // model imitates that shape on a fresh call (e.g. emits `{_truncated: ..}`
+      // or only the elided marker key as its entire args), give a targeted
+      // error instead of the generic schema message — otherwise the model
+      // keeps copying the artifact and loops. See Compressor truncation logic.
+      const argKeys = Object.keys((args ?? {}) as Record<string, unknown>);
+      const looksLikeElidedArtifact =
+        argKeys.length > 0 &&
+        argKeys.every((k) => k === '_truncated' || k === '_elided' || k === '_omitted');
+      if (looksLikeElidedArtifact) {
+        return {
+          content:
+            'no edits provided: the arguments only contain a compression placeholder ' +
+            `key ([${argKeys.join(', ')}]). That marker is an artifact of an OLD ` +
+            'truncated tool call in the history — it is NOT a valid argument shape. ' +
+            'Re-emit propose_edit with the real {summary, edits: [{path, newText, oldText?}]} ' +
+            'payload containing the actual code you want to change.',
+          isError: true
+        };
+      }
       const summary = String(args.summary ?? '');
       // Accept a few common alias keys (`hunks`, `changes`, `files`) for
       // `edits` — the model occasionally picks one of these on the first

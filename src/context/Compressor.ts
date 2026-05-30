@@ -112,8 +112,15 @@ export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig)
         const trimmed = am.tool_calls.map((tc) => {
           const argStr = typeof tc.function.arguments === 'string' ? tc.function.arguments : '';
           if (argStr.length <= argsCap) return tc;
-          // Keep arguments as valid JSON to satisfy strict server validators.
-          const placeholder = JSON.stringify({ _truncated: `${argStr.length} chars` });
+          // Keep arguments as valid JSON to satisfy strict server validators,
+          // but use an explicit "_elided" marker (NOT a plausible field like a
+          // truncated value) so the model never mistakes this historical
+          // placeholder for an imitable argument shape. Imitation of the old
+          // `{_truncated: "N chars"}` placeholder was causing the very next
+          // propose_edit to emit `{_truncated: ...}` as its real args and fail.
+          const placeholder = JSON.stringify({
+            _elided: `[${tc.function.name || 'tool'} args elided by history compaction \u2014 ${argStr.length} chars. This is a PAST call's record, not a template. Re-issue real arguments if calling again.]`
+          });
           return { ...tc, function: { ...tc.function, arguments: placeholder } };
         });
         const anyChanged = trimmed.some((tc, idx) => tc !== am.tool_calls![idx]);
