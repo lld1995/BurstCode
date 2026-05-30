@@ -272,7 +272,7 @@ export const grepSearchTool: Tool = {
         : root;
       if (glob && !isLiteralPath) cliArgs.push('-g', glob);
       cliArgs.push('--', query, searchTarget);
-      const proc = cp.spawn(rgPath, cliArgs);
+      const proc = cp.spawn(rgPath, cliArgs, { cwd: root });
       let stdout = '';
       let stderr = '';
       let killedByInternalTimeout = false;
