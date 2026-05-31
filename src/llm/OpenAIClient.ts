@@ -397,6 +397,16 @@ class ThinkSplitter {
  * request always validates while preserving any captured chain-of-thought.
  */
 function normalizeReasoningContent(messages: ChatMessage[]): ChatMessage[] {
+  // Only backfill reasoning_content when the session has actually engaged
+  // thinking mode at least once. Unconditionally adding the field to every
+  // assistant message can trigger "failed to marshal request body to JSON"
+  // errors in Go-based API proxies that don't expect the extra field.
+  const hasThinking = messages.some((m) => {
+    if (m.role !== 'assistant') return false;
+    const rc = (m as unknown as Record<string, unknown>).reasoning_content;
+    return typeof rc === 'string' && rc.length > 0;
+  });
+  if (!hasThinking) return messages;
   return messages.map((m) => {
     if (m.role !== 'assistant') return m;
     const am = m as ChatMessage & { reasoning_content?: unknown };

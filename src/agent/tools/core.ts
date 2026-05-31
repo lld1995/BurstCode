@@ -416,11 +416,11 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
           'and paths to outline — all sub-operations execute concurrently. ' +
           'Use this as the FIRST move on any non-trivial question instead of issuing ' +
           'read_file / grep_search one at a time across multiple turns. ' +
-          'IMPORTANT: You MUST provide at least one entry across reads / greps / lists / outlines. Empty calls will fail — if you have nothing to collect, do not call this tool.',
+          'IMPORTANT: You MUST provide at least one entry across files / searches / dirs / trees. Empty calls will fail — if you have nothing to collect, do not call this tool.',
         parameters: {
           type: 'object',
           properties: {
-            reads: {
+            files: {
               type: 'array',
               description: `Up to ${CC_MAX_READS} file regions to read. Same args as read_file.`,
               items: {
@@ -433,7 +433,7 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
                 required: ['path']
               }
             },
-            greps: {
+            searches: {
               type: 'array',
               description: `Up to ${CC_MAX_GREPS} ripgrep searches. Same args as grep_search.`,
               items: {
@@ -447,7 +447,7 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
                 required: ['query']
               }
             },
-            lists: {
+            dirs: {
               type: 'array',
               description: `Up to ${CC_MAX_LISTS} directory listings. Same args as list_dir.`,
               items: {
@@ -457,7 +457,7 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
                 }
               }
             },
-            outlines: {
+            trees: {
               type: 'array',
               description: `Up to ${CC_MAX_OUTLINES} workspace outlines. Same args as workspace_outline.`,
               items: {
@@ -478,10 +478,10 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
       type TaskSpec = { label: string; promise: Promise<ToolResult> };
       const tasks: TaskSpec[] = [];
 
-      const reads = Array.isArray(args.reads) ? (args.reads as Record<string, unknown>[]).slice(0, CC_MAX_READS) : [];
-      const greps = Array.isArray(args.greps) ? (args.greps as Record<string, unknown>[]).slice(0, CC_MAX_GREPS) : [];
-      const lists = Array.isArray(args.lists) ? (args.lists as Record<string, unknown>[]).slice(0, CC_MAX_LISTS) : [];
-      const outlines = Array.isArray(args.outlines) ? (args.outlines as Record<string, unknown>[]).slice(0, CC_MAX_OUTLINES) : [];
+      const reads = Array.isArray(args.files) ? (args.files as Record<string, unknown>[]).slice(0, CC_MAX_READS) : [];
+      const greps = Array.isArray(args.searches) ? (args.searches as Record<string, unknown>[]).slice(0, CC_MAX_GREPS) : [];
+      const lists = Array.isArray(args.dirs) ? (args.dirs as Record<string, unknown>[]).slice(0, CC_MAX_LISTS) : [];
+      const outlines = Array.isArray(args.trees) ? (args.trees as Record<string, unknown>[]).slice(0, CC_MAX_OUTLINES) : [];
 
       for (const r of reads) {
         const label = `read_file ${String(r.path)}${r.startLine != null ? `:${r.startLine}` : ''}${r.endLine != null ? `-${r.endLine}` : ''}`;
@@ -502,7 +502,7 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
 
       if (tasks.length === 0) {
         return {
-          content: 'collect_context: nothing to collect — you called collect_context with empty reads/greps/lists/outlines parameters. These are PARAMETERS of collect_context, NOT separate tools. Retry with at least one entry, e.g. collect_context({"greps": [{"query": "your search", "glob": "**/*.cs"}]}) or collect_context({"reads": [{"path": "src/file.ts"}]}). If you genuinely have nothing to collect, stop calling this tool.',
+          content: 'collect_context: nothing to collect — you called collect_context with empty files/searches/dirs/trees parameters. These are PARAMETERS of collect_context, NOT separate tools. Retry with at least one entry, e.g. collect_context({"searches": [{"query": "your search", "glob": "**/*.cs"}]}) or collect_context({"files": [{"path": "src/file.ts"}]}). If you genuinely have nothing to collect, stop calling this tool.',
           isError: true
         };
       }

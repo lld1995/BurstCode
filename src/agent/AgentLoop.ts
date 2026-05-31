@@ -979,10 +979,12 @@ export class AgentLoop {
 
       const executeOne = async (c: PreparedCall): Promise<ToolResult> => {
         if (!c.tool) {
-          const ccHints: Record<string, string> = { greps: 'grep_search', reads: 'read_file', lists: 'list_dir', outlines: 'workspace_outline' };
+          const ccHints: Record<string, string> = { greps: 'grep_search', reads: 'read_file', lists: 'list_dir', outlines: 'workspace_outline', searches: 'grep_search', files: 'read_file', dirs: 'list_dir', trees: 'workspace_outline' };
+          const ccParamNames: Record<string, string> = { greps: 'searches', reads: 'files', lists: 'dirs', outlines: 'trees', searches: 'searches', files: 'files', dirs: 'dirs', trees: 'trees' };
           const standalone = ccHints[c.name];
+          const paramName = ccParamNames[c.name];
           const hint = standalone
-            ? ` Did you mean to call '${standalone}' directly, or use collect_context with { "${c.name}": [...] }?`
+            ? ` '${c.name}' is a PARAMETER of collect_context, NOT a standalone tool. Call '${standalone}' directly, or use collect_context({ "${paramName}": [...] }).`
             : '';
           return { content: `Unknown tool: ${c.name}.${hint}`, isError: true };
         }
