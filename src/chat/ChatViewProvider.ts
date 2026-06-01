@@ -893,14 +893,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       vscode.window.showWarningMessage('BurstCode: stop the current request before rolling back.');
       return;
     }
-    if (this.applier.getPendingState().hunks > 0) {
+    // Only the edits created AT or AFTER the turn we're rolling back to get
+    // discarded — the git restore below reverts those files on disk anyway, so
+    // keeping them in the banner would point at content that no longer exists.
+    // Pending edits from EARLIER turns are left untouched: the user may still
+    // be reviewing them and the restore-to-this-checkpoint preserves their
+    // on-disk state.
+    const pendingFromHere = this.applier.pendingHunksFrom(messageIndex);
+    if (pendingFromHere > 0) {
       const choice = await vscode.window.showWarningMessage(
-        'BurstCode: there are still pending edits. Discard them and roll back?',
+        'BurstCode: there are still pending edits from this prompt onward. Discard them and roll back?',
         { modal: true },
         'Discard & Roll Back'
       );
       if (choice !== 'Discard & Roll Back') return;
-      await this.applier.rejectAll();
+      await this.applier.rejectAllFrom(messageIndex);
     }
 
     // Re-verify the ref still resolves before claiming we can restore disk
@@ -1013,6 +1020,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.ensureSystemMessageSlot(session);
     const messageIndex = session.messages.length;
     session.messages.push({ role: 'user', content: userText });
+    // Tag any edits this run queues with the turn that produced them, so a
+    // later rollback to an EARLIER turn only discards this turn's edits and
+    // leaves still-unreviewed edits from previous turns in the banner.
+    this.applier.setCurrentTurn(messageIndex);
 
     // Kick off the two slow setup tasks in PARALLEL: creating a git
     // checkpoint (spawns `git`, can be hundreds of ms on big repos) and

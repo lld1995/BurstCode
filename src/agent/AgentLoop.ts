@@ -5,7 +5,7 @@ import { FALLBACK_SYSTEM_PROMPT } from './prompts';
 import { compressMessages, defaultCompressorConfig, normalizeToolResult, pruneOrphanedToolResults } from '../context/Compressor';
 import { estimateMessagesTokens } from '../llm/tokenizer';
 import { Logger } from '../util/Logger';
-import { repairJsonControlChars, repairJsonUnescapedQuotes } from '../util/jsonRepair';
+import { extractFirstJsonObject, repairJsonControlChars, repairJsonUnescapedQuotes } from '../util/jsonRepair';
 import { HunkApplier } from '../edits/HunkApplier';
 import { AskUserFn } from './tools/edits';
 
@@ -948,6 +948,23 @@ export class AgentLoop {
                 }
               } else {
                 parseError = err2 instanceof Error ? err2.message : String(err2);
+              }
+              // Final fallback: the model sometimes concatenates TWO tool-call
+              // argument objects into one string ("{...}{...}"), which trips
+              // JSON.parse with "Unexpected non-whitespace character after JSON".
+              // Honor the FIRST complete object so the call still runs and the
+              // conversation isn't dead-ended on a parse error it keeps repeating.
+              if (parseError) {
+                const firstObj = extractFirstJsonObject(afterControl);
+                if (firstObj !== null) {
+                  try {
+                    parsed = JSON.parse(firstObj);
+                    parseError = undefined;
+                    this.logger.warn(
+                      `Tool args ${tc.name}: recovered first of multiple concatenated JSON objects (trailing content discarded)`
+                    );
+                  } catch { /* keep the original parseError */ }
+                }
               }
             }
             if (parseError) {

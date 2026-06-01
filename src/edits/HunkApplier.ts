@@ -46,6 +46,12 @@ interface PendingFile {
   isNewFile: boolean;
   /** Latest summary string that touched this file, for the chat banner. */
   lastSummary: string;
+  /**
+   * The agent turn (user-message index) that first queued this file. Used by
+   * `rejectAllFrom` so a rollback to turn N only discards edits created at or
+   * after turn N — pending edits from EARLIER, unrelated turns are preserved.
+   */
+  turnIndex: number;
 }
 
 interface DecisionListener {
@@ -129,6 +135,12 @@ export class HunkApplier implements vscode.Disposable {
    */
   private cycleInitPromise: Promise<void> | null = null;
   /**
+   * The agent turn (user-message index) currently being processed. Set by
+   * the chat provider when a run starts so newly-queued pending files can be
+   * tagged with the turn that produced them. Defaults to 0 (pre-run / unknown).
+   */
+  private currentTurnIndex = 0;
+  /**
    * True once the diff editor for the first newly-queued file in the current
    * cycle has been opened. Reset together with `cycleInitPromise`.
    */
@@ -180,6 +192,31 @@ export class HunkApplier implements vscode.Disposable {
       return a.path.localeCompare(b.path);
     });
     return { files, hunks, fileList, latestSummary: this.latestSummary };
+  }
+
+  /**
+   * Record which agent turn (user-message index) is now being processed so
+   * pending files queued from here on are tagged with it. Called by the chat
+   * provider when a run starts. Enables turn-scoped rollback discards.
+   */
+  setCurrentTurn(messageIndex: number): void {
+    if (Number.isFinite(messageIndex) && messageIndex >= 0) {
+      this.currentTurnIndex = messageIndex;
+    }
+  }
+
+  /**
+   * Count pending hunks that belong to turn `minTurnIndex` or later. A
+   * rollback to turn N uses this to decide whether it actually needs to
+   * discard anything — pending edits from earlier turns are left untouched.
+   */
+  pendingHunksFrom(minTurnIndex: number): number {
+    let n = 0;
+    for (const f of this.pending.values()) {
+      if (f.turnIndex < minTurnIndex) continue;
+      n += f.hunks.filter((h) => h.status === 'pending').length;
+    }
+    return n;
   }
 
   /**
@@ -637,7 +674,8 @@ export class HunkApplier implements vscode.Disposable {
         hunks: [],
         eol: loaded.eol,
         isNewFile: loaded.isNewFile,
-        lastSummary: summary
+        lastSummary: summary,
+        turnIndex: this.currentTurnIndex
       };
       this.pending.set(key, entry);
       newlyQueued = uri;
@@ -904,6 +942,37 @@ export class HunkApplier implements vscode.Disposable {
         this.withFileLock(file.uri.toString(), async () => {
           if (!this.pending.has(file.uri.toString())) return;
           for (const h of file.hunks) if (h.status === 'pending') h.status = 'rejected';
+          await this.syncDiskToModified(file);
+          await this.flushFileIfDone(file);
+        })
+      )
+    );
+    this.emitDecision();
+  }
+
+  /**
+   * Reject only the pending hunks belonging to turn `minTurnIndex` or later,
+   * leaving pending edits from earlier (unrelated) turns intact. Used by
+   * rollback: rolling back to turn N must NOT throw away edits the user is
+   * still reviewing from turns before N. Brand-new files queued at/after the
+   * boundary with no surviving hunks are removed from disk.
+   */
+  async rejectAllFrom(minTurnIndex: number): Promise<void> {
+    const snapshot = Array.from(this.pending.values()).filter(
+      (f) => f.turnIndex >= minTurnIndex
+    );
+    await Promise.all(
+      snapshot.map((file) =>
+        this.withFileLock(file.uri.toString(), async () => {
+          if (!this.pending.has(file.uri.toString())) return;
+          let changed = false;
+          for (const h of file.hunks) {
+            if (h.status === 'pending') {
+              h.status = 'rejected';
+              changed = true;
+            }
+          }
+          if (!changed) return;
           await this.syncDiskToModified(file);
           await this.flushFileIfDone(file);
         })

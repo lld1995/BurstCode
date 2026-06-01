@@ -104,3 +104,58 @@ export function repairJsonControlChars(input: string): string | null {
   }
   return changed ? out : null;
 }
+
+/**
+ * Third-pass repair for the "concatenated tool-call arguments" bug: some
+ * models emit TWO (or more) JSON objects back-to-back into a SINGLE tool
+ * call's `arguments` string, e.g.
+ *
+ *     {"query":"a","glob":"x"}{"query":"b","glob":"y","maxResults":5}
+ *
+ * `JSON.parse` rejects this with "Unexpected non-whitespace character after
+ * JSON at position N". This scanner walks the input tracking brace/bracket
+ * depth (while respecting string literals + escapes) and returns the FIRST
+ * complete top-level JSON object/array. Trailing content after it is dropped
+ * — it belonged to a second call the model failed to split out, and the best
+ * recovery is to honor the first object so the conversation can continue.
+ *
+ * Returns the extracted first-object substring when the input contained a
+ * complete leading object/array FOLLOWED by extra non-whitespace, or `null`
+ * when there is nothing extra to strip (so callers fall through to the
+ * original parse error).
+ */
+export function extractFirstJsonObject(input: string): string | null {
+  let i = 0;
+  // Skip leading whitespace.
+  while (i < input.length && /\s/.test(input[i])) i++;
+  const startCh = input[i];
+  if (startCh !== '{' && startCh !== '[') return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let endExclusive = -1;
+  for (let j = i; j < input.length; j++) {
+    const ch = input[j];
+    if (escape) { escape = false; continue; }
+    if (inString) {
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{' || ch === '[') depth++;
+    else if (ch === '}' || ch === ']') {
+      depth--;
+      if (depth === 0) { endExclusive = j + 1; break; }
+    }
+  }
+  if (endExclusive < 0) return null; // never closed — truncated, not concatenated.
+
+  // Is there any non-whitespace AFTER the first complete object?
+  let k = endExclusive;
+  while (k < input.length && /\s/.test(input[k])) k++;
+  if (k >= input.length) return null; // nothing trailing — input was already a single object.
+
+  return input.slice(i, endExclusive);
+}
