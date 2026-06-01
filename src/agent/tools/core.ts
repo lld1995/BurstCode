@@ -420,13 +420,14 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
           'and paths to outline — all sub-operations execute concurrently. ' +
           'Use this as the FIRST move on any non-trivial question instead of issuing ' +
           'read_file / grep_search one at a time across multiple turns. ' +
-          'IMPORTANT: You MUST provide at least one entry across files / searches / dirs / trees. Empty calls will fail — if you have nothing to collect, do not call this tool.',
+          'IMPORTANT: You MUST provide at least one entry across files / searches / dirs / trees. Empty calls will fail — if you have nothing to collect, do not call this tool. ' +
+          'Each of files / searches / dirs / trees MUST be a JSON array, even when you only have a single entry (wrap that one object in an array).',
         parameters: {
           type: 'object',
           properties: {
             files: {
               type: 'array',
-              description: `Up to ${CC_MAX_READS} file regions to read. Same args as read_file.`,
+              description: `Up to ${CC_MAX_READS} file regions to read. Same args as read_file. MUST be a JSON array, even for a single entry.`,
               items: {
                 type: 'object',
                 properties: {
@@ -439,7 +440,7 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
             },
             searches: {
               type: 'array',
-              description: `Up to ${CC_MAX_GREPS} ripgrep searches. Same args as grep_search.`,
+              description: `Up to ${CC_MAX_GREPS} ripgrep searches. Same args as grep_search. MUST be a JSON array, even for a single entry.`,
               items: {
                 type: 'object',
                 properties: {
@@ -453,7 +454,7 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
             },
             dirs: {
               type: 'array',
-              description: `Up to ${CC_MAX_LISTS} directory listings. Same args as list_dir.`,
+              description: `Up to ${CC_MAX_LISTS} directory listings. Same args as list_dir. MUST be a JSON array, even for a single entry.`,
               items: {
                 type: 'object',
                 properties: {
@@ -463,7 +464,7 @@ export function buildCollectContextTool(applier?: HunkApplier): Tool {
             },
             trees: {
               type: 'array',
-              description: `Up to ${CC_MAX_OUTLINES} workspace outlines. Same args as workspace_outline.`,
+              description: `Up to ${CC_MAX_OUTLINES} workspace outlines. Same args as workspace_outline. MUST be a JSON array, even for a single entry.`,
               items: {
                 type: 'object',
                 properties: {

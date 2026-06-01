@@ -94,6 +94,16 @@ interface SessionLive {
   iter: number;
   assistantText: string;
   reasoningText: string;
+  /**
+   * Assistant text segments already finalized (via `assistant-message`)
+   * WITHIN the current iteration but BEFORE the current `assistantText`
+   * stream. The agent loop emits one such finalized segment every time it
+   * auto-continues after a `finish_reason=length` truncation. Without
+   * retaining them here, a user who switches away and back mid-run loses
+   * every segment except the last one still streaming — the live snapshot
+   * used to drop them by resetting `assistantText` to ''.
+   */
+  finalizedAssistantTexts: string[];
   runningTools: Map<string, RunningToolSnap>;
   toolProgress: Map<string, string[]>;
   pills: PillSnap[];
@@ -106,6 +116,7 @@ function emptyLive(): SessionLive {
     iter: 0,
     assistantText: '',
     reasoningText: '',
+    finalizedAssistantTexts: [],
     runningTools: new Map(),
     toolProgress: new Map(),
     pills: []
@@ -482,6 +493,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       iter: live.iter,
       assistantText: live.assistantText,
       reasoningText: live.reasoningText,
+      finalizedAssistantTexts: live.finalizedAssistantTexts,
       runningTools,
       pills: live.pills,
       lastStatus: live.lastStatus,
@@ -1284,10 +1296,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'reasoning-delta':
         live.reasoningText += String(event.payload ?? '');
         break;
-      case 'assistant-message':
+      case 'assistant-message': {
+        // Preserve the just-finalized segment so a mid-run replay can rebuild
+        // it. The agent loop emits this right before auto-continuing after a
+        // finish_reason=length truncation; resetting assistantText to '' (as
+        // before) silently discarded every segment but the last.
+        const finalText = String((event.payload as { text?: unknown } | undefined)?.text ?? '');
+        if (finalText.trim().length > 0) {
+          live.finalizedAssistantTexts.push(finalText);
+        }
         live.assistantText = '';
         live.reasoningText = '';
         break;
+      }
       case 'tool-call-start': {
         const p = (event.payload ?? {}) as { id?: string; name?: string; args?: unknown; streaming?: boolean };
         const id = String(p.id ?? `${p.name}_${Date.now()}`);
@@ -1327,6 +1348,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         live.pills.push({ kind: 'iteration', payload: { iter: iter - 1 } });
         live.assistantText = '';
         live.reasoningText = '';
+        // A new iteration's finalized segments are already committed to the
+        // persistent transcript (session.messages), so the per-iteration
+        // buffer can reset to avoid double-rendering on replay.
+        live.finalizedAssistantTexts = [];
         live.lastStatus = { state: 'busy', label: `Thinking (iter ${iter})...` };
         break;
       }
@@ -2944,6 +2969,13 @@ function replayLiveState(snap) {
   // In-flight reasoning bubble.
   if (snap.reasoningText) {
     activeReasoningEl = addReasoningMsg(snap.reasoningText, { open: true, streaming: true });
+  }
+  // Assistant segments finalized earlier in THIS iteration (e.g. each part
+  // before a finish_reason=length auto-continue). Render them as completed
+  // bubbles so none are lost — only the last segment is still streaming.
+  const finalized = Array.isArray(snap.finalizedAssistantTexts) ? snap.finalizedAssistantTexts : [];
+  for (const t of finalized) {
+    if (t && t.trim().length > 0) addAssistantMsg(t);
   }
   // In-flight assistant bubble.
   if (snap.assistantText) {
