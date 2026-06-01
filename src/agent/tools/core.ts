@@ -46,7 +46,8 @@ export function buildReadFileTool(applier?: HunkApplier): Tool {
           properties: {
             path: { type: 'string', description: 'Path relative to workspace or absolute.' },
             startLine: { type: 'number', description: '1-indexed start line (inclusive). Defaults to 1.' },
-            endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200.' }
+            endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200.' },
+            full: { type: 'boolean', description: 'When true, read the ENTIRE file from startLine to the last line, ignoring the default 200-line window. Use sparingly — large files flood the shared context window. Default false.' }
           },
           required: ['path']
         }
@@ -84,7 +85,10 @@ export function buildReadFileTool(applier?: HunkApplier): Tool {
       }
       const total = rawLines.length;
       const start = Math.max(1, Number(args.startLine) || 1);
-      const end = Math.min(total, Number(args.endLine) || Math.min(total, start + 199));
+      const full = args.full === true || args.full === 'true';
+      const end = full
+        ? total
+        : Math.min(total, Number(args.endLine) || Math.min(total, start + 199));
       const lines: string[] = [];
       for (let i = start - 1; i < end; i++) {
         lines.push(`${(i + 1).toString().padStart(5)}\t${rawLines[i] ?? ''}`);
