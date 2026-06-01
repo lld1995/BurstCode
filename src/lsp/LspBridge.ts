@@ -56,12 +56,20 @@ export class LspBridge {
     }));
   }
 
-  async workspaceSymbols(query: string): Promise<vscode.SymbolInformation[]> {
-    const result = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
-      'vscode.executeWorkspaceSymbolProvider',
-      query
-    );
-    return result ?? [];
+  async workspaceSymbols(query: string, retries: number = 3): Promise<vscode.SymbolInformation[]> {
+    // Workspace-symbol providers (notably TS) often return empty on the first
+    // query while still indexing — retry a few times with a short backoff
+    // before giving up, so callers don't see a spurious "no symbols" result.
+    for (let attempt = 0; ; attempt++) {
+      const result = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+        'vscode.executeWorkspaceSymbolProvider',
+        query
+      );
+      if ((result && result.length > 0) || attempt >= retries) {
+        return result ?? [];
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
   }
 
   async hover(uri: vscode.Uri, position: vscode.Position): Promise<vscode.Hover[]> {

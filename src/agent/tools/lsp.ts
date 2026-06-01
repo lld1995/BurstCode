@@ -332,10 +332,17 @@ export function buildLspTools(bridge: LspBridge, guard: DependencyGuard): Tool[]
       const max = Math.min(Number(args.maxResults) || 50, 200);
       const includeSnippets = args.includeSnippets !== false;
 
-      const candidates = await bridge.workspaceSymbols(name);
+      let candidates = await bridge.workspaceSymbols(name);
+      // Fallback: some providers miss exact-name queries but match a shorter
+      // prefix. Retry with the leading portion of the name before giving up.
+      if (candidates.length === 0 && name.length > 4) {
+        const prefixQuery = name.slice(0, Math.max(4, Math.ceil(name.length / 2)));
+        const byPrefix = await bridge.workspaceSymbols(prefixQuery);
+        candidates = byPrefix.filter((s) => s.name.includes(name) || name.includes(s.name));
+      }
       if (candidates.length === 0) {
         return {
-          content: `# no workspace symbols matched "${name}"\nThe language server may still be indexing, or the symbol name is wrong. Try a partial name, or fall back to grep_search.`,
+          content: `# no workspace symbols matched "${name}"\nThe language server may still be indexing, or the symbol name is wrong. Note: workspace symbols only cover top-level/exported declarations — local variables and parameters won't appear here. Try a partial name, or fall back to grep_search.`,
           isError: true
         };
       }
