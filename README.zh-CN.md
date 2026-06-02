@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="media/readme/hero.svg" alt="BurstCode" width="100%" />
+<img src="media/readme/hero.svg" alt="BurstCode" width="120" height="120" />
 
 # BurstCode
 

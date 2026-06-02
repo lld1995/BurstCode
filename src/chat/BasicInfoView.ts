@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { readChatProfile, readBackgroundProfile } from '../llm/OpenAIClient';
 import type { ExplorerStatus } from '../background/BackgroundExplorer';
+import { t } from '../util/i18n';
 
 type NodeKind = 'group' | 'leaf';
 
@@ -35,22 +36,22 @@ class BasicNode extends vscode.TreeItem {
 }
 
 function formatPhase(phase: string, enabled: boolean): string {
-  if (!enabled) return 'off';
+  if (!enabled) return t('phase.off');
   switch (phase) {
-    case 'idle-waiting': return 'idle';
-    case 'running': return 'running…';
-    case 'paused-by-chat': return 'paused (chat)';
-    case 'paused-by-activity': return 'paused';
-    case 'no-workspace': return 'no folder';
-    case 'disabled': return 'off';
-    case 'error': return 'error';
+    case 'idle-waiting': return t('phase.idle');
+    case 'running': return t('phase.running');
+    case 'paused-by-chat': return t('phase.pausedChat');
+    case 'paused-by-activity': return t('phase.pausedActivity');
+    case 'no-workspace': return t('phase.noWorkspace');
+    case 'disabled': return t('phase.off');
+    case 'error': return t('phase.error');
     default: return phase;
   }
 }
 
 function permissionsSummary(shellEnabled: boolean, shellAuto: boolean): string {
-  if (!shellEnabled) return 'shell off';
-  return shellAuto ? 'shell + auto-approve' : 'shell on';
+  if (!shellEnabled) return t('perm.shellOff');
+  return shellAuto ? t('perm.shellAuto') : t('perm.shellOn');
 }
 
 export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode.Disposable {
@@ -66,7 +67,8 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
       if (
         e.affectsConfiguration('burstcode.llm') ||
         e.affectsConfiguration('burstcode.background') ||
-        e.affectsConfiguration('burstcode.shell')
+        e.affectsConfiguration('burstcode.shell') ||
+        e.affectsConfiguration('burstcode.ui')
       ) {
         this.refresh();
       }
@@ -115,33 +117,33 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
       : bgProfile.model || bgProfile.models[0] || 'inherit chat';
 
     // ---------- Models ----------
-    const modelsGroup = new BasicNode('group', 'Models', {
-      description: chatPair || 'not configured',
+    const modelsGroup = new BasicNode('group', t('models.group'), {
+      description: chatPair || t('models.notConfigured'),
       icon: 'server-process',
       expanded: true
     });
     modelsGroup.children = [
-      new BasicNode('leaf', 'Chat', {
-        description: chatPair || 'pick one',
+      new BasicNode('leaf', t('models.chat'), {
+        description: chatPair || t('models.chat.pickOne'),
         icon: chatModel ? 'comment-discussion' : 'warning',
         tooltip: chatModel
-          ? `Chat model: ${chatPair}\nbaseURL: ${chatProfile.baseURL || '(unset)'}\nClick to switch.`
-          : 'No active chat model — click to pick one.',
+          ? t('models.chat.tooltip', chatPair, chatProfile.baseURL || '(unset)')
+          : t('models.chat.tooltipEmpty'),
         command: { command: 'burstcode.selectModel', title: 'Select Chat Model' }
       }),
-      new BasicNode('leaf', 'Background', {
+      new BasicNode('leaf', t('models.background'), {
         description: bgPair,
         icon: bgProfile.inherit ? 'arrow-swap' : 'circuit-board',
         tooltip: bgProfile.inherit
-          ? 'Background loop inherits the chat profile.\nClick to override.'
-          : `Background model: ${bgPair}\nClick to change or inherit chat.`,
+          ? t('models.background.tooltipInherit')
+          : t('models.background.tooltip', bgPair),
         command: {
           command: 'burstcode.background.selectModel',
           title: 'Select Background Model'
         }
       }),
-      new BasicNode('leaf', 'Chat profile settings…', {
-        description: 'baseURL / apiKey / model',
+      new BasicNode('leaf', t('models.chatProfile'), {
+        description: t('models.chatProfile.desc'),
         icon: 'globe',
         command: {
           command: 'workbench.action.openSettings',
@@ -149,8 +151,8 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
           arguments: ['burstcode.llm.chat']
         }
       }),
-      new BasicNode('leaf', 'Background profile settings…', {
-        description: 'inherit / baseURL / apiKey / model',
+      new BasicNode('leaf', t('models.bgProfile'), {
+        description: t('models.bgProfile.desc'),
         icon: 'globe',
         command: {
           command: 'workbench.action.openSettings',
@@ -161,61 +163,61 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     ];
 
     // ---------- Permissions ----------
-    const permissions = new BasicNode('group', 'Permissions', {
+    const permissions = new BasicNode('group', t('perm.group'), {
       description: permissionsSummary(shellEnabled, shellAuto),
       icon: 'shield',
       expanded: true
     });
     permissions.children = [
       this.toggleNode(
-        'Shell commands',
+        t('perm.shellCommands'),
         shellEnabled,
         'burstcode.shell.enabled',
-        'Allow the agent to run shell commands via the run_shell tool.',
+        t('perm.shellCommands.tip'),
         'terminal'
       ),
       this.toggleNode(
-        'Auto-approve shell',
+        t('perm.autoApprove'),
         shellAuto,
         'burstcode.shell.autoApprove',
-        'Skip the per-command approval prompt. Leave OFF unless you trust the model fully.',
+        t('perm.autoApprove.tip'),
         shellAuto ? 'unlock' : 'lock'
       )
     ];
 
     // ---------- Background Explorer (behaviour only — no model here) ----------
-    const bgGroup = new BasicNode('group', 'Background Explorer', {
+    const bgGroup = new BasicNode('group', t('bg.group'), {
       description: phaseLabel,
-      tooltip: status?.detail || 'Idle-time codebase analyser',
+      tooltip: status?.detail || t('bg.idleAnalyser'),
       icon: 'pulse',
       expanded: bgEnabled
     });
     bgGroup.children = [
       this.toggleNode(
-        bgEnabled ? 'Enabled' : 'Disabled',
+        bgEnabled ? t('bg.enabled') : t('bg.disabled'),
         bgEnabled,
         'burstcode.background.enabled',
-        'Idle-time codebase analyser. Runs while you are not editing.',
+        t('bg.enabled.tip'),
         bgEnabled ? 'play-circle' : 'stop-circle'
       ),
       this.toggleNode(
-        'Auto-run generated tests',
+        t('bg.autoRunTests'),
         bgRunTests,
         'burstcode.background.runGeneratedTests',
-        'Run vitest/jest/pytest on the unit tests the explorer generates.',
+        t('bg.autoRunTests.tip'),
         bgRunTests ? 'beaker' : 'circle-slash'
       ),
-      new BasicNode('leaf', `Output folder: ${bgOutputDir}`, {
+      new BasicNode('leaf', t('bg.outputFolder', bgOutputDir), {
         icon: 'folder',
-        tooltip: 'Workspace-relative directory used for docs/, bugs.md, tests/, state.json',
+        tooltip: t('bg.outputFolder.tip'),
         command: {
           command: 'workbench.action.openSettings',
           title: 'Configure Output Directory',
           arguments: ['burstcode.background.outputDir']
         }
       }),
-      new BasicNode('leaf', 'Schedule…', {
-        description: 'idle / interval / files per cycle',
+      new BasicNode('leaf', t('bg.schedule'), {
+        description: t('bg.schedule.desc'),
         icon: 'clock',
         command: {
           command: 'workbench.action.openSettings',
@@ -226,33 +228,33 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     ];
 
     // ---------- Actions ----------
-    const actions = new BasicNode('group', 'Actions', { icon: 'rocket' });
+    const actions = new BasicNode('group', t('actions.group'), { icon: 'rocket' });
     actions.children = [
-      new BasicNode('leaf', 'Open chat', {
+      new BasicNode('leaf', t('actions.openChat'), {
         icon: 'comment-discussion',
         command: { command: 'burstcode.openChat', title: 'Open Chat' }
       }),
-      new BasicNode('leaf', 'New chat', {
+      new BasicNode('leaf', t('actions.newChat'), {
         icon: 'add',
         command: { command: 'burstcode.newChat', title: 'New Chat' }
       }),
-      new BasicNode('leaf', 'Run background analysis now', {
+      new BasicNode('leaf', t('actions.runNow'), {
         icon: 'play',
         command: { command: 'burstcode.background.runOnce', title: 'Run Once' }
       }),
-      new BasicNode('leaf', 'Show background activity log', {
+      new BasicNode('leaf', t('actions.showLog'), {
         icon: 'output',
         command: { command: 'burstcode.background.showActivityLog', title: 'Show Log' }
       }),
-      new BasicNode('leaf', 'Restore Git checkpoint…', {
+      new BasicNode('leaf', t('actions.restoreCheckpoint'), {
         icon: 'history',
         command: { command: 'burstcode.restoreCheckpoint', title: 'Restore Checkpoint' }
       })
     ];
 
     // ---------- Footer ----------
-    const advanced = new BasicNode('leaf', 'All settings…', {
-      description: 'Full BurstCode configuration',
+    const advanced = new BasicNode('leaf', t('footer.allSettings'), {
+      description: t('footer.allSettings.desc'),
       icon: 'settings-gear',
       command: {
         command: 'workbench.action.openSettings',
@@ -261,7 +263,7 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
       }
     });
     const about = new BasicNode('leaf', `BurstCode v${version}`, {
-      description: 'About',
+      description: t('footer.about'),
       icon: 'info'
     });
 
@@ -276,9 +278,9 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     icon: string
   ): BasicNode {
     return new BasicNode('leaf', label, {
-      description: value ? 'on' : 'off',
+      description: value ? t('state.on') : t('state.off'),
       icon,
-      tooltip: `${description}\nClick to toggle (${key}).`,
+      tooltip: t('toggle.tip', description, key),
       command: {
         command: 'burstcode.toggleSetting',
         title: `Toggle ${key}`,

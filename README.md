@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="media/readme/hero.svg" alt="BurstCode" width="100%" />
+<img src="media/readme/hero.svg" alt="BurstCode" width="120" height="120" />
 
 # BurstCode
 
@@ -10,7 +10,7 @@ Chat with your codebase, let the agent read, search, edit, build and test across
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![VS Code ^1.106](https://img.shields.io/badge/VS%20Code-%5E1.106-007ACC.svg) ![Local LLM](https://img.shields.io/badge/LLM-local%20%2F%20OpenAI--compatible-success.svg)
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+**English** · [简体中文](README.zh-CN.md)
 
 </div>
 

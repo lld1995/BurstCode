@@ -3413,8 +3413,18 @@ function tcParsePartialArgs(buf) {
     else if (ch === '}' || ch === ']') stack.pop();
   }
   if (inStr) { if (esc) out += '\\\\'; out += '"'; }
-  // Drop a dangling key-without-value or trailing comma so closing is valid.
-  out = out.replace(/[,:]\\s*$/, '');
+  // Drop a dangling trailing comma so closing is valid.
+  out = out.replace(/,\\s*$/, '');
+  // Drop a dangling key-without-value at the end of an object, e.g. the buffer
+  // stopped at {"summary" or {"summary": — without this the closer produces
+  // {"summary"} which is invalid JSON and we'd fall back to a raw-JSON flash.
+  if (stack[stack.length - 1] === '{') {
+    out = out.replace(/(\\{)\\s*$/, '$1');                       // { with nothing after
+    out = out.replace(/,\\s*"(?:[^"\\\\]|\\\\.)*"\\s*$/, '');       // , "danglingKey"
+    out = out.replace(/(\\{)\\s*"(?:[^"\\\\]|\\\\.)*"\\s*$/, '$1');  // { "danglingKey"
+    out = out.replace(/:\\s*$/, ': null');                       // key: <value not yet streamed>
+    out = out.replace(/,\\s*$/, '');                             // re-trim after the above
+  }
   for (let i = stack.length - 1; i >= 0; i--) {
     out += stack[i] === '{' ? '}' : ']';
   }
@@ -4176,19 +4186,39 @@ window.addEventListener('message', (e) => {
         // the partial args instead of dumping raw JSON tokens at the user.
         const tn = argDet.dataset.toolName || '';
         let rendered = false;
-        if (tn === 'propose_edit' || tn === 'write_file') {
+        const isRichTool = (tn === 'propose_edit' || tn === 'write_file');
+        if (isRichTool) {
           const partial = tcParsePartialArgs(argDet.dataset.argsBuf);
           if (partial) rendered = tcStreamRichPreview(argDet, tn, partial);
         }
         if (!rendered) {
-          let argPre = argDet.querySelector('.tool-args-stream');
-          if (!argPre) {
-            argPre = document.createElement('pre');
-            argPre.className = 'tool-args-stream';
-            argDet.appendChild(argPre);
+          // For propose_edit / write_file, NEVER dump the raw, unclosed JSON
+          // buffer at the user: a single frame whose partial JSON fails to
+          // repair would flash half-open JSON (e.g. {"summary": "…). Instead
+          // keep whatever rich preview / placeholder the previous frame already
+          // rendered. The final, complete render happens on tool-call-end.
+          // Only non-rich tools fall back to showing the streaming arg text.
+          if (isRichTool) {
+            // Seed an initial placeholder once, so the very first frames (before
+            // any field is parseable) still look clean rather than empty.
+            if (!argDet.querySelector('.tc-stream-preview')) {
+              const ph = tcStreamPlaceholder(tn, {});
+              if (ph) {
+                argDet.querySelectorAll(':scope > .tool-args-stream').forEach((el) => el.remove());
+                ph.classList.add('tc-stream-preview');
+                argDet.appendChild(ph);
+              }
+            }
+          } else {
+            let argPre = argDet.querySelector('.tool-args-stream');
+            if (!argPre) {
+              argPre = document.createElement('pre');
+              argPre.className = 'tool-args-stream';
+              argDet.appendChild(argPre);
+            }
+            const shown = argDet.dataset.argsBuf;
+            argPre.textContent = shown.length > 8000 ? '...' + shown.slice(-7000) : shown;
           }
-          const shown = argDet.dataset.argsBuf;
-          argPre.textContent = shown.length > 8000 ? '...' + shown.slice(-7000) : shown;
         }
         scrollToBottom();
       }
