@@ -3427,8 +3427,16 @@ function tcParsePartialArgs(buf) {
 function tcStreamRichPreview(det, name, partialArgs) {
   if (name !== 'propose_edit' && name !== 'write_file') return false;
   if (!partialArgs || typeof partialArgs !== 'object') return false;
-  const body = tcRichBody(name, partialArgs, null, '', false);
-  if (!body) return false;
+  let body = tcRichBody(name, partialArgs, null, '', false);
+  // Early in the stream the leading "summary" field has arrived but the
+  // "edits" / "content" needed for a real diff hasn't — tcRichBody returns
+  // null. Rather than fall back to dumping the raw leading JSON at the user,
+  // render a lightweight placeholder so the card stays clean from the start.
+  if (!body) {
+    const partialBody = tcStreamPlaceholder(name, partialArgs);
+    if (!partialBody) return false;
+    body = partialBody;
+  }
   // Swap in the freshly-built preview, dropping any prior preview / JSON dump.
   det.querySelectorAll(':scope > .tc-stream-preview, :scope > .tool-args-stream').forEach((el) => el.remove());
   body.classList.add('tc-stream-preview');
@@ -3439,6 +3447,27 @@ function tcStreamRichPreview(det, name, partialArgs) {
     if (html) sum.innerHTML = html;
   }
   return true;
+}
+
+// Build a minimal placeholder for an in-flight propose_edit / write_file whose
+// renderable payload (edits/content) hasn't streamed in yet. Shows the summary
+// text (if present) so the user never sees raw leading JSON.
+function tcStreamPlaceholder(name, partialArgs) {
+  const a = partialArgs || {};
+  const wrap = document.createElement('div');
+  const summaryText = typeof a.summary === 'string' ? a.summary : '';
+  if (summaryText) {
+    const sumEl = document.createElement('div');
+    sumEl.className = 'tc-empty';
+    sumEl.style.fontStyle = 'normal';
+    sumEl.textContent = summaryText;
+    wrap.appendChild(sumEl);
+  }
+  const hint = document.createElement('div');
+  hint.className = 'tc-empty';
+  hint.textContent = name === 'write_file' ? '准备写入…' : '准备编辑…';
+  wrap.appendChild(hint);
+  return wrap;
 }
 
 function renderMarkdown(src) {
