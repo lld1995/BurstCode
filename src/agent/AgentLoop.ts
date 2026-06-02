@@ -164,6 +164,20 @@ function endsWithIntentToActOnly(text: string): boolean {
   const sentences = trimmed.split(/(?<=[.!。！?？])\s+/);
   const last = (sentences[sentences.length - 1] ?? trimmed).trim().toLowerCase();
   if (!last) return false;
+  // Benign closers that START with an intent-like prefix but are actually a
+  // FINISHED answer (offering help, noting a caveat, asking the user to react).
+  // These must be excluded first or they false-positive into endless
+  // auto-continues even though the task is already complete.
+  const benignCloserRe: RegExp[] = [
+    /^let me know\b/i,                              // "Let me know if you have questions"
+    /^let me explain\b/i,
+    /^i('?| a)m\s+going to\s+(?:explain|summari[sz]e|walk)\b/i,
+    /^i('?| wi)ll\s+(?:explain|summari[sz]e|note|mention|be here|happily|gladly)\b/i,
+    /^i need to (?:note|mention|clarify|point out|flag|highlight)\b/i,
+    /^i should (?:note|mention|clarify|point out|flag|highlight)\b/i,
+    /^(?:让我知道|让我们|我会(?:在|随时)|我需要(?:说明|指出|提醒|强调)|我将(?:说明|总结))/
+  ];
+  if (benignCloserRe.some((re) => re.test(last))) return false;
   const intentRe: RegExp[] = [
     /^i'?ll\s/i,
     /^i will\s/i,
