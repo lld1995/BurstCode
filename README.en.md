@@ -92,10 +92,22 @@ Most agentic coding extensions assume you are sending your code to a hosted fron
 
 ## Installation
 
-### From a `.vsix` (recommended today)
+### From the VS Code Marketplace (recommended)
+
+Open the **Extensions** view in VS Code (`Ctrl/Cmd+Shift+X`), search for **BurstCode**, and click **Install**.
+
+Or from the command line:
 
 ```powershell
-code --install-extension burstcode-0.1.66.vsix
+code --install-extension burstcode.burstcode
+```
+
+You can also click **Install** on the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=burstcode.burstcode) page.
+
+### From a `.vsix` (offline / pre-release)
+
+```powershell
+code --install-extension burstcode-0.1.69.vsix
 ```
 
 Or in VS Code: open the **Extensions** view → `…` menu → **Install from VSIX…** → pick the `.vsix` file.

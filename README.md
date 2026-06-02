@@ -92,10 +92,22 @@
 
 ## 安装
 
-### 通过 `.vsix` 安装（目前推荐）
+### 从 VS Code 扩展商店安装（推荐）
+
+在 VS Code 中打开 **扩展** 视图（`Ctrl/Cmd+Shift+X`），搜索 **BurstCode**，点击 **安装**。
+
+或从命令行安装：
 
 ```powershell
-code --install-extension burstcode-0.1.66.vsix
+code --install-extension burstcode.burstcode
+```
+
+你也可以在 [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=burstcode.burstcode) 页面点击 **Install**。
+
+### 通过 `.vsix` 安装（离线 / 预发布）
+
+```powershell
+code --install-extension burstcode-0.1.69.vsix
 ```
 
 或在 VS Code 中：打开 **扩展** 视图 → `…` 菜单 → **从 VSIX 安装…** → 选择 `.vsix` 文件。

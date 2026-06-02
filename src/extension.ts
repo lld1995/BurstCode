@@ -18,7 +18,7 @@ import {
 } from './llm/OpenAIClient';
 import { WorkspaceIndex } from './context/WorkspaceIndex';
 import { BackgroundExplorer, ExplorerStatus } from './background/BackgroundExplorer';
-import { t } from './util/i18n';
+import { t, UI_LANGUAGE_CONFIG_KEY } from './util/i18n';
 import * as path from 'path';
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -141,7 +141,11 @@ export function activate(context: vscode.ExtensionContext): void {
         placeHolder: t('lang.pick')
       });
       if (!picked || picked.value === current) return;
-      const inspected = cfg.inspect<string>('language');
+      // Update via the root configuration section using the fully-qualified key.
+      // Updating through the intermediate `burstcode.ui` node can fail with
+      // "... is not a registered configuration" on some VS Code builds.
+      const rootCfg = vscode.workspace.getConfiguration();
+      const inspected = rootCfg.inspect<string>(UI_LANGUAGE_CONFIG_KEY);
       let target: vscode.ConfigurationTarget = vscode.ConfigurationTarget.Global;
       if (inspected?.workspaceFolderValue !== undefined) {
         target = vscode.ConfigurationTarget.WorkspaceFolder;
@@ -149,10 +153,10 @@ export function activate(context: vscode.ExtensionContext): void {
         target = vscode.ConfigurationTarget.Workspace;
       }
       try {
-        await cfg.update('language', picked.value, target);
+        await rootCfg.update(UI_LANGUAGE_CONFIG_KEY, picked.value, target);
       } catch (err) {
         if (target !== vscode.ConfigurationTarget.Global) {
-          await cfg.update('language', picked.value, vscode.ConfigurationTarget.Global);
+          await rootCfg.update(UI_LANGUAGE_CONFIG_KEY, picked.value, vscode.ConfigurationTarget.Global);
         } else {
           throw err;
         }
