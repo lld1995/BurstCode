@@ -416,6 +416,56 @@ function normalizeReasoningContent(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /**
+ * DeepSeek's thinking-capable models have a stricter — and direction-dependent —
+ * contract for `reasoning_content` than DashScope/Qwen:
+ *
+ *   1. Pure reasoning models (`deepseek-reasoner`, R1) do NOT support function
+ *      calling and REJECT any history that still carries `reasoning_content`:
+ *        400 "if the reasoning_content field is included in the sequence of
+ *             input messages, the API will return a 400 error"
+ *      → For these we STRIP `reasoning_content` from every assistant message.
+ *
+ *   2. The newer thinking models (DeepSeek V3.1 / V3.2 thinking) DO support
+ *      function calling and require the OPPOSITE for tool-call turns: an
+ *      assistant message that carries `tool_calls` MUST round-trip its
+ *      `reasoning_content`, otherwise:
+ *        400 "The `reasoning_content` in the thinking mode must be passed back
+ *             to the API."
+ *      A turn that only emitted a tool call (no visible chain-of-thought) is
+ *      saved by AgentLoop WITHOUT the field, so on the next request it is
+ *      missing and trips this error. → For tool-call assistant messages we
+ *      backfill `reasoning_content: ''` when absent; for plain assistant
+ *      answers (no tool_calls) we strip it, matching DeepSeek's documented
+ *      "previous-round CoT is not concatenated into the context" rule.
+ */
+function normalizeDeepSeekReasoning(messages: ChatMessage[], model: string): ChatMessage[] {
+  const lower = model.toLowerCase();
+  // Pure reasoning models (R1 / deepseek-reasoner) cannot accept reasoning_content
+  // at all and do not do tool calls — strip the field everywhere.
+  const isPureReasoner = lower.includes('reasoner') || lower.includes('-r1') || lower.includes('/r1');
+  return messages.map((m) => {
+    if (m.role !== 'assistant') return m;
+    const am = m as ChatMessage & {
+      reasoning_content?: unknown;
+      tool_calls?: unknown;
+    };
+    const hasToolCalls = Array.isArray(am.tool_calls) && am.tool_calls.length > 0;
+
+    if (isPureReasoner || !hasToolCalls) {
+      // Strip reasoning_content: required for R1, and matches DeepSeek's
+      // "CoT not concatenated" rule for plain answer turns on thinking models.
+      if (typeof am.reasoning_content === 'undefined') return m;
+      const { reasoning_content: _rc, ...rest } = am;
+      return rest as ChatMessage;
+    }
+
+    // Thinking model + tool-call turn: reasoning_content MUST be present.
+    if (typeof am.reasoning_content === 'string') return m;
+    return { ...m, reasoning_content: '' } as ChatMessage;
+  });
+}
+
+/**
  * Prepare messages for the target model, applying model-specific normalisation:
  *
  * Claude (native Anthropic API or OpenAI-compatible proxies that translate to it):
@@ -428,7 +478,12 @@ function normalizeReasoningContent(messages: ChatMessage[]): ChatMessage[] {
  *      after a cancelled stream or a schema migration) and trigger the same error
  *      on round-trip.
  *
- * All other models (Qwen/DashScope, DeepSeek, …):
+ * DeepSeek (deepseek-reasoner / V3.x thinking):
+ *   Delegate to normalizeDeepSeekReasoning — strip reasoning_content for pure
+ *   reasoners and plain answer turns, but round-trip it on tool-call turns of
+ *   thinking models (see that function for the exact contract).
+ *
+ * All other models (Qwen/DashScope, …):
  *   Backfill `reasoning_content: ''` when the field is absent so Qwen-thinking
  *   endpoints always receive a shape-correct request body.
  */
@@ -454,6 +509,9 @@ function prepareMessagesForModel(messages: ChatMessage[], model: string): ChatMe
       }
       return msg;
     });
+  }
+  if (model.toLowerCase().includes('deepseek')) {
+    return normalizeDeepSeekReasoning(messages, model);
   }
   return normalizeReasoningContent(messages);
 }
