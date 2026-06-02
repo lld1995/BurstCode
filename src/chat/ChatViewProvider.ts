@@ -319,7 +319,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    */
   private broadcastPendingEdits(): void {
     if (!this.view) return;
-    const state = this.applier.getPendingState(this.currentSession?.id);
+    // A brand-new chat has no session id yet and owns NO pending edits. Passing
+    // `undefined` to getPendingState() matches the GLOBAL queue (legacy view),
+    // which would surface the previously-visible session's edits in the banner.
+    // Post an explicitly-empty snapshot in that case so the banner clears.
+    const sid = this.currentSession?.id;
+    const state = sid
+      ? this.applier.getPendingState(sid)
+      : { files: 0, hunks: 0, fileList: [], latestSummary: '' };
     this.post({ type: 'pending-edits', payload: state });
   }
 
@@ -1219,7 +1226,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             session.messages,
             workspaceRoot,
             llmCfg.contextWindow,
-            () => { session.checkpoints = []; }
+            (info) => {
+              session.checkpoints = [];
+              // Sync the UI context gauge with the post-compression token count
+              // (reuse the same event the auto-compressor emits, so the webview
+              // updates the bar and flashes a notice).
+              postLive({
+                type: 'context-compressed',
+                payload: { before: info.before, after: info.after, max: info.max }
+              });
+            }
           )
         : [];
       for await (const event of agent.run(session.messages, cts.token, runTools)) {
@@ -1754,10 +1770,12 @@ setTimeout(() => {
   .tc-file-head .tc-file-name { color: var(--vscode-textLink-foreground); cursor: pointer; }
   .tc-file-head .tc-file-name:hover { text-decoration: underline; }
   .tc-file-head .tc-file-meta { margin-left: auto; opacity: 0.7; font-size: 0.9em; white-space: nowrap; }
-  .tc-code { margin: 0; padding: 0; overflow: auto; max-height: 320px; font-family: var(--vscode-editor-font-family); font-size: 0.92em; line-height: 1.45; background: var(--vscode-editor-background); }
-  .tc-code .tc-row { display: flex; white-space: pre; }
-  .tc-code .tc-ln { flex: 0 0 auto; min-width: 42px; padding: 0 8px 0 6px; text-align: right; color: var(--vscode-editorLineNumber-foreground); opacity: 0.6; user-select: none; -webkit-user-select: none; }
-  .tc-code .tc-txt { flex: 1 1 auto; padding-right: 10px; white-space: pre-wrap; word-break: break-word; }
+  .tc-code { margin: 0; padding: 0; overflow: auto; max-height: 320px; font-family: var(--vscode-editor-font-family); font-size: 0.92em; line-height: 1.5; background: var(--vscode-editor-background); }
+  .tc-code .tc-row { display: flex; align-items: flex-start; white-space: pre; }
+  .tc-code .tc-ln { flex: 0 0 auto; width: 46px; box-sizing: border-box; padding: 0 8px 0 6px; text-align: right; color: var(--vscode-editorLineNumber-foreground); opacity: 0.55; user-select: none; -webkit-user-select: none; border-right: 1px solid var(--vscode-panel-border); margin-right: 8px; }
+  .tc-code .tc-txt { flex: 1 1 auto; min-width: 0; padding-right: 10px; white-space: pre-wrap; word-break: break-word; }
+  /* Visual gap between stacked collect_context sub-result cards. */
+  .tc-stream-preview > .tc-file + .tc-file, .tool > div > .tc-file + .tc-file { margin-top: 8px; }
   .tc-code .tc-row.add { background: var(--vscode-diffEditor-insertedTextBackground, rgba(76,175,80,0.16)); }
   .tc-code .tc-row.add .tc-ln::before { content: '+'; }
   .tc-code .tc-row.del { background: var(--vscode-diffEditor-removedTextBackground, rgba(241,76,76,0.16)); }
@@ -2958,10 +2976,19 @@ function renderTranscript(entries) {
       const sum = document.createElement('summary');
       sum.textContent = (e.isError ? '⚠ ' : '✓ ') + (e.name || 'tool');
       det.appendChild(sum);
-      const pre = document.createElement('pre');
-      pre.textContent = (e.text || '').slice(0, 4000);
-      det.appendChild(pre);
       log.appendChild(det);
+      // Rebuild the rich card (diff / read / collect) when we still have the
+      // call args from the saved transcript. Falls back to a plain <pre> dump
+      // for everything else or when applyRichTool can't build a body.
+      const handled = (e.name && e.args != null)
+        ? applyRichTool(det, e.name, e.args, null, e.text, !!e.isError, true)
+        : false;
+      const hasBody = det.querySelector('.tc-file, .tc-code, pre');
+      if (!handled || !hasBody) {
+        const pre = document.createElement('pre');
+        pre.textContent = (e.text || '').slice(0, 4000);
+        det.appendChild(pre);
+      }
     }
   });
   forceScrollToBottom();
@@ -3275,17 +3302,57 @@ function tcRichBody(name, args, meta, result, isError) {
       card.appendChild(tcFileCard(metaTextPath(meta), meta.start, metaText, code));
       return card;
     }
-    // collect_context: just show the raw aggregated text in a scroll box,
-    // but inside our nicer card frame with a header summarising counts.
+    // collect_context: the aggregated result text is a concatenation of
+    // per-source blocks delimited by "===== <title> =====" markers (one per
+    // read / grep / dir / tree). Split on those markers so each sub-result is
+    // a clearly-separated card instead of one undifferentiated wall of text.
+    const head = (meta && meta.tasks != null) ? (meta.tasks + ' sources') : 'context';
+    const sections = tcSplitCollectSections(text);
+    if (sections.length) {
+      for (const sec of sections) {
+        const pre = document.createElement('pre');
+        pre.style.margin = '0';
+        pre.style.maxHeight = '260px';
+        pre.textContent = sec.body.slice(0, 6000);
+        card.appendChild(tcFileCard(sec.title || 'context', 0, sec.meta || '', pre));
+      }
+      return card;
+    }
     const pre = document.createElement('pre');
     pre.style.margin = '0';
     pre.style.maxHeight = '320px';
     pre.textContent = text.slice(0, 8000);
-    const head = (meta && meta.tasks != null) ? (meta.tasks + ' sources') : 'context';
     card.appendChild(tcFileCard(name, 0, head, pre));
     return card;
   }
   return null;
+}
+
+// Split a collect_context aggregated result into its per-source sections.
+// Recognises the "===== <title> =====" delimiters the tool emits. Returns
+// [{ title, meta, body }]. Empty array when no markers are found (fallback).
+function tcSplitCollectSections(text) {
+  const src = String(text || '');
+  const re = /^=====\\s*(.+?)\\s*=====$/gm;
+  const marks = [];
+  let m;
+  while ((m = re.exec(src))) {
+    marks.push({ title: m[1], start: m.index, bodyStart: m.index + m[0].length });
+  }
+  if (!marks.length) return [];
+  const out = [];
+  for (let i = 0; i < marks.length; i++) {
+    const end = i + 1 < marks.length ? marks[i + 1].start : src.length;
+    const body = src.slice(marks[i].bodyStart, end).replace(/^\\n+/, '').replace(/\\s+$/, '');
+    // First line of a section body is often a "# count" / "# path" summary.
+    let title = marks[i].title;
+    let meta = '';
+    const firstNl = body.indexOf('\\n');
+    const firstLine = firstNl >= 0 ? body.slice(0, firstNl) : body;
+    if (/^#\\s/.test(firstLine)) meta = firstLine.replace(/^#\\s*/, '');
+    out.push({ title, meta, body });
+  }
+  return out;
 }
 
 function metaTextPath(meta) {
@@ -3311,10 +3378,65 @@ function applyRichTool(det, name, args, meta, result, isError, done) {
     // Replace the default body with the rich body if we can build one.
     const body = tcRichBody(name, args, meta, result, isError);
     if (body) {
-      // Remove any default <pre> dumps / arg streams we created earlier.
-      det.querySelectorAll(':scope > pre, :scope > .tool-args-stream').forEach((el) => el.remove());
+      // Remove any default <pre> dumps / arg streams / live previews we made earlier.
+      det.querySelectorAll(':scope > pre, :scope > .tool-args-stream, :scope > .tc-stream-preview').forEach((el) => el.remove());
       det.appendChild(body);
     }
+  }
+  return true;
+}
+
+// Best-effort parse of a PARTIAL JSON args buffer streamed token-by-token.
+// Closes any unterminated strings/objects/arrays so we can render a live
+// preview of propose_edit / write_file before the call finishes. Returns the
+// parsed object or null if even the lenient repair fails.
+function tcParsePartialArgs(buf) {
+  const s = String(buf || '').trim();
+  if (!s) return null;
+  try { return JSON.parse(s); } catch (_) {}
+  // Walk the buffer tracking string state + the stack of open containers, then
+  // append the closers needed to make it valid JSON.
+  let inStr = false, esc = false;
+  const stack = [];
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    out += ch;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  if (inStr) { if (esc) out += '\\\\'; out += '"'; }
+  // Drop a dangling key-without-value or trailing comma so closing is valid.
+  out = out.replace(/[,:]\\s*$/, '');
+  for (let i = stack.length - 1; i >= 0; i--) {
+    out += stack[i] === '{' ? '}' : ']';
+  }
+  try { return JSON.parse(out); } catch (_) { return null; }
+}
+
+// Render a LIVE rich preview of an in-flight propose_edit / write_file while
+// its args stream in. Reuses tcRichBody by treating the partial args as final.
+// Returns true if a preview was rendered (so the raw JSON dump is suppressed).
+function tcStreamRichPreview(det, name, partialArgs) {
+  if (name !== 'propose_edit' && name !== 'write_file') return false;
+  if (!partialArgs || typeof partialArgs !== 'object') return false;
+  const body = tcRichBody(name, partialArgs, null, '', false);
+  if (!body) return false;
+  // Swap in the freshly-built preview, dropping any prior preview / JSON dump.
+  det.querySelectorAll(':scope > .tc-stream-preview, :scope > .tool-args-stream').forEach((el) => el.remove());
+  body.classList.add('tc-stream-preview');
+  det.appendChild(body);
+  const sum = det.querySelector('summary');
+  if (sum) {
+    const html = tcSummaryHtml(name, partialArgs, null, false, false);
+    if (html) sum.innerHTML = html;
   }
   return true;
 }
@@ -3990,6 +4112,7 @@ window.addEventListener('message', (e) => {
       const det = document.createElement('details');
       det.className = 'tool';
       det.dataset.running = 'true';
+      det.dataset.toolName = String(msg.payload.name || '');
       try { det._tcArgs = msg.payload.args; } catch (e) {}
       if (msg.payload.streaming) {
         det.dataset.streaming = 'true';
@@ -4019,14 +4142,25 @@ window.addEventListener('message', (e) => {
       if (argDet) {
         argDet.dataset.argsBuf = (argDet.dataset.argsBuf || '') + msg.payload.delta;
         const buf = argDet.dataset.argsBuf;
-        if (buf.length > 8000) argDet.dataset.argsBuf = '...' + buf.slice(-7000);
-        let argPre = argDet.querySelector('.tool-args-stream');
-        if (!argPre) {
-          argPre = document.createElement('pre');
-          argPre.className = 'tool-args-stream';
-          argDet.appendChild(argPre);
+        if (buf.length > 16000) argDet.dataset.argsBuf = buf.slice(0, 16000);
+        // For propose_edit / write_file, render a LIVE diff/code preview from
+        // the partial args instead of dumping raw JSON tokens at the user.
+        const tn = argDet.dataset.toolName || '';
+        let rendered = false;
+        if (tn === 'propose_edit' || tn === 'write_file') {
+          const partial = tcParsePartialArgs(argDet.dataset.argsBuf);
+          if (partial) rendered = tcStreamRichPreview(argDet, tn, partial);
         }
-        argPre.textContent = argDet.dataset.argsBuf;
+        if (!rendered) {
+          let argPre = argDet.querySelector('.tool-args-stream');
+          if (!argPre) {
+            argPre = document.createElement('pre');
+            argPre.className = 'tool-args-stream';
+            argDet.appendChild(argPre);
+          }
+          const shown = argDet.dataset.argsBuf;
+          argPre.textContent = shown.length > 8000 ? '...' + shown.slice(-7000) : shown;
+        }
         scrollToBottom();
       }
       break;

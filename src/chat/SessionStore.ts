@@ -125,6 +125,10 @@ export interface TranscriptEntry {
   text: string;
   name?: string;
   isError?: boolean;
+  /** For tool entries: the parsed call arguments, so the webview can rebuild
+   *  the rich diff / read / collect cards (propose_edit, write_file, read_file,
+   *  collect_context) when replaying a session from history. */
+  args?: unknown;
   /** For user entries: index in the original messages array. */
   messageIndex?: number;
   /** For user entries: rollback ref captured before this prompt was processed. */
@@ -183,13 +187,26 @@ export function buildTranscript(
         (m as unknown as { tool_calls?: Array<{ id?: string; function: { name: string; arguments: string } }> })
           .tool_calls ?? [];
       for (const c of calls) {
-        entries.push({ kind: 'tool', name: c.function.name, text: '(call) ' + c.function.arguments });
+        // Preserve the parsed arguments so the webview can rebuild the rich
+        // tool card (diff / read / collect) when this session is replayed from
+        // history. `text` starts as a placeholder and is overwritten by the
+        // matching tool-result message below.
+        let parsedArgs: unknown;
+        try { parsedArgs = JSON.parse(c.function.arguments); } catch { parsedArgs = undefined; }
+        entries.push({
+          kind: 'tool',
+          name: c.function.name,
+          text: '(call) ' + c.function.arguments,
+          args: parsedArgs
+        });
       }
     } else if (m.role === 'tool') {
       const text = typeof m.content === 'string' ? m.content : '';
       // Attach to last tool entry if name unknown.
       const last = entries[entries.length - 1];
       if (last && last.kind === 'tool' && last.text.startsWith('(call)')) {
+        // Overwrite the placeholder with the real result, but KEEP last.args /
+        // last.name so rich rendering still has the call arguments.
         last.text = text;
       } else {
         entries.push({ kind: 'tool', name: 'tool', text });

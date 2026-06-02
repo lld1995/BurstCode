@@ -31,13 +31,14 @@ function slugify(text: string): string {
  * @param contextWindow - Model context window size; used by compress_context for budget math.
  * @param onCompressed - Optional callback fired after compress_context splices messages.
  *   The caller should use this to clear any stale checkpoint indices (messageIndex values
- *   become invalid once messages are spliced).
+ *   become invalid once messages are spliced) AND to broadcast the new context usage to the UI.
+ *   The `info` argument carries the token counts so the UI can sync its context gauge.
  */
 export function buildContextTools(
   messages: ChatMessage[],
   workspaceRoot: string,
   contextWindow = defaultCompressorConfig.contextWindow,
-  onCompressed?: () => void
+  onCompressed?: (info: { before: number; after: number; max: number }) => void
 ): Tool[] {
   const compressContext: Tool = {
     name: 'compress_context',
@@ -79,7 +80,7 @@ export function buildContextTools(
       const after = estimateMessagesTokens(
         messages as Array<{ role: string; content: unknown }>
       );
-      onCompressed?.();
+      onCompressed?.({ before, after, max: contextWindow });
       return {
         content:
           `Context compressed for topic switch: ${before} → ${after} tokens freed ~${before - after}. ` +
