@@ -4258,7 +4258,15 @@ window.addEventListener('message', (e) => {
       if (det) {
         det.dataset.error = String(!!msg.payload.isError);
         det.dataset.running = 'false';
-        const endArgs = (det._tcArgs != null) ? det._tcArgs : msg.payload.args;
+        // Prefer the authoritative, fully-parsed args delivered with tool-call-end.
+        // _tcArgs only holds the args known at tool-call-start time, which for a
+        // streamed call is {} — relying on it would freeze the preview on the last
+        // partial stream frame and drop the final tokens. Fall back to _tcArgs only
+        // when the end payload carries no args.
+        const hasEndArgs = msg.payload.args != null
+          && typeof msg.payload.args === 'object'
+          && Object.keys(msg.payload.args).length > 0;
+        const endArgs = hasEndArgs ? msg.payload.args : (det._tcArgs != null ? det._tcArgs : msg.payload.args);
         const handled = applyRichTool(
           det,
           msg.payload.name,

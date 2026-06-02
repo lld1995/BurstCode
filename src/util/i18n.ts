@@ -80,6 +80,15 @@ const EN: Dict = {
   'footer.allSettings.desc': 'Full BurstCode configuration',
   'footer.about': 'About',
 
+  // Language
+  'lang.label': 'Language',
+  'lang.desc': 'Side panel language',
+  'lang.tip': 'Current UI language: {0}\nClick to switch.',
+  'lang.zh': '简体中文',
+  'lang.en': 'English',
+  'lang.auto': 'Auto (follow VS Code)',
+  'lang.pick': 'Select side panel language',
+
   // Toggle state
   'state.on': 'on',
   'state.off': 'off',
@@ -147,6 +156,15 @@ const ZH: Dict = {
   'footer.allSettings': '全部设置…',
   'footer.allSettings.desc': '完整的 BurstCode 配置',
   'footer.about': '关于',
+
+  // Language
+  'lang.label': '语言',
+  'lang.desc': '侧边面板语言',
+  'lang.tip': '当前界面语言：{0}\n点击切换。',
+  'lang.zh': '简体中文',
+  'lang.en': 'English',
+  'lang.auto': '自动（跟随 VS Code）',
+  'lang.pick': '选择侧边面板语言',
 
   // Toggle state
   'state.on': '开',

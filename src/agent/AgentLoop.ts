@@ -1116,7 +1116,7 @@ export class AgentLoop {
           results[cursor] = result;
           yield {
             type: 'tool-call-end',
-            payload: { name: c.name, id: c.callId, result: result.content, isError: !!result.isError, meta: result.meta }
+            payload: { name: c.name, id: c.callId, args: c.parsed, result: result.content, isError: !!result.isError, meta: result.meta }
           };
           cursor++;
           continue;
@@ -1171,7 +1171,7 @@ export class AgentLoop {
             const res = results[batchStart + bi];
             yield {
               type: 'tool-call-end',
-              payload: { name: c.name, id: c.callId, result: res.content, isError: !!res.isError, meta: res.meta }
+              payload: { name: c.name, id: c.callId, args: c.parsed, result: res.content, isError: !!res.isError, meta: res.meta }
             };
           }
           if (inFlight > 0 || progressQueue.length > 0) {
@@ -1212,7 +1212,7 @@ export class AgentLoop {
               const c = prepared[absIdx];
               yield {
                 type: 'tool-call-end',
-                payload: { name: c.name, id: c.callId, result: results[absIdx].content, isError: true, meta: undefined }
+                payload: { name: c.name, id: c.callId, args: c.parsed, result: results[absIdx].content, isError: true, meta: undefined }
               };
             }
           }

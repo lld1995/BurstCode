@@ -18,6 +18,7 @@ import {
 } from './llm/OpenAIClient';
 import { WorkspaceIndex } from './context/WorkspaceIndex';
 import { BackgroundExplorer, ExplorerStatus } from './background/BackgroundExplorer';
+import { t } from './util/i18n';
 import * as path from 'path';
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -122,6 +123,40 @@ export function activate(context: vscode.ExtensionContext): void {
         `BurstCode: ${key} = ${next ? 'on' : 'off'}`,
         2000
       );
+    }),
+    vscode.commands.registerCommand('burstcode.selectLanguage', async () => {
+      const cfg = vscode.workspace.getConfiguration('burstcode.ui');
+      const current = cfg.get<string>('language', 'zh');
+      type LangItem = vscode.QuickPickItem & { value: 'zh' | 'en' | 'auto' };
+      const items: LangItem[] = [
+        { label: t('lang.zh'), value: 'zh' as const },
+        { label: t('lang.en'), value: 'en' as const },
+        { label: t('lang.auto'), value: 'auto' as const }
+      ].map((it) => ({
+        ...it,
+        description: it.value === current ? '\u2713' : undefined
+      }));
+      const picked = await vscode.window.showQuickPick(items, {
+        title: t('lang.pick'),
+        placeHolder: t('lang.pick')
+      });
+      if (!picked || picked.value === current) return;
+      const inspected = cfg.inspect<string>('language');
+      let target: vscode.ConfigurationTarget = vscode.ConfigurationTarget.Global;
+      if (inspected?.workspaceFolderValue !== undefined) {
+        target = vscode.ConfigurationTarget.WorkspaceFolder;
+      } else if (inspected?.workspaceValue !== undefined) {
+        target = vscode.ConfigurationTarget.Workspace;
+      }
+      try {
+        await cfg.update('language', picked.value, target);
+      } catch (err) {
+        if (target !== vscode.ConfigurationTarget.Global) {
+          await cfg.update('language', picked.value, vscode.ConfigurationTarget.Global);
+        } else {
+          throw err;
+        }
+      }
     }),
     vscode.commands.registerCommand('burstcode.selectModel', async () => {
       const chat = readChatProfile();

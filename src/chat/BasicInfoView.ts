@@ -262,12 +262,29 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
         arguments: ['burstcode']
       }
     });
+
+    // ---------- Language quick switch ----------
+    const uiLangSetting = vscode.workspace
+      .getConfiguration('burstcode.ui')
+      .get<string>('language', 'zh');
+    const langValueLabel =
+      uiLangSetting === 'en'
+        ? t('lang.en')
+        : uiLangSetting === 'auto'
+          ? t('lang.auto')
+          : t('lang.zh');
+    const language = new BasicNode('leaf', t('lang.label'), {
+      description: langValueLabel,
+      icon: 'globe',
+      tooltip: t('lang.tip', langValueLabel),
+      command: { command: 'burstcode.selectLanguage', title: 'Select Language' }
+    });
     const about = new BasicNode('leaf', `BurstCode v${version}`, {
       description: t('footer.about'),
       icon: 'info'
     });
 
-    return [modelsGroup, permissions, bgGroup, actions, advanced, about];
+    return [modelsGroup, permissions, bgGroup, actions, language, advanced, about];
   }
 
   private toggleNode(
