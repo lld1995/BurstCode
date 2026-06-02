@@ -508,11 +508,11 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
         inputType = options.length > 0 ? 'single' : 'text';
       }
 
+      // Be forgiving: 'single'/'multi' require options, but if the model asked for
+      // a choice without supplying any, degrade to free-text rather than failing the
+      // turn. The question text usually still makes sense as an open-ended prompt.
       if ((inputType === 'single' || inputType === 'multi') && options.length === 0) {
-        return {
-          content: `ask_user inputType='${inputType}' requires at least one option. Provide options or use inputType='text'.`,
-          isError: true
-        };
+        inputType = 'text';
       }
 
       const allowCustomText = !!args.allowCustomText && inputType !== 'text';

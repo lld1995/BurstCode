@@ -194,7 +194,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     });
     this.pendingEditsSub = this.applier.onPendingStateChange((state) => {
-      this.broadcastPendingEdits(state);
+      // The emitted `state` is global; re-derive the view scoped to the
+      // currently-visible session so each tab only ever shows its own edits.
+      this.broadcastPendingEdits();
       // Persist a small note into the session messages so the next agent run
       // sees what the user did in between turns. The model will read this as
       // ordinary user-side context and react accordingly.
@@ -309,8 +311,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private broadcastPendingEdits(state: PendingState): void {
+  /**
+   * Push the pending-edits banner state for the CURRENTLY-VISIBLE session only.
+   * The HunkApplier queue is global, but each chat tab must see and act on just
+   * the edits its own session produced, so we always re-derive the per-session
+   * snapshot here rather than forwarding the global emitted state.
+   */
+  private broadcastPendingEdits(): void {
     if (!this.view) return;
+    const state = this.applier.getPendingState(this.currentSession?.id);
     this.post({ type: 'pending-edits', payload: state });
   }
 
@@ -336,7 +345,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.broadcastContextUsage();
     this.broadcastBackgroundStatus();
     // Re-broadcast any pending-edit queue so a reopened panel shows the banner.
-    this.broadcastPendingEdits(this.applier.getPendingState());
+    this.broadcastPendingEdits();
   }
 
   private broadcastSessions(): void {
@@ -439,6 +448,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'reset' });
     this.broadcastSessions();
     this.broadcastContextUsage();
+    // A fresh chat has no pending edits of its own; clear the banner.
+    this.broadcastPendingEdits();
   }
 
   private async loadSession(id: string): Promise<void> {
@@ -476,6 +487,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.broadcastSessions();
     this.broadcastContextUsage();
+    // Refresh the pending-edits banner so it shows THIS session's edits only.
+    this.broadcastPendingEdits();
   }
 
   /** Build a JSON-safe snapshot of the in-flight run state for replay. */
@@ -601,10 +614,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case 'accept-all-edits':
-        await this.applier.acceptAll();
+        await this.applier.acceptAll(this.currentSession?.id);
         break;
       case 'reject-all-edits':
-        await this.applier.rejectAll();
+        await this.applier.rejectAll(this.currentSession?.id);
         break;
       case 'review-edits': {
         const uri = String((msg.payload as { uri?: string })?.uri ?? '').trim();
@@ -1036,6 +1049,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // later rollback to an EARLIER turn only discards this turn's edits and
     // leaves still-unreviewed edits from previous turns in the banner.
     this.applier.setCurrentTurn(messageIndex);
+    // Tag this run's edits with the owning session so the banner / accept /
+    // reject stay scoped to this tab when the user switches between sessions.
+    this.applier.setCurrentSession(session.id);
 
     // Kick off the two slow setup tasks in PARALLEL: creating a git
     // checkpoint (spawns `git`, can be hundreds of ms on big repos) and
@@ -1726,6 +1742,29 @@ setTimeout(() => {
   .tool .tool-progress-log { max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .tool .tool-args-stream { max-height: 300px; overflow: auto; white-space: pre-wrap; word-break: break-all; opacity: 0.8; }
   .tool[data-running="true"] summary::after { content: ''; display: inline-block; width: 7px; height: 7px; margin-left: 8px; border-radius: 50%; background: var(--vscode-charts-yellow); animation: pulse 1.1s ease-in-out infinite; vertical-align: middle; }
+
+  /* Rich tool cards: propose_edit diff / read_file ranges / write_file */
+  .tool summary .tc-tag { font-weight: 600; opacity: 0.95; }
+  .tool summary .tc-path { color: var(--vscode-textLink-foreground); }
+  .tool summary .tc-stat { margin-left: 6px; font-size: 0.9em; opacity: 0.8; }
+  .tool summary .tc-add { color: var(--vscode-charts-green, #4caf50); }
+  .tool summary .tc-del { color: var(--vscode-charts-red, #f14c4c); }
+  .tc-file { margin: 4px 0 6px 4px; border: 1px solid var(--vscode-panel-border); border-radius: 5px; overflow: hidden; background: var(--vscode-editor-background); }
+  .tc-file-head { display: flex; align-items: center; gap: 8px; padding: 4px 8px; background: var(--vscode-editorWidget-background); border-bottom: 1px solid var(--vscode-panel-border); font-size: 0.92em; }
+  .tc-file-head .tc-file-name { color: var(--vscode-textLink-foreground); cursor: pointer; }
+  .tc-file-head .tc-file-name:hover { text-decoration: underline; }
+  .tc-file-head .tc-file-meta { margin-left: auto; opacity: 0.7; font-size: 0.9em; white-space: nowrap; }
+  .tc-code { margin: 0; padding: 0; overflow: auto; max-height: 320px; font-family: var(--vscode-editor-font-family); font-size: 0.92em; line-height: 1.45; background: var(--vscode-editor-background); }
+  .tc-code .tc-row { display: flex; white-space: pre; }
+  .tc-code .tc-ln { flex: 0 0 auto; min-width: 42px; padding: 0 8px 0 6px; text-align: right; color: var(--vscode-editorLineNumber-foreground); opacity: 0.6; user-select: none; -webkit-user-select: none; }
+  .tc-code .tc-txt { flex: 1 1 auto; padding-right: 10px; white-space: pre-wrap; word-break: break-word; }
+  .tc-code .tc-row.add { background: var(--vscode-diffEditor-insertedTextBackground, rgba(76,175,80,0.16)); }
+  .tc-code .tc-row.add .tc-ln::before { content: '+'; }
+  .tc-code .tc-row.del { background: var(--vscode-diffEditor-removedTextBackground, rgba(241,76,76,0.16)); }
+  .tc-code .tc-row.del .tc-ln::before { content: '-'; }
+  .tc-code .tc-row.ctx { opacity: 0.78; }
+  .tc-code .tc-row.add .tc-ln, .tc-code .tc-row.del .tc-ln { opacity: 0.9; }
+  .tc-empty { padding: 6px 10px; opacity: 0.6; font-style: italic; }
 
   .iter-pill { margin: 8px 0 4px; opacity: 0.55; font-size: 0.8em; }
   .pill { font-size: 0.78em; padding: 2px 7px; border-radius: 10px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
@@ -3032,6 +3071,254 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// ---- Rich tool-call rendering --------------------------------------------
+// propose_edit / write_file render as a diff/code editor, read_file /
+// collect_context render as "which lines were read" cards. Anything else
+// falls back to the plain <pre> result dump.
+
+function tcBaseName(p) {
+  const s = String(p || '');
+  const m = s.replace(/\\\\/g, '/').split('/');
+  return m[m.length - 1] || s;
+}
+
+function tcFileLink(path, line) {
+  const a = document.createElement('span');
+  a.className = 'tc-file-name';
+  a.textContent = tcBaseName(path) + (line ? ':' + line : '');
+  a.title = String(path || '');
+  a.addEventListener('click', () => {
+    if (path) vscode.postMessage({ type: 'open-file', payload: { path: path, line: line || 0 } });
+  });
+  return a;
+}
+
+// Minimal LCS-based line diff between two strings. Returns rows:
+// { kind: 'ctx'|'add'|'del', oldNo, newNo, text }.
+function tcLineDiff(oldStr, newStr, startLine) {
+  const a = (oldStr == null ? '' : String(oldStr)).split('\\n');
+  const b = (newStr == null ? '' : String(newStr)).split('\\n');
+  if (oldStr == null || oldStr === '') {
+    // Pure insertion (e.g. new file).
+    return b.map((t, i) => ({ kind: 'add', oldNo: null, newNo: (startLine || 1) + i, text: t }));
+  }
+  const n = a.length, m = b.length;
+  // Cap the DP table to keep big edits cheap; fall back to block replace.
+  if (n * m > 250000) {
+    const rows = [];
+    a.forEach((t, i) => rows.push({ kind: 'del', oldNo: (startLine || 1) + i, newNo: null, text: t }));
+    b.forEach((t, i) => rows.push({ kind: 'add', oldNo: null, newNo: (startLine || 1) + i, text: t }));
+    return rows;
+  }
+  const dp = [];
+  for (let i = 0; i <= n; i++) dp.push(new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const rows = [];
+  let i = 0, j = 0, oldNo = startLine || 1, newNo = startLine || 1;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { rows.push({ kind: 'ctx', oldNo: oldNo++, newNo: newNo++, text: a[i] }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { rows.push({ kind: 'del', oldNo: oldNo++, newNo: null, text: a[i] }); i++; }
+    else { rows.push({ kind: 'add', oldNo: null, newNo: newNo++, text: b[j] }); j++; }
+  }
+  while (i < n) rows.push({ kind: 'del', oldNo: oldNo++, newNo: null, text: a[i++] });
+  while (j < m) rows.push({ kind: 'add', oldNo: null, newNo: newNo++, text: b[j++] });
+  return rows;
+}
+
+function tcCodeBlock(rows, mode) {
+  // mode: 'diff' colours add/del; 'plain' just shows numbered lines.
+  const code = document.createElement('div');
+  code.className = 'tc-code';
+  if (!rows.length) {
+    const e = document.createElement('div');
+    e.className = 'tc-empty';
+    e.textContent = '(empty)';
+    code.appendChild(e);
+    return code;
+  }
+  for (const r of rows) {
+    const row = document.createElement('div');
+    row.className = 'tc-row ' + (mode === 'diff' ? r.kind : 'ctx');
+    const ln = document.createElement('span');
+    ln.className = 'tc-ln';
+    ln.textContent = mode === 'diff'
+      ? String(r.kind === 'add' ? r.newNo : r.kind === 'del' ? r.oldNo : r.newNo)
+      : String(r.newNo);
+    const txt = document.createElement('span');
+    txt.className = 'tc-txt';
+    txt.textContent = r.text;
+    row.appendChild(ln);
+    row.appendChild(txt);
+    code.appendChild(row);
+  }
+  return code;
+}
+
+function tcFileCard(path, line, metaText, body) {
+  const card = document.createElement('div');
+  card.className = 'tc-file';
+  const head = document.createElement('div');
+  head.className = 'tc-file-head';
+  head.appendChild(tcFileLink(path, line));
+  if (metaText) {
+    const meta = document.createElement('span');
+    meta.className = 'tc-file-meta';
+    meta.textContent = metaText;
+    head.appendChild(meta);
+  }
+  card.appendChild(head);
+  if (body) card.appendChild(body);
+  return card;
+}
+
+// Returns an HTML summary string for the collapsed title, or '' to keep the
+// default. name/args available at start; meta/result available at end.
+function tcSummaryHtml(name, args, meta, isError, done) {
+  const a = args || {};
+  const tick = done ? (isError ? '⚠ ' : '') : '';
+  if (name === 'propose_edit') {
+    let adds = 0, dels = 0, files = [];
+    const edits = Array.isArray(a.edits) ? a.edits : (a.path ? [a] : []);
+    for (const e of edits) {
+      if (e && e.path) files.push(tcBaseName(e.path));
+      const rows = tcLineDiff(e && e.oldText, e && e.newText, e && e.startLine);
+      for (const r of rows) { if (r.kind === 'add') adds++; else if (r.kind === 'del') dels++; }
+    }
+    const uniq = Array.from(new Set(files));
+    const label = uniq.length === 1 ? uniq[0] : (uniq.length + ' files');
+    return tick + '<span class="tc-tag">✏️ Edit</span> <span class="tc-path">' + escapeHtml(label) + '</span>'
+      + '<span class="tc-stat"><span class="tc-add">+' + adds + '</span> <span class="tc-del">-' + dels + '</span></span>';
+  }
+  if (name === 'write_file') {
+    const created = meta && typeof meta.created === 'boolean' ? meta.created : undefined;
+    const verb = created === true ? '新建' : created === false ? '覆写' : '写入';
+    const sz = meta && meta.bytes != null ? ' · ' + tcBytes(meta.bytes) : '';
+    return tick + '<span class="tc-tag">📝 Write</span> <span class="tc-path">' + escapeHtml(tcBaseName(a.path)) + '</span>'
+      + '<span class="tc-stat">' + verb + sz + '</span>';
+  }
+  if (name === 'read_file') {
+    const s = a.startLine, e = a.endLine;
+    const rng = (s != null || e != null) ? ':' + (s || 1) + (e != null ? '-' + e : '+') : '';
+    return tick + '<span class="tc-tag">📖 Read</span> <span class="tc-path">' + escapeHtml(tcBaseName(a.path) + rng) + '</span>';
+  }
+  if (name === 'collect_context') {
+    const nf = Array.isArray(a.files) ? a.files.length : 0;
+    const ng = Array.isArray(a.searches) ? a.searches.length : 0;
+    const nd = Array.isArray(a.dirs) ? a.dirs.length : 0;
+    const nt = Array.isArray(a.trees) ? a.trees.length : 0;
+    const parts = [];
+    if (nf) parts.push(nf + ' read');
+    if (ng) parts.push(ng + ' grep');
+    if (nd) parts.push(nd + ' dir');
+    if (nt) parts.push(nt + ' tree');
+    return tick + '<span class="tc-tag">📚 Collect</span> <span class="tc-stat">' + escapeHtml(parts.join(' · ') || 'context') + '</span>';
+  }
+  return '';
+}
+
+function tcBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+// Build the expanded body for a finished rich tool. Returns an element, or
+// null to fall back to the default <pre>.
+function tcRichBody(name, args, meta, result, isError) {
+  const a = args || {};
+  if (isError) return null; // show the raw error in the default <pre>
+  if (name === 'propose_edit') {
+    const wrap = document.createElement('div');
+    const edits = Array.isArray(a.edits) ? a.edits : (a.path ? [a] : []);
+    if (!edits.length) return null;
+    for (const e of edits) {
+      const rows = tcLineDiff(e && e.oldText, e && e.newText, e && e.startLine);
+      let adds = 0, dels = 0;
+      for (const r of rows) { if (r.kind === 'add') adds++; else if (r.kind === 'del') dels++; }
+      const body = tcCodeBlock(rows, 'diff');
+      wrap.appendChild(tcFileCard(e && e.path, e && e.startLine, '+' + adds + ' -' + dels, body));
+    }
+    return wrap;
+  }
+  if (name === 'write_file') {
+    const content = String(a.content == null ? '' : a.content);
+    const lines = content.split('\\n');
+    const MAX = 400;
+    const shown = lines.slice(0, MAX);
+    const rows = shown.map((t, i) => ({ kind: 'ctx', newNo: i + 1, text: t }));
+    const body = tcCodeBlock(rows, 'plain');
+    if (lines.length > MAX) {
+      const more = document.createElement('div');
+      more.className = 'tc-empty';
+      more.textContent = '… ' + (lines.length - MAX) + ' more lines';
+      body.appendChild(more);
+    }
+    const sz = meta && meta.bytes != null ? tcBytes(meta.bytes) : tcBytes(content.length);
+    return tcFileCard(a.path, 1, sz, body);
+  }
+  if (name === 'read_file' || name === 'collect_context') {
+    // Show the read result text with line numbers when we can infer a start.
+    // The result already includes a header line we keep as-is in a <pre>-like body.
+    const card = document.createElement('div');
+    const text = String(result || '');
+    if (name === 'read_file' && meta && meta.start != null) {
+      const lines = text.split('\\n');
+      // Drop the tool's own "# path (lines a-b)" header line if present.
+      const bodyLines = lines.length && /^#\\s/.test(lines[0]) ? lines.slice(1) : lines;
+      const rows = bodyLines.map((t, i) => ({ kind: 'ctx', newNo: Number(meta.start) + i, text: t }));
+      const code = tcCodeBlock(rows, 'plain');
+      const metaText = (meta.end - meta.start + 1) + ' lines · ' + (meta.totalLines || '?') + ' total'
+        + (meta.hasPendingEdits ? ' · pending' : '');
+      card.appendChild(tcFileCard(metaTextPath(meta), meta.start, metaText, code));
+      return card;
+    }
+    // collect_context: just show the raw aggregated text in a scroll box,
+    // but inside our nicer card frame with a header summarising counts.
+    const pre = document.createElement('pre');
+    pre.style.margin = '0';
+    pre.style.maxHeight = '320px';
+    pre.textContent = text.slice(0, 8000);
+    const head = (meta && meta.tasks != null) ? (meta.tasks + ' sources') : 'context';
+    card.appendChild(tcFileCard(name, 0, head, pre));
+    return card;
+  }
+  return null;
+}
+
+function metaTextPath(meta) {
+  try {
+    if (meta && meta.uri) {
+      const u = String(meta.uri);
+      return decodeURIComponent(u.replace(/^file:\\/\\//, ''));
+    }
+  } catch (_) {}
+  return (meta && meta.uri) || '';
+}
+
+// Apply rich rendering to a tool <details>. Returns true if handled.
+function applyRichTool(det, name, args, meta, result, isError, done) {
+  const RICH = { propose_edit: 1, write_file: 1, read_file: 1, collect_context: 1 };
+  if (!RICH[name]) return false;
+  const sum = det.querySelector('summary');
+  if (sum) {
+    const html = tcSummaryHtml(name, args, meta, isError, done);
+    if (html) sum.innerHTML = html;
+  }
+  if (done) {
+    // Replace the default body with the rich body if we can build one.
+    const body = tcRichBody(name, args, meta, result, isError);
+    if (body) {
+      // Remove any default <pre> dumps / arg streams we created earlier.
+      det.querySelectorAll(':scope > pre, :scope > .tool-args-stream').forEach((el) => el.remove());
+      det.appendChild(body);
+    }
+  }
+  return true;
+}
+
 function renderMarkdown(src) {
   if (!src) return '';
   const codeBlocks = [];
@@ -3693,7 +3980,9 @@ window.addEventListener('message', (e) => {
       if (toolElements.has(existingKey)) {
         const existingDet = toolElements.get(existingKey);
         const existingSum = existingDet.querySelector('summary');
-        if (existingSum) existingSum.textContent = '\u{1F527} ' + msg.payload.name + '(' + JSON.stringify(msg.payload.args).slice(0, 200) + ') \u00b7 running...';
+        if (!applyRichTool(existingDet, msg.payload.name, msg.payload.args, msg.payload.meta, null, false, false)) {
+          if (existingSum) existingSum.textContent = '\u{1F527} ' + msg.payload.name + '(' + JSON.stringify(msg.payload.args).slice(0, 200) + ') \u00b7 running...';
+        }
         delete existingDet.dataset.streaming;
         activeStreamingToolEl = null;
         break;
@@ -3701,6 +3990,7 @@ window.addEventListener('message', (e) => {
       const det = document.createElement('details');
       det.className = 'tool';
       det.dataset.running = 'true';
+      try { det._tcArgs = msg.payload.args; } catch (e) {}
       if (msg.payload.streaming) {
         det.dataset.streaming = 'true';
         activeStreamingToolEl = det;
@@ -3712,6 +4002,7 @@ window.addEventListener('message', (e) => {
       sum.textContent = '\u{1F527} ' + msg.payload.name + '(' + JSON.stringify(msg.payload.args).slice(0, 200) + ') \u00b7 running...';
       det.appendChild(sum);
       log.appendChild(det);
+      applyRichTool(det, msg.payload.name, msg.payload.args, msg.payload.meta, null, false, false);
       const key = existingKey;
       toolElements.set(key, det);
       runningTools.set(key, { name: msg.payload.name, startedAt: Date.now() });
@@ -3774,11 +4065,23 @@ window.addEventListener('message', (e) => {
       if (det) {
         det.dataset.error = String(!!msg.payload.isError);
         det.dataset.running = 'false';
-        const sum = det.querySelector('summary');
-        sum.textContent = (msg.payload.isError ? '⚠ ' : '✓ ') + msg.payload.name + ' · done';
-        const pre = document.createElement('pre');
-        pre.textContent = (msg.payload.result || '').slice(0, 4000);
-        det.appendChild(pre);
+        const endArgs = (det._tcArgs != null) ? det._tcArgs : msg.payload.args;
+        const handled = applyRichTool(
+          det,
+          msg.payload.name,
+          endArgs,
+          msg.payload.meta,
+          msg.payload.result,
+          !!msg.payload.isError,
+          true
+        );
+        if (!handled) {
+          const sum = det.querySelector('summary');
+          sum.textContent = (msg.payload.isError ? '⚠ ' : '✓ ') + msg.payload.name + ' · done';
+          const pre = document.createElement('pre');
+          pre.textContent = (msg.payload.result || '').slice(0, 4000);
+          det.appendChild(pre);
+        }
       }
       if (key) runningTools.delete(key);
       if (runningTools.size === 0) {

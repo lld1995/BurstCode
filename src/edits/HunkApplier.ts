@@ -52,6 +52,13 @@ interface PendingFile {
    * after turn N — pending edits from EARLIER, unrelated turns are preserved.
    */
   turnIndex: number;
+  /**
+   * The chat session that produced this file's edits. The banner / accept /
+   * reject actions are scoped to a single session so switching tabs shows and
+   * acts on only that session's pending edits. Empty string when queued
+   * outside any session (e.g. background explorer pre-session work).
+   */
+  sessionId: string;
 }
 
 interface DecisionListener {
@@ -141,6 +148,12 @@ export class HunkApplier implements vscode.Disposable {
    */
   private currentTurnIndex = 0;
   /**
+   * The chat session whose run is currently queuing edits. Set by the chat
+   * provider when a run starts (alongside `setCurrentTurn`) so newly-queued
+   * pending files are tagged with the owning session. Defaults to '' (unknown).
+   */
+  private currentSessionId = '';
+  /**
    * True once the diff editor for the first newly-queued file in the current
    * cycle has been opened. Reset together with `cycleInitPromise`.
    */
@@ -161,12 +174,18 @@ export class HunkApplier implements vscode.Disposable {
     );
   }
 
-  /** Snapshot of the current pending state, suitable for re-broadcasting. */
-  getPendingState(): PendingState {
+  /**
+   * Snapshot of the current pending state, suitable for re-broadcasting.
+   * When `sessionId` is provided, only files produced by that session (plus
+   * session-less files) are counted and listed, so each chat tab sees its own
+   * banner. Omit it for the legacy global view.
+   */
+  getPendingState(sessionId?: string | null): PendingState {
     let hunks = 0;
     let files = 0;
     const fileList: PendingFileSummary[] = [];
     for (const f of this.pending.values()) {
+      if (!this.matchesSession(f, sessionId)) continue;
       const pendingCount = f.hunks.filter((h) => h.status === 'pending').length;
       const acceptedCount = f.hunks.filter((h) => h.status === 'accepted').length;
       const rejectedCount = f.hunks.filter((h) => h.status === 'rejected').length;
@@ -203,6 +222,27 @@ export class HunkApplier implements vscode.Disposable {
     if (Number.isFinite(messageIndex) && messageIndex >= 0) {
       this.currentTurnIndex = messageIndex;
     }
+  }
+
+  /**
+   * Record which chat session is now queuing edits so newly-queued pending
+   * files are tagged with it. Called by the chat provider when a run starts.
+   * Enables session-scoped banner display and accept/reject.
+   */
+  setCurrentSession(sessionId: string): void {
+    this.currentSessionId = sessionId ?? '';
+  }
+
+  /**
+   * True when `file` should be shown / acted on for the given session filter.
+   * A null/undefined filter matches every file (legacy global behaviour);
+   * files queued without a session ('') are always visible so nothing is
+   * orphaned out of the UI.
+   */
+  private matchesSession(file: PendingFile, sessionId?: string | null): boolean {
+    if (sessionId === undefined || sessionId === null) return true;
+    if (!file.sessionId) return true;
+    return file.sessionId === sessionId;
   }
 
   /**
@@ -675,7 +715,8 @@ export class HunkApplier implements vscode.Disposable {
         eol: loaded.eol,
         isNewFile: loaded.isNewFile,
         lastSummary: summary,
-        turnIndex: this.currentTurnIndex
+        turnIndex: this.currentTurnIndex,
+        sessionId: this.currentSessionId
       };
       this.pending.set(key, entry);
       newlyQueued = uri;
@@ -911,14 +952,17 @@ export class HunkApplier implements vscode.Disposable {
     this.emitDecision();
   }
 
-  async acceptAll(): Promise<void> {
+  async acceptAll(sessionId?: string | null): Promise<void> {
     // Per-file lock so concurrent propose_edits on different files keep
     // running in parallel; same-file ones serialize against the flush. The
     // `this.pending.has(...)` re-check inside the lock guards against a
     // file being drained by a per-hunk decision between our snapshot and
     // lock acquisition. No disk writes needed — disk already matches the
-    // accepted state.
-    const snapshot = Array.from(this.pending.values());
+    // accepted state. When `sessionId` is given, only that session's files
+    // are accepted so a tab switch never decides another session's edits.
+    const snapshot = Array.from(this.pending.values()).filter((f) =>
+      this.matchesSession(f, sessionId)
+    );
     await Promise.all(
       snapshot.map((file) =>
         this.withFileLock(file.uri.toString(), async () => {
@@ -931,12 +975,15 @@ export class HunkApplier implements vscode.Disposable {
     this.emitDecision();
   }
 
-  async rejectAll(): Promise<void> {
+  async rejectAll(sessionId?: string | null): Promise<void> {
     // Reject all pending hunks AND roll each file's disk content back to
     // exclude every newly-rejected hunk. Files whose accepted hunks are
     // already permanent stay at their accepted content; brand-new files
-    // with no accepted hunks are removed from disk entirely.
-    const snapshot = Array.from(this.pending.values());
+    // with no accepted hunks are removed from disk entirely. When `sessionId`
+    // is given, only that session's files are rejected.
+    const snapshot = Array.from(this.pending.values()).filter((f) =>
+      this.matchesSession(f, sessionId)
+    );
     await Promise.all(
       snapshot.map((file) =>
         this.withFileLock(file.uri.toString(), async () => {

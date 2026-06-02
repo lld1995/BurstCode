@@ -377,11 +377,13 @@ export function buildWriteFileTool(): Tool {
       const nodePath = await import('path');
       try {
         await fsModule.mkdir(nodePath.dirname(uri.fsPath), { recursive: true });
+        let existed = false;
+        try { await fsModule.access(uri.fsPath); existed = true; } catch { existed = false; }
         await fsModule.writeFile(uri.fsPath, content, 'utf8');
         const relPath = vscode.workspace.asRelativePath(uri);
         return {
           content: `Written ${content.split(/\r?\n/).length} line(s) to ${relPath}`,
-          meta: { uri: uri.toString(), bytes: Buffer.byteLength(content, 'utf8') }
+          meta: { uri: uri.toString(), bytes: Buffer.byteLength(content, 'utf8'), created: !existed }
         };
       } catch (err) {
         return { content: `write_file failed: ${String((err as Error).message ?? err)}`, isError: true };
