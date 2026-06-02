@@ -3295,7 +3295,10 @@ function tcRichBody(name, args, meta, result, isError) {
       const lines = text.split('\\n');
       // Drop the tool's own "# path (lines a-b)" header line if present.
       const bodyLines = lines.length && /^#\\s/.test(lines[0]) ? lines.slice(1) : lines;
-      const rows = bodyLines.map((t, i) => ({ kind: 'ctx', newNo: Number(meta.start) + i, text: t }));
+      // read_file prefixes every content line with a right-padded line number
+      // followed by a tab ("    1\\t<code>"). The panel renders its own number in
+      // the .tc-ln gutter, so strip that prefix to avoid showing it twice.
+      const rows = bodyLines.map((t, i) => ({ kind: 'ctx', newNo: Number(meta.start) + i, text: String(t).replace(/^\\s*\\d+\\t/, '') }));
       const code = tcCodeBlock(rows, 'plain');
       const metaText = (meta.end - meta.start + 1) + ' lines · ' + (meta.totalLines || '?') + ' total'
         + (meta.hasPendingEdits ? ' · pending' : '');
