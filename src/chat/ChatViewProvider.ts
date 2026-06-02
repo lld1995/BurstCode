@@ -3510,7 +3510,53 @@ function renderMarkdown(src) {
   // Escape HTML now that code segments are extracted.
   text = escapeHtml(text);
 
-  // Block-level transforms operate line-by-line.
+  // Parse block-level structure. Recursive containers (blockquotes) call
+  // renderBlocks (NOT renderMarkdown) so they SHARE the codeBlocks/inlineCodes
+  // arrays extracted above. The previous code recursed via renderMarkdown,
+  // which re-ran extraction on text that already contained \\u0000INLINECODE
+  // placeholders -- its fresh (empty) inlineCodes array then made every
+  // placeholder restore to undefined, and raw.trim() later threw, truncating
+  // the whole message at the first blockquote.
+  let html = renderBlocks(text, codeBlocks, inlineCodes);
+
+  // Restore inline code — detect @file-path citations and make them clickable
+  html = html.replace(/\\u0000INLINECODE(\\d+)\\u0000/g, (m, idx) => {
+    const raw = inlineCodes[+idx];
+    if (raw == null) return '';
+    const fp = parseFilePath(raw);
+    if (fp) {
+      const label = escapeHtml(fileDisplayLabel(fp.path, fp.line, fp.end));
+      return '<a class="file-link" href="#" data-file-path="' + escapeHtml(fp.path) + '" data-file-line="' + fp.line + '" title="' + escapeHtml(fp.path + (fp.line ? ':' + fp.line : '')) + '"><code>' + label + '</code></a>';
+    }
+    const sym = /^([A-Za-z_$][\w$.]*)\(\s*\)$/.exec(raw.trim());
+    if (sym) {
+      return '<a class="symbol-link" href="#" data-symbol-name="' + escapeHtml(sym[1]) + '" title="Go to: ' + escapeHtml(sym[1]) + '"><code>' + escapeHtml(raw) + '</code></a>';
+    }
+    return '<code>' + escapeHtml(raw) + '</code>';
+  });
+  // Restore fenced code blocks — detect @file-path lang to render clickable header
+  html = html.replace(/\\u0000CODEBLOCK(\\d+)\\u0000/g, (m, idx) => {
+    const { lang, code } = codeBlocks[+idx];
+    const fp = lang ? parseFilePath(lang) : null;
+    if (fp) {
+      const ext = fp.path.split('.').pop() || 'text';
+      const langAttr = ' class="language-' + escapeHtml(ext) + '"';
+      const label = escapeHtml(fileDisplayLabel(fp.path, fp.line, fp.end));
+      const head = '<div class="code-head"><a class="file-link" href="#" data-file-path="' + escapeHtml(fp.path) + '" data-file-line="' + fp.line + '" title="' + escapeHtml(fp.path + (fp.line ? ':' + fp.line : '')) + '">' + label + '</a><button class="copy" type="button" title="Copy">⧉</button></div>';
+      return '<pre>' + head + '<code' + langAttr + '>' + escapeHtml(code) + '</code></pre>';
+    }
+    const langAttr = lang ? ' class="language-' + escapeHtml(lang) + '"' : '';
+    const head = '<div class="code-head"><span class="lang">' + (lang ? escapeHtml(lang) : 'text') + '</span><button class="copy" type="button" title="Copy">⧉</button></div>';
+    return '<pre>' + head + '<code' + langAttr + '>' + escapeHtml(code) + '</code></pre>';
+  });
+  return html;
+}
+
+// Block-level parser. Operates on text whose code segments have ALREADY been
+// replaced with \\u0000CODEBLOCK / \\u0000INLINECODE placeholders and HTML-escaped
+// by renderMarkdown. codeBlocks/inlineCodes are threaded through so nested
+// containers (blockquotes) can recurse here WITHOUT re-extracting placeholders.
+function renderBlocks(text, codeBlocks, inlineCodes) {
   const lines = text.split('\\n');
   const out = [];
   let i = 0;
@@ -3535,14 +3581,15 @@ function renderMarkdown(src) {
       i++;
       continue;
     }
-    // Blockquote (consecutive)
+    // Blockquote (consecutive). Recurse into renderBlocks with the SAME
+    // placeholder arrays so inline code inside the quote resolves correctly.
     if (/^\\s*&gt;\\s?/.test(line)) {
       const buf = [];
       while (i < lines.length && /^\\s*&gt;\\s?/.test(lines[i])) {
         buf.push(lines[i].replace(/^\\s*&gt;\\s?/, ''));
         i++;
       }
-      out.push('<blockquote>' + renderMarkdown(buf.join('\\n')) + '</blockquote>');
+      out.push('<blockquote>' + renderBlocks(buf.join('\\n'), codeBlocks, inlineCodes) + '</blockquote>');
       continue;
     }
     // Unordered list
@@ -3574,12 +3621,12 @@ function renderMarkdown(src) {
         bodyRows.push(splitTableRow(lines[i]));
         i++;
       }
-      let html = '<table><thead><tr>' + headerCells.map((c) => '<th>' + applyInline(c) + '</th>').join('') + '</tr></thead>';
+      let tbl = '<table><thead><tr>' + headerCells.map((c) => '<th>' + applyInline(c) + '</th>').join('') + '</tr></thead>';
       if (bodyRows.length) {
-        html += '<tbody>' + bodyRows.map((row) => '<tr>' + row.map((c) => '<td>' + applyInline(c) + '</td>').join('') + '</tr>').join('') + '</tbody>';
+        tbl += '<tbody>' + bodyRows.map((row) => '<tr>' + row.map((c) => '<td>' + applyInline(c) + '</td>').join('') + '</tr>').join('') + '</tbody>';
       }
-      html += '</table>';
-      out.push(html);
+      tbl += '</table>';
+      out.push(tbl);
       continue;
     }
     // Code-block placeholder line — emit as-is
@@ -3606,39 +3653,7 @@ function renderMarkdown(src) {
     }
     flushParagraph(buf);
   }
-
-  let html = out.join('\\n');
-
-  // Restore inline code — detect @file-path citations and make them clickable
-  html = html.replace(/\\u0000INLINECODE(\\d+)\\u0000/g, (m, idx) => {
-    const raw = inlineCodes[+idx];
-    const fp = parseFilePath(raw);
-    if (fp) {
-      const label = escapeHtml(fileDisplayLabel(fp.path, fp.line, fp.end));
-      return '<a class="file-link" href="#" data-file-path="' + escapeHtml(fp.path) + '" data-file-line="' + fp.line + '" title="' + escapeHtml(fp.path + (fp.line ? ':' + fp.line : '')) + '"><code>' + label + '</code></a>';
-    }
-    const sym = /^([A-Za-z_$][\w$.]*)\(\s*\)$/.exec(raw.trim());
-    if (sym) {
-      return '<a class="symbol-link" href="#" data-symbol-name="' + escapeHtml(sym[1]) + '" title="Go to: ' + escapeHtml(sym[1]) + '"><code>' + escapeHtml(raw) + '</code></a>';
-    }
-    return '<code>' + escapeHtml(raw) + '</code>';
-  });
-  // Restore fenced code blocks — detect @file-path lang to render clickable header
-  html = html.replace(/\\u0000CODEBLOCK(\\d+)\\u0000/g, (m, idx) => {
-    const { lang, code } = codeBlocks[+idx];
-    const fp = lang ? parseFilePath(lang) : null;
-    if (fp) {
-      const ext = fp.path.split('.').pop() || 'text';
-      const langAttr = ' class="language-' + escapeHtml(ext) + '"';
-      const label = escapeHtml(fileDisplayLabel(fp.path, fp.line, fp.end));
-      const head = '<div class="code-head"><a class="file-link" href="#" data-file-path="' + escapeHtml(fp.path) + '" data-file-line="' + fp.line + '" title="' + escapeHtml(fp.path + (fp.line ? ':' + fp.line : '')) + '">' + label + '</a><button class="copy" type="button" title="Copy">⧉</button></div>';
-      return '<pre>' + head + '<code' + langAttr + '>' + escapeHtml(code) + '</code></pre>';
-    }
-    const langAttr = lang ? ' class="language-' + escapeHtml(lang) + '"' : '';
-    const head = '<div class="code-head"><span class="lang">' + (lang ? escapeHtml(lang) : 'text') + '</span><button class="copy" type="button" title="Copy">⧉</button></div>';
-    return '<pre>' + head + '<code' + langAttr + '>' + escapeHtml(code) + '</code></pre>';
-  });
-  return html;
+  return out.join('\\n');
 }
 
 function splitTableRow(line) {
