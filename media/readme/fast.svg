@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="64" height="64" role="img" aria-label="Fast">
+  <defs>
+    <linearGradient id="fast-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="fast-bolt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FDE68A"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="84" height="84" rx="22" fill="url(#fast-bg)"/>
+  <rect x="6.75" y="6.75" width="82.5" height="82.5" rx="21.25" fill="none" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1.5"/>
+  <line x1="22" y1="34" x2="38" y2="34" stroke="#FFFFFF" stroke-opacity="0.4" stroke-width="3" stroke-linecap="round"/>
+  <line x1="18" y1="48" x2="34" y2="48" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="3" stroke-linecap="round"/>
+  <line x1="22" y1="62" x2="38" y2="62" stroke="#FFFFFF" stroke-opacity="0.4" stroke-width="3" stroke-linecap="round"/>
+  <path d="M58 16 L40 52 L52 52 L46 80 L72 42 L58 42 L66 16 Z" fill="url(#fast-bolt)" stroke="#FFFFFF" stroke-opacity="0.9" stroke-width="2.5" stroke-linejoin="round"/>
+</svg>

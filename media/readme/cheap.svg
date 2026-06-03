@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="64" height="64" role="img" aria-label="Cheap">
+  <defs>
+    <linearGradient id="cheap-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="cheap-coin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FDE68A"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="84" height="84" rx="22" fill="url(#cheap-bg)"/>
+  <rect x="6.75" y="6.75" width="82.5" height="82.5" rx="21.25" fill="none" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1.5"/>
+  <ellipse cx="40" cy="34" rx="20" ry="9" fill="none" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="3"/>
+  <path d="M20 34 V58 C20 63 29 67 40 67 C51 67 60 63 60 58 V34" fill="none" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="3" stroke-linecap="round"/>
+  <path d="M20 46 C20 51 29 55 40 55 C51 55 60 51 60 46" fill="none" stroke="#FFFFFF" stroke-opacity="0.3" stroke-width="2.5"/>
+  <circle cx="62" cy="60" r="18" fill="url(#cheap-coin)" stroke="#FFFFFF" stroke-opacity="0.9" stroke-width="2.5"/>
+  <path d="M62 50 V70 M57 55 C57 52 67 52 67 55 C67 58 57 58 57 61 C57 64 67 64 67 61" fill="none" stroke="#92400E" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

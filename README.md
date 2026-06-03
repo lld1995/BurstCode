@@ -4,9 +4,19 @@
 
 # BurstCode
 
-**面向 VS Code 的 Windsurf 风格自主编码 Agent —— 完全由你自己的本地 OpenAI 兼容大模型驱动。**
+**面向 VS Code 的自主编码 Agent —— 精准、高速、省钱，完全由你自己的本地 OpenAI 兼容大模型驱动。**
 
-与你的代码库对话，让 Agent 跨文件读取、搜索、编辑、构建与测试 —— 全部运行在你自己掌控的端点上（Ollama、vLLM、LM Studio、llama.cpp，或任意兼容 `/v1` 的服务）。无需云端账号、无遥测、无按 token 计费。
+与你的代码库对话，让 Agent 跨文件读取、搜索、编辑、构建与测试 —— 全部运行在你自己掌控的端点上（Ollama、vLLM、LM Studio、llama.cpp，或任意兼容 `/v1` 的服务）。
+
+<table>
+<tr>
+<td align="center" width="33%"><img src="media/readme/precise.svg" width="56" height="56" alt="精准" /><br/><b>精准</b></td>
+<td align="center" width="33%"><img src="media/readme/fast.svg" width="56" height="56" alt="高速" /><br/><b>高速</b></td>
+<td align="center" width="33%"><img src="media/readme/cheap.svg" width="56" height="56" alt="省钱" /><br/><b>省钱</b></td>
+</tr>
+</table>
+
+**精准 · 高速 · 省钱 —— 这三点，就是 BurstCode 的全部。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![VS Code ^1.106](https://img.shields.io/badge/VS%20Code-%5E1.106-007ACC.svg) ![Local LLM](https://img.shields.io/badge/LLM-local%20%2F%20OpenAI--compatible-success.svg)
 
@@ -18,30 +28,60 @@
 
 ## 目录
 
-- [为什么选择 BurstCode](#为什么选择-burstcode)
-- [功能特性](#功能特性)
-- [环境要求](#环境要求)
-- [安装](#安装)
-- [配置你的大模型](#配置你的大模型)
-- [使用方法](#使用方法)
-- [Agent 工具箱](#agent-工具箱)
-- [后台代码探索器](#后台代码探索器)
-- [命令](#命令)
-- [配置项参考](#配置项参考)
-- [从源码构建](#从源码构建)
-- [常见问题](#常见问题)
-- [许可证](#许可证)
+- [BurstCode](#burstcode)
+  - [目录](#目录)
+  - [为什么选择 BurstCode](#为什么选择-burstcode)
+    - [ 精准 —— 改对，而不是改多](#-精准--改对而不是改多)
+    - [ 高速 —— 一次往返，做完该做的](#-高速--一次往返做完该做的)
+    - [ 省钱 —— 0 云端账单，本地即算力](#-省钱--0-云端账单本地即算力)
+  - [功能特性](#功能特性)
+  - [环境要求](#环境要求)
+  - [安装](#安装)
+    - [从 VS Code 扩展商店安装（推荐）](#从-vs-code-扩展商店安装推荐)
+    - [通过 `.vsix` 安装（离线 / 预发布）](#通过-vsix-安装离线--预发布)
+    - [自行构建 `.vsix`](#自行构建-vsix)
+  - [配置你的大模型](#配置你的大模型)
+  - [使用方法](#使用方法)
+    - [打开聊天](#打开聊天)
+    - [与 Agent 对话](#与-agent-对话)
+    - [审查改动](#审查改动)
+    - [回滚整个回合](#回滚整个回合)
+  - [Agent 工具箱](#agent-工具箱)
+  - [后台代码探索器](#后台代码探索器)
+  - [命令](#命令)
+  - [配置项参考](#配置项参考)
+    - [大模型配置档](#大模型配置档)
+    - [Agent 循环](#agent-循环)
+    - [Shell](#shell)
+    - [后台探索器](#后台探索器)
+    - [上下文与其它](#上下文与其它)
+  - [从源码构建](#从源码构建)
+  - [常见问题](#常见问题)
+  - [许可证](#许可证)
 
 ---
 
 ## 为什么选择 BurstCode
 
-大多数 Agent 类编码插件都默认你会把代码发送到托管的前沿模型。BurstCode 的设计前提恰恰相反：**模型运行在你本地。** 把它指向任意 OpenAI 兼容的 `/v1` 端点，它就会像一个完整的自主 Agent 一样工作 —— 规划多步任务、批量调用工具、以“先审查再回滚”的 diff 流程编辑文件、运行你的构建与测试，甚至在你工作时于后台探索代码库。
+市面上的 Agent 类编码插件大多默认你会把代码发往托管的云端前沿模型，按 token 收费、还要交出源码。BurstCode 围绕三个核心理念重新设计 —— **精准、高速、省钱**，并完全运行在你本地掌控的模型上。
 
-- **100% 本地优先** —— 除非*你*把端点指向远程服务器，否则你的源码不会离开本机。
+### <img src="media/readme/precise.svg" width="22" height="22" align="absmiddle" alt="" /> 精准 —— 改对，而不是改多
+
+- **理解 LSP，而非盲搜** —— 用语言服务（跳转定义、查引用、查实现、悬停类型）定位代码，重构能正确理解作用域与再导出，不会误伤同名符号。
+- **先审查再落地** —— 每次改动都以可逐块 Accept / Reject 的 diff 呈现，外加 Git 检查点随时整体回滚，改动可控、可追溯。
+- **长期记忆** —— 记录你的纠正与项目约定，越用越懂你的代码风格。
+
+### <img src="media/readme/fast.svg" width="22" height="22" align="absmiddle" alt="" /> 高速 —— 一次往返，做完该做的
+
+- **批量上下文收集** —— `collect_context` 在单次往返中并发执行读取 + grep + 目录列举 + 大纲，少绕路、少等待。
+- **并发子 Agent** —— 把隔离探索与并行编辑下放给拥有独立上下文窗口的专注子 Agent，互不阻塞。
+- **自主续跑** —— Agent 循环会规划、批量调用工具、卡住时自我纠正，并跨越 token 上限/流中断边界自动续跑，无需你反复催。
+
+### <img src="media/readme/cheap.svg" width="22" height="22" align="absmiddle" alt="" /> 省钱 —— 0 云端账单，本地即算力
+
+- **100% 本地优先** —— 除非*你*把端点指向远程服务器，否则源码不出本机，**无云端账号、无遥测、无按 token 计费**。
 - **自带模型** —— Qwen-Coder、DeepSeek-Coder、Llama、Codestral……凡是你的服务在 `/v1/models` 暴露的都可用。
-- **两套独立配置档** —— 聊天用快/大的模型，后台用更便宜的模型。
-- **理解 LSP** —— 它使用语言服务（跳转定义、查引用、查实现、悬停类型）而非盲目的文本搜索，因此重构能理解作用域与再导出。
+- **两套独立配置档** —— 聊天用快/大的模型，后台用更便宜的小模型，把算力花在刀刃上。
 
 ---
 

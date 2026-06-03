@@ -4,9 +4,19 @@
 
 # BurstCode
 
-**A Windsurf-style autonomous coding agent for VS Code — powered entirely by your own local, OpenAI-compatible LLMs.**
+**An autonomous coding agent for VS Code — Precise, Fast, and Cheap, powered entirely by your own local, OpenAI-compatible LLMs.**
 
-Chat with your codebase, let the agent read, search, edit, build and test across files — all running against an endpoint you control (Ollama, vLLM, LM Studio, llama.cpp, or any `/v1`-compatible server). No cloud account, no telemetry, no per-token bill.
+Chat with your codebase, let the agent read, search, edit, build and test across files — all running against an endpoint you control (Ollama, vLLM, LM Studio, llama.cpp, or any `/v1`-compatible server).
+
+<table>
+<tr>
+<td align="center" width="33%"><img src="media/readme/precise.svg" width="56" height="56" alt="Precise" /><br/><b>Precise</b></td>
+<td align="center" width="33%"><img src="media/readme/fast.svg" width="56" height="56" alt="Fast" /><br/><b>Fast</b></td>
+<td align="center" width="33%"><img src="media/readme/cheap.svg" width="56" height="56" alt="Cheap" /><br/><b>Cheap</b></td>
+</tr>
+</table>
+
+**Precise · Fast · Cheap — those three things are what BurstCode is all about.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![VS Code ^1.106](https://img.shields.io/badge/VS%20Code-%5E1.106-007ACC.svg) ![Local LLM](https://img.shields.io/badge/LLM-local%20%2F%20OpenAI--compatible-success.svg)
 
@@ -36,12 +46,25 @@ Chat with your codebase, let the agent read, search, edit, build and test across
 
 ## Why BurstCode
 
-Most agentic coding extensions assume you are sending your code to a hosted frontier model. BurstCode is built around the opposite assumption: **the model runs where you do.** Point it at any OpenAI-compatible `/v1` endpoint and it behaves like a full autonomous agent — planning multi-step work, batching tool calls, editing files with a review-and-rollback diff workflow, running your build and tests, and even exploring your codebase in the background while you work.
+Most agentic coding extensions assume you'll ship your code to a hosted, cloud frontier model — metered per token, with your source leaving the building. BurstCode is built around three principles instead — **Precise, Fast, and Cheap** — running entirely on models you control locally.
 
-- **100% local-first** — your source never leaves your machine unless *you* point the endpoint at a remote server.
+### <img src="media/readme/precise.svg" width="22" height="22" align="absmiddle" alt="" /> Precise — change the right thing, not everything
+
+- **LSP-aware, not blind text search** — it locates code via the language server (go-to-def, references, implementations, hover), so refactors understand scope and re-exports and never clobber a same-named symbol.
+- **Review before it lands** — every change is shown as a diff with per-hunk Accept / Reject, plus Git checkpoints to roll the whole workspace back at any time — controlled and traceable.
+- **Long-term memory** — records your corrections and project conventions, so it understands your codebase better the more you use it.
+
+### <img src="media/readme/fast.svg" width="22" height="22" align="absmiddle" alt="" /> Fast — one round-trip, done right
+
+- **Batched context collection** — `collect_context` fans out reads + greps + dir listings + outlines in a single round-trip, so the agent stops backtracking and waiting.
+- **Concurrent sub-agents** — offload isolated exploration and parallel edits to focused sub-agents with their own context windows, without blocking each other.
+- **Autonomous continuation** — the agent loop plans, batches tool calls, self-corrects when stuck, and auto-continues across token-limit / stream-interruption boundaries — no babysitting.
+
+### <img src="media/readme/cheap.svg" width="22" height="22" align="absmiddle" alt="" /> Cheap — zero cloud bill, your hardware is the compute
+
+- **100% local-first** — your source never leaves your machine unless *you* point the endpoint at a remote server: **no cloud account, no telemetry, no per-token bill.**
 - **Bring your own model** — Qwen-Coder, DeepSeek-Coder, Llama, Codestral… anything your server exposes at `/v1/models`.
-- **Two independent profiles** — a fast/large model for chat, a cheaper one for background work.
-- **LSP-aware** — it uses the language server (go-to-def, references, implementations, hover) instead of blind text search, so refactors understand scope and re-exports.
+- **Two independent profiles** — a fast/large model for chat and a cheaper, smaller one for background work, so you spend compute where it matters.
 
 ---
 
