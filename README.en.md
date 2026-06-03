@@ -61,15 +61,17 @@ Most agentic coding extensions assume you'll ship your code to a hosted, cloud f
 - **Concurrent sub-agents** — offload isolated exploration and parallel edits to focused sub-agents with their own context windows, without blocking each other.
 - **Autonomous continuation** — the agent loop plans, batches tool calls, self-corrects when stuck, and auto-continues across token-limit / stream-interruption boundaries — no babysitting.
 
-### <img src="media/readme/cheap.svg" width="22" height="22" align="absmiddle" alt="" /> Cheap — zero cloud bill, your hardware is the compute
+### <img src="media/readme/cheap.svg" width="22" height="22" align="absmiddle" alt="" /> Cheap — get the task done with the fewest tokens
 
-- **100% local-first** — your source never leaves your machine unless *you* point the endpoint at a remote server: **no cloud account, no telemetry, no per-token bill.**
-- **Bring your own model** — Qwen-Coder, DeepSeek-Coder, Llama, Codestral… anything your server exposes at `/v1/models`.
+- **Context-length control** — zone-based compression of past turns and automatic archiving of finished topics keep the context window lean, so you don't reburn tokens dragging a bloated context into every request.
+- **Request-frequency control** — parallel tool calls per turn, plan-then-act, and self-correction when stuck drive the number of LLM round-trips for a task to the minimum.
+- **Heavy lifting offloaded to sub-agents** — broad search and file reading run in isolated sub-agent contexts that return only a concise summary, so the main loop never gets blown up by raw file content.
 - **Two independent profiles** — a fast/large model for chat and a cheaper, smaller one for background work, so you spend compute where it matters.
 
 ### <img src="media/readme/secure.svg" width="22" height="22" align="absmiddle" alt="" /> Secure — your code stays local, every change is controlled and reversible
 
-- **Your data never leaves the machine** — unless *you* point the endpoint at a remote server, your source, prompts and context stay local: no cloud account, no telemetry.
+- **100% local-first** — unless *you* point the endpoint at a remote server, your source, prompts and context stay on your machine: **no cloud account, no telemetry, no per-token bill.**
+- **Bring your own model** — Qwen-Coder, DeepSeek-Coder, Llama, Codestral… anything your server exposes at `/v1/models`; model and data stay under your control.
 - **Every step is reviewable** — changes land as per-hunk Accept / Reject diffs and shell commands are gated by approval, so nothing touches your code or environment behind your back.
 - **Reversible at any time** — a Git checkpoint is taken before each agent turn, so one click rolls the whole workspace back if a turn goes the wrong way.
 
