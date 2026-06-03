@@ -903,7 +903,69 @@ export class HunkApplier implements vscode.Disposable {
     await this.openDiffForEntry(entry);
   }
 
-  private async openDiffForEntry(entry: PendingFile): Promise<void> {
+  /**
+   * Resolve a pending file by its source uri-key (`uri.toString()`) OR by a
+   * workspace-relative / absolute path, open the accept/reject diff editor for
+   * it, and scroll the RIGHT (current) pane to the nearest changed hunk so the
+   * user lands on the most relevant edit. Returns true when a pending entry was
+   * found and the diff was opened; false otherwise so callers can fall back to
+   * plainly opening the file.
+   *
+   * `preferLine` (1-indexed) biases which hunk is revealed — the hunk whose
+   * modified range is closest to it wins. When omitted, the first pending hunk
+   * (else the first hunk) is used.
+   */
+  async revealEditInDiff(uriKeyOrPath: string, preferLine?: number): Promise<boolean> {
+    const entry = this.resolvePendingEntry(uriKeyOrPath);
+    if (!entry) return false;
+    await this.openDiffForEntry(entry, preferLine);
+    return true;
+  }
+
+  /** True when the given uri-key / path currently has queued hunks. */
+  hasPendingForPath(uriKeyOrPath: string): boolean {
+    return !!this.resolvePendingEntry(uriKeyOrPath);
+  }
+
+  /**
+   * Look up a pending file by either its source `uri.toString()` key or a
+   * workspace-relative / absolute fs path. The webview's propose_edit cards
+   * only know the path string the model supplied, so we accept both forms.
+   */
+  private resolvePendingEntry(uriKeyOrPath: string): PendingFile | undefined {
+    const raw = String(uriKeyOrPath || '').trim();
+    if (!raw) return undefined;
+    // Fast path: exact uri-key match.
+    const direct = this.pending.get(raw);
+    if (direct) return direct;
+    // Resolve the path to an absolute fsPath and match by uri-key.
+    let uri: vscode.Uri | undefined;
+    try {
+      if (raw.startsWith('file://')) {
+        uri = vscode.Uri.parse(raw);
+      } else if (raw.startsWith('/') || (raw.length > 2 && raw[1] === ':')) {
+        uri = vscode.Uri.file(raw);
+      } else {
+        const folder = vscode.workspace.workspaceFolders?.[0];
+        if (folder) uri = vscode.Uri.joinPath(folder.uri, raw);
+      }
+    } catch {
+      uri = undefined;
+    }
+    if (uri) {
+      const byUri = this.pending.get(uri.toString());
+      if (byUri) return byUri;
+    }
+    // Last resort: match by normalized basename-relative path comparison.
+    const norm = raw.replace(/\\/g, '/').replace(/^\.\//, '');
+    for (const f of this.pending.values()) {
+      if (this.workspaceRelative(f.uri) === norm) return f;
+      if (f.uri.fsPath.replace(/\\/g, '/').endsWith('/' + norm)) return f;
+    }
+    return undefined;
+  }
+
+  private async openDiffForEntry(entry: PendingFile, preferLine?: number): Promise<void> {
     // Diff layout: LEFT = frozen original snapshot, RIGHT = live file on
     // disk (which has been eagerly updated with the proposed edits so the
     // user can compile/run before deciding). For brand-new files the
@@ -915,6 +977,49 @@ export class HunkApplier implements vscode.Disposable {
       entry.uri,
       `BurstCode • ${path.basename(entry.uri.fsPath)} (Original ↔ Current)`
     );
+    // After the diff opens, reveal the nearest changed hunk in the active
+    // (RIGHT / current) editor so the user jumps straight to the most recent
+    // change rather than landing at the top of the file.
+    try {
+      await this.revealNearestHunk(entry, preferLine);
+    } catch {
+      /* best-effort scroll; never fail the open */
+    }
+  }
+
+  /**
+   * Scroll + select the modified-coordinate range of the most relevant queued
+   * hunk in the currently active editor. Prefers the hunk nearest `preferLine`
+   * when supplied; otherwise the first pending hunk (else the first hunk).
+   */
+  private async revealNearestHunk(entry: PendingFile, preferLine?: number): Promise<void> {
+    const ranges = this.getHunkRangesInModifiedCoords(entry.uri);
+    if (!ranges.length) return;
+    let target = ranges.find((r) => r.status === 'pending') ?? ranges[0];
+    if (typeof preferLine === 'number' && preferLine > 0) {
+      let best = target;
+      let bestDist = Infinity;
+      for (const r of ranges) {
+        const center = r.modStart > r.modEnd ? r.modStart : (r.modStart + r.modEnd) / 2;
+        const dist = Math.abs(center - preferLine);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = r;
+        }
+      }
+      target = best;
+    }
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return;
+    // modStart is 1-indexed; pure deletions encode as modStart > modEnd, in
+    // which case point the cursor just before the deletion site.
+    const startLine0 = Math.max(0, target.modStart - 1);
+    const endLine0 = target.modEnd >= target.modStart
+      ? Math.max(0, target.modEnd - 1)
+      : startLine0;
+    const range = new vscode.Range(startLine0, 0, endLine0, 0);
+    editor.selection = new vscode.Selection(range.start, range.start);
+    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
   }
 
   async acceptHunk(hunkId: string): Promise<void> {

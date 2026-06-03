@@ -635,6 +635,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         break;
       }
+      case 'review-edit-file': {
+        // Clicking a file inside a propose_edit card: open the accept/reject
+        // diff editor and scroll to the nearest change. If the file no longer
+        // has pending edits (already accepted/rejected), fall back to opening
+        // the file at the changed line.
+        const p = (msg.payload ?? {}) as { path?: string; line?: number };
+        const filePath = String(p.path ?? '').trim();
+        if (!filePath) break;
+        const line = typeof p.line === 'number' && p.line > 0 ? p.line : undefined;
+        try {
+          const opened = await this.applier.revealEditInDiff(filePath, line);
+          if (!opened) {
+            await this.handleMessage({ type: 'open-file', payload: { path: filePath, line: line ?? 0 } });
+          }
+        } catch (err) {
+          this.logger.warn('review-edit-file failed', String(err));
+        }
+        break;
+      }
       case 'rollback': {
         const payload = (msg.payload ?? {}) as { ref?: string; messageIndex?: number };
         await this.rollbackToCheckpoint(String(payload.ref ?? ''), Number(payload.messageIndex ?? -1));
@@ -1768,6 +1787,8 @@ setTimeout(() => {
   .tc-file { margin: 4px 0 6px 4px; border: 1px solid var(--vscode-panel-border); border-radius: 5px; overflow: hidden; background: var(--vscode-editor-background); }
   .tc-file-head { display: flex; align-items: center; gap: 8px; padding: 4px 8px; background: var(--vscode-editorWidget-background); border-bottom: 1px solid var(--vscode-panel-border); font-size: 0.92em; }
   .tc-file-head .tc-file-name { color: var(--vscode-textLink-foreground); cursor: pointer; }
+  .tc-file-head .tc-file-name:hover { text-decoration: underline; }
+  .tc-file-head .tc-file-name.tc-file-name-review { color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground)); }
   .tc-file-head .tc-file-name:hover { text-decoration: underline; }
   .tc-file-head .tc-file-meta { margin-left: auto; opacity: 0.7; font-size: 0.9em; white-space: nowrap; }
   .tc-code { margin: 0; padding: 0; overflow: auto; max-height: 320px; font-family: var(--vscode-editor-font-family); font-size: 0.92em; line-height: 1.5; background: var(--vscode-editor-background); }
@@ -3109,13 +3130,24 @@ function tcBaseName(p) {
   return m[m.length - 1] || s;
 }
 
-function tcFileLink(path, line) {
+function tcFileLink(path, line, opts) {
   const a = document.createElement('span');
   a.className = 'tc-file-name';
   a.textContent = tcBaseName(path) + (line ? ':' + line : '');
-  a.title = String(path || '');
+  // propose_edit cards open the accept/reject diff editor (and jump to the
+  // nearest change); other cards just open the file at the given line.
+  const review = !!(opts && opts.review);
+  a.title = review
+    ? '查看改动 (diff · 接受/拒绝) — ' + String(path || '')
+    : String(path || '');
+  if (review) a.classList.add('tc-file-name-review');
   a.addEventListener('click', () => {
-    if (path) vscode.postMessage({ type: 'open-file', payload: { path: path, line: line || 0 } });
+    if (!path) return;
+    if (review) {
+      vscode.postMessage({ type: 'review-edit-file', payload: { path: path, line: line || 0 } });
+    } else {
+      vscode.postMessage({ type: 'open-file', payload: { path: path, line: line || 0 } });
+    }
   });
   return a;
 }
@@ -3183,12 +3215,12 @@ function tcCodeBlock(rows, mode) {
   return code;
 }
 
-function tcFileCard(path, line, metaText, body) {
+function tcFileCard(path, line, metaText, body, opts) {
   const card = document.createElement('div');
   card.className = 'tc-file';
   const head = document.createElement('div');
   head.className = 'tc-file-head';
-  head.appendChild(tcFileLink(path, line));
+  head.appendChild(tcFileLink(path, line, opts));
   if (metaText) {
     const meta = document.createElement('span');
     meta.className = 'tc-file-meta';
@@ -3264,9 +3296,16 @@ function tcRichBody(name, args, meta, result, isError) {
     for (const e of edits) {
       const rows = tcLineDiff(e && e.oldText, e && e.newText, e && e.startLine);
       let adds = 0, dels = 0;
-      for (const r of rows) { if (r.kind === 'add') adds++; else if (r.kind === 'del') dels++; }
+      let firstChange = 0;
+      for (const r of rows) {
+        if (r.kind === 'add') { adds++; if (!firstChange && r.newNo) firstChange = r.newNo; }
+        else if (r.kind === 'del') { dels++; if (!firstChange && r.newNo) firstChange = r.newNo; }
+      }
+      const jumpLine = firstChange || (e && e.startLine) || 0;
       const body = tcCodeBlock(rows, 'diff');
-      wrap.appendChild(tcFileCard(e && e.path, e && e.startLine, '+' + adds + ' -' + dels, body));
+      // Clicking a propose_edit file opens the accept/reject diff editor and
+      // jumps to the nearest change instead of just opening the file.
+      wrap.appendChild(tcFileCard(e && e.path, jumpLine, '+' + adds + ' -' + dels, body, { review: true }));
     }
     return wrap;
   }
