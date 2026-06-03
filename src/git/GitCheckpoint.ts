@@ -407,6 +407,72 @@ export class GitCheckpoint {
     }
   }
 
+  /**
+   * Resolve the set of workspace-relative file paths whose on-disk content
+   * would actually CHANGE if `ref` were restored right now. Used to preview
+   * the rollback in the confirmation dialog so the user knows exactly which
+   * files revert. Files whose current content already matches the checkpoint
+   * blob are omitted (restoring them is a no-op). Returns an empty array for
+   * legacy git refs or when nothing resolves.
+   */
+  async listAffectedFiles(ref: string): Promise<string[]> {
+    if (!ref || !ref.startsWith(GitCheckpoint.FILE_REF_PREFIX)) return [];
+    const wsRoot = await this.workspaceRoot();
+    if (!wsRoot) return [];
+    let sourceMap: Map<string, string>;
+    try {
+      sourceMap = await this.resolveCheckpointChain(wsRoot, ref, new Set());
+    } catch {
+      return [];
+    }
+    const changed: string[] = [];
+    const checks = Array.from(sourceMap.entries()).map(([relativePath, sourcePath]) => async () => {
+      try {
+        const snapshot = await fs.promises.readFile(sourcePath, 'utf-8');
+        let current: string | null = null;
+        try {
+          current = await fs.promises.readFile(path.join(wsRoot, relativePath), 'utf-8');
+        } catch {
+          current = null; // file missing now → restore re-creates it (a change)
+        }
+        if (current !== snapshot) changed.push(relativePath);
+      } catch {
+        /* unreadable snapshot blob — skip */
+      }
+    });
+    await GitCheckpoint.runPool(checks, GitCheckpoint.IO_CONCURRENCY);
+    changed.sort();
+    return changed;
+  }
+
+  /**
+   * Return the snapshot (pre-prompt) content of a single file as captured by
+   * the given file-based checkpoint, or null when the file is NOT part of the
+   * checkpoint. A null result means the file did not exist at checkpoint time
+   * (it was created during/after the prompt) and will therefore be DELETED by
+   * a rollback rather than reverted — callers can use this to show an
+   * "empty ↔ current" (will-be-deleted) diff.
+   */
+  async getCheckpointFileSnapshot(ref: string, relativePath: string): Promise<string | null> {
+    if (!ref || !ref.startsWith(GitCheckpoint.FILE_REF_PREFIX)) return null;
+    const wsRoot = await this.workspaceRoot();
+    if (!wsRoot) return null;
+    let sourceMap: Map<string, string>;
+    try {
+      sourceMap = await this.resolveCheckpointChain(wsRoot, ref, new Set());
+    } catch {
+      return null;
+    }
+    const norm = relativePath.replace(/\\/g, '/');
+    const blobPath = sourceMap.get(relativePath) ?? sourceMap.get(norm);
+    if (!blobPath) return null;
+    try {
+      return await fs.promises.readFile(blobPath, 'utf-8');
+    } catch {
+      return null;
+    }
+  }
+
   async refExists(ref: string): Promise<boolean> {
     if (!ref) return false;
 
@@ -572,6 +638,18 @@ export class GitCheckpoint {
         const removed = await this.deleteForwardCheckpoints(wsRoot, targetTs);
         if (removed > 0) this.logger.info('Pruned forward checkpoints after rollback', { removed });
       }
+
+      // Post-restore cleanup: delete files that exist on disk but are NOT in the
+      // resolved snapshot. These are files created AFTER the checkpoint (by
+      // write_file or propose_edit new-file creation) that the snapshot doesn't
+      // know about — without this step they'd survive the rollback as orphans.
+      // We skip the checkpoint directory itself and common build artifacts.
+      const snapshotPaths = new Set(sourceMap.keys());
+      const postRestoreDeleted = await this.deleteOrphanFiles(wsRoot, wsRoot, snapshotPaths, new Set());
+      if (postRestoreDeleted > 0) {
+        this.logger.info('Deleted orphan files after restore', { count: postRestoreDeleted });
+      }
+
       return true;
     } catch (err) {
       this.logger.error('Restore failed', String(err));
@@ -630,6 +708,62 @@ export class GitCheckpoint {
       result.set(file.relativePath, path.join(checkpointDir, encoded));
     }
     return result;
+  }
+
+  /**
+   * Recursively delete files that exist on disk but are NOT in `knownPaths`.
+   * Used after checkpoint restore to clean up files created after the checkpoint.
+   * Skips the checkpoint directory itself and common build artifact dirs.
+   * Returns the count of deleted files.
+   */
+  private async deleteOrphanFiles(
+    currentDir: string,
+    baseDir: string,
+    knownPaths: Set<string>,
+    visited: Set<string>
+  ): Promise<number> {
+    const resolved = path.resolve(currentDir);
+    if (visited.has(resolved)) return 0;
+    visited.add(resolved);
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(currentDir, { withFileTypes: true });
+    } catch {
+      return 0;
+    }
+
+    let deleted = 0;
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        // Skip hidden dirs, build artifacts, and the checkpoint store itself.
+        if (entry.name.startsWith('.') || GitCheckpoint.SKIP_DIRS.has(entry.name)) continue;
+        deleted += await this.deleteOrphanFiles(fullPath, baseDir, knownPaths, visited);
+        // After processing children, try to remove the directory if empty.
+        try {
+          const remaining = await fs.promises.readdir(fullPath);
+          if (remaining.length === 0) {
+            await fs.promises.rmdir(fullPath);
+          }
+        } catch {
+          /* not empty or locked — leave it */
+        }
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (GitCheckpoint.BINARY_EXTENSIONS.has(ext)) continue;
+        const relativePath = path.relative(baseDir, fullPath);
+        if (!knownPaths.has(relativePath)) {
+          try {
+            await fs.promises.unlink(fullPath);
+            deleted++;
+          } catch {
+            /* locked — skip */
+          }
+        }
+      }
+    }
+    return deleted;
   }
 
   private async restoreGitCheckpoint(ref: string): Promise<boolean> {

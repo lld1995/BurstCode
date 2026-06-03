@@ -14,6 +14,25 @@ function topicSwitchConfig(contextWindow: number) {
   return { ...defaultCompressorConfig, contextWindow, keepLastN: 1, inputBudgetRatio: 0.3 };
 }
 
+/**
+ * Decode residual escape sequences that occasionally survive into a tool
+ * argument's string value — most visibly `\uXXXX` for non-ASCII (Chinese)
+ * text, which otherwise gets written to the topic doc literally as
+ * "\u91cd\u5199" instead of "重写". Also normalises the common single-char
+ * escapes (\n \t \r \" \\). Safe to run on already-decoded strings: a real
+ * backslash that isn't part of a recognised escape is left untouched.
+ */
+function decodeEscapes(text: string): string {
+  if (!text || text.indexOf('\\') === -1) return text;
+  return text
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\');
+}
+
 function slugify(text: string): string {
   return text
     .toLowerCase()
@@ -143,16 +162,16 @@ export function buildContextTools(
       }
     },
     async execute(args: Record<string, unknown>): Promise<ToolResult> {
-      const title = String(args.title ?? 'untitled');
-      const problem = String(args.problem ?? '');
+      const title = decodeEscapes(String(args.title ?? 'untitled'));
+      const problem = decodeEscapes(String(args.problem ?? ''));
       const filesTouched = Array.isArray(args.files_touched)
-        ? (args.files_touched as unknown[]).map(String)
+        ? (args.files_touched as unknown[]).map((f) => decodeEscapes(String(f)))
         : [];
-      const findings = String(args.findings ?? '');
-      const solution = args.solution ? String(args.solution) : undefined;
-      const learnings = args.learnings ? String(args.learnings) : undefined;
+      const findings = decodeEscapes(String(args.findings ?? ''));
+      const solution = args.solution ? decodeEscapes(String(args.solution)) : undefined;
+      const learnings = args.learnings ? decodeEscapes(String(args.learnings)) : undefined;
 
-      const slug = slugify(title);
+      const slug = slugify(title) || 'topic';
       const ts = Date.now();
       const isoDate = new Date(ts).toISOString();
       const fileName = `${slug}-${ts}.md`;

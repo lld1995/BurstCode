@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { Logger } from '../util/Logger';
 import { DependencyGuard } from '../deps/DependencyGuard';
 import { HunkApplier, PendingState } from '../edits/HunkApplier';
@@ -135,6 +136,9 @@ interface RunContext {
 /** Workspace-state key for the persisted browser-style open-tab working set. */
 const KEY_OPEN_TABS = 'burstcode.chat.openTabs';
 
+/** Virtual scheme backing the LEFT side of a rollback-preview diff (pre-prompt snapshot). */
+const ROLLBACK_SNAPSHOT_SCHEME = 'burstcode-rollback';
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'burstcode.chatView';
 
@@ -165,6 +169,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private checkpointFailureNotified = false;
   private configSub?: vscode.Disposable;
   private pendingEditsSub?: vscode.Disposable;
+  /**
+   * Lazily-created virtual content provider that serves the pre-prompt
+   * snapshot of a file for the rollback-confirmation diff (LEFT = checkpoint
+   * snapshot, RIGHT = current file on disk). Keyed by the virtual URI string.
+   */
+  private rollbackSnapshots?: Map<string, string>;
+  private rollbackSnapshotSub?: vscode.Disposable;
   private readonly sessions: SessionStore;
   private readonly lessons: LessonStore;
   private readonly foregroundActivityEmitter = new vscode.EventEmitter<string>();
@@ -925,6 +936,119 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Resolve the virtual content provider used to back the LEFT (snapshot) side
+   * of a rollback-preview diff. Registered lazily on first use and disposed
+   * with the provider. The returned scheme serves whatever string we stash in
+   * `rollbackSnapshots` for a given URI.
+   */
+  private ensureRollbackSnapshotProvider(): Map<string, string> {
+    if (!this.rollbackSnapshots) {
+      this.rollbackSnapshots = new Map<string, string>();
+      this.rollbackSnapshotSub = vscode.workspace.registerTextDocumentContentProvider(
+        ROLLBACK_SNAPSHOT_SCHEME,
+        {
+          provideTextDocumentContent: (uri) => this.rollbackSnapshots?.get(uri.toString()) ?? ''
+        }
+      );
+      this.context.subscriptions.push(this.rollbackSnapshotSub);
+    }
+    return this.rollbackSnapshots;
+  }
+
+  /**
+   * Open a diff for one file that a rollback would change: LEFT = the file's
+   * content as captured in the checkpoint (pre-prompt), RIGHT = the current
+   * file on disk. When the file is NOT in the checkpoint it was created after
+   * the prompt and will be DELETED by rollback — we show an empty LEFT side so
+   * the diff reads as an all-deletions ("will be removed") preview.
+   */
+  private async openRollbackFileDiff(ref: string, relativePath: string): Promise<void> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) return;
+    const snapshot = await this.gitCheckpoint.getCheckpointFileSnapshot(ref, relativePath);
+    const willDelete = snapshot === null;
+    const snapshots = this.ensureRollbackSnapshotProvider();
+    const fileUri = vscode.Uri.file(path.join(root, relativePath));
+    const leftUri = fileUri.with({
+      scheme: ROLLBACK_SNAPSHOT_SCHEME,
+      path: fileUri.path + '.checkpoint'
+    });
+    snapshots.set(leftUri.toString(), snapshot ?? '');
+    const title = willDelete
+      ? `Rollback • ${path.basename(relativePath)} (will be deleted)`
+      : `Rollback • ${path.basename(relativePath)} (Before prompt ↔ Current)`;
+    await vscode.commands.executeCommand('vscode.diff', leftUri, fileUri, title, {
+      preview: true
+    });
+  }
+
+  /**
+   * Interactive rollback confirmation. Presents the affected files in a
+   * QuickPick; each row has an "open diff" button so the user can inspect the
+   * exact change a rollback would make before committing. Accepting the
+   * "Roll Back" action resolves true; dismissing resolves false.
+   */
+  private async confirmRollbackWithDiffs(ref: string, affected: string[]): Promise<boolean> {
+    type RbItem = vscode.QuickPickItem & { rbKind: 'action' | 'file'; file?: string };
+    const diffButton: vscode.QuickInputButton = {
+      iconPath: new vscode.ThemeIcon('diff'),
+      tooltip: 'Open diff (before prompt ↔ current)'
+    };
+    const items: Array<RbItem | vscode.QuickPickItem> = [
+      {
+        rbKind: 'action',
+        label: '$(discard) Roll Back',
+        detail: `Revert ${affected.length} file(s) to the state right before this prompt and truncate the chat. Your current working tree is saved as a safety checkpoint first.`,
+        alwaysShow: true
+      } as RbItem,
+      {
+        label: `${affected.length} file(s) will change — click the diff icon to preview`,
+        kind: vscode.QuickPickItemKind.Separator
+      }
+    ];
+    for (const f of affected) {
+      items.push({
+        rbKind: 'file',
+        file: f,
+        label: `$(file) ${f}`,
+        buttons: [diffButton]
+      } as RbItem);
+    }
+
+    return await new Promise<boolean>((resolve) => {
+      const qp = vscode.window.createQuickPick<RbItem>();
+      qp.title = 'Roll back to before this prompt?';
+      qp.placeholder = 'Select “Roll Back” to confirm, or click a file’s diff icon to preview — press Esc to cancel';
+      qp.ignoreFocusOut = true;
+      qp.items = items as RbItem[];
+      let done = false;
+      const finish = (result: boolean): void => {
+        if (done) return;
+        done = true;
+        qp.hide();
+        qp.dispose();
+        resolve(result);
+      };
+      qp.onDidTriggerItemButton((e) => {
+        if (e.item.rbKind === 'file' && e.item.file) {
+          void this.openRollbackFileDiff(ref, e.item.file);
+        }
+      });
+      qp.onDidAccept(() => {
+        const sel = qp.selectedItems[0];
+        if (sel?.rbKind === 'action') {
+          finish(true);
+        } else if (sel?.rbKind === 'file' && sel.file) {
+          // Selecting a file row (Enter) opens its diff but keeps the picker.
+          void this.openRollbackFileDiff(ref, sel.file);
+        }
+      });
+      qp.onDidHide(() => finish(false));
+      qp.show();
+    });
+  }
+
+  /**
    * Restore the working tree to the snapshot captured before a previous user
    * prompt was processed. Also truncates the session transcript back to that
    * point so the chat history stays consistent with the code on disk.
@@ -972,16 +1096,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.logger.warn('Rollback ref no longer exists — downgrading to chat-only', { ref });
       hasCheckpoint = false;
     }
-    const confirmPrompt = hasCheckpoint
-      ? 'Roll back the working tree to the state right before this prompt? Conversation after this point will also be removed. Your current working tree will first be saved as a safety checkpoint.'
-      : 'No checkpoint was captured for this prompt, so the code on disk CANNOT be restored. Only the chat history will be truncated back to this point. Continue?';
-    const confirmLabel = hasCheckpoint ? 'Roll Back' : 'Truncate Chat Only';
-    const confirm = await vscode.window.showWarningMessage(
-      confirmPrompt,
-      { modal: true },
-      confirmLabel
-    );
-    if (confirm !== confirmLabel) return;
+
+    // Build a preview of the files that will actually revert so the user can
+    // see the blast radius before confirming — and let them click into each
+    // file's diff (checkpoint snapshot ↔ current) before deciding.
+    let confirmed = false;
+    if (hasCheckpoint) {
+      const affected = await this.gitCheckpoint.listAffectedFiles(ref);
+      if (affected.length > 0) {
+        confirmed = await this.confirmRollbackWithDiffs(ref, affected);
+      } else {
+        const choice = await vscode.window.showWarningMessage(
+          'Roll back the working tree to the state right before this prompt? Conversation after this point will also be removed. Your current working tree will first be saved as a safety checkpoint.' +
+            '\n\nNo file changes detected since this prompt — only the chat history will be truncated.',
+          { modal: true },
+          'Roll Back'
+        );
+        confirmed = choice === 'Roll Back';
+      }
+    } else {
+      const choice = await vscode.window.showWarningMessage(
+        'No checkpoint was captured for this prompt, so the code on disk CANNOT be restored. Only the chat history will be truncated back to this point. Continue?',
+        { modal: true },
+        'Truncate Chat Only'
+      );
+      confirmed = choice === 'Truncate Chat Only';
+    }
+    if (!confirmed) return;
 
     this.post({ type: 'rollback-start' });
     if (hasCheckpoint) {
