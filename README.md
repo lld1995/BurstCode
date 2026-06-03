@@ -10,13 +10,14 @@
 
 <table>
 <tr>
-<td align="center" width="33%"><img src="media/readme/precise.svg" width="56" height="56" alt="精准" /><br/><b>精准</b></td>
-<td align="center" width="33%"><img src="media/readme/fast.svg" width="56" height="56" alt="高速" /><br/><b>高速</b></td>
-<td align="center" width="33%"><img src="media/readme/cheap.svg" width="56" height="56" alt="省钱" /><br/><b>省钱</b></td>
+<td align="center" width="25%"><img src="media/readme/precise.svg" width="56" height="56" alt="精准" /><br/><b>精准</b></td>
+<td align="center" width="25%"><img src="media/readme/fast.svg" width="56" height="56" alt="高速" /><br/><b>高速</b></td>
+<td align="center" width="25%"><img src="media/readme/cheap.svg" width="56" height="56" alt="省钱" /><br/><b>省钱</b></td>
+<td align="center" width="25%"><img src="media/readme/secure.svg" width="56" height="56" alt="安全" /><br/><b>安全</b></td>
 </tr>
 </table>
 
-**精准 · 高速 · 省钱 —— 这三点，就是 BurstCode 的全部。**
+**精准 · 高速 · 省钱 · 安全 —— 这四点，就是 BurstCode 的全部。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![VS Code ^1.106](https://img.shields.io/badge/VS%20Code-%5E1.106-007ACC.svg) ![Local LLM](https://img.shields.io/badge/LLM-local%20%2F%20OpenAI--compatible-success.svg)
 
@@ -34,6 +35,7 @@
     - [ 精准 —— 改对，而不是改多](#-精准--改对而不是改多)
     - [ 高速 —— 一次往返，做完该做的](#-高速--一次往返做完该做的)
     - [ 省钱 —— 0 云端账单，本地即算力](#-省钱--0-云端账单本地即算力)
+    - [ 安全 —— 代码不出本机，改动可控可回滚](#-安全--代码不出本机改动可控可回滚)
   - [功能特性](#功能特性)
   - [环境要求](#环境要求)
   - [安装](#安装)
@@ -63,7 +65,7 @@
 
 ## 为什么选择 BurstCode
 
-市面上的 Agent 类编码插件大多默认你会把代码发往托管的云端前沿模型，按 token 收费、还要交出源码。BurstCode 围绕三个核心理念重新设计 —— **精准、高速、省钱**，并完全运行在你本地掌控的模型上。
+市面上的 Agent 类编码插件大多默认你会把代码发往托管的云端前沿模型，按 token 收费、还要交出源码。BurstCode 围绕四个核心理念重新设计 —— **精准、高速、省钱、安全**，并完全运行在你本地掌控的模型上。
 
 ### <img src="media/readme/precise.svg" width="22" height="22" align="absmiddle" alt="" /> 精准 —— 改对，而不是改多
 
@@ -82,6 +84,12 @@
 - **100% 本地优先** —— 除非*你*把端点指向远程服务器，否则源码不出本机，**无云端账号、无遥测、无按 token 计费**。
 - **自带模型** —— Qwen-Coder、DeepSeek-Coder、Llama、Codestral……凡是你的服务在 `/v1/models` 暴露的都可用。
 - **两套独立配置档** —— 聊天用快/大的模型，后台用更便宜的小模型，把算力花在刀刃上。
+
+### <img src="media/readme/secure.svg" width="22" height="22" align="absmiddle" alt="" /> 安全 —— 代码不出本机，改动可控可回滚
+
+- **数据不离开本机** —— 除非*你*主动把端点指向远程，否则源码、提示词与上下文全程留在本地，无云端账号、无遥测上报。
+- **每一步都可审查** —— 改动以逐块 Accept / Reject 的 diff 呈现，Shell 命令带审批门控，绝不在你不知情时动你的代码或环境。
+- **随时可回滚** —— 每个 Agent 回合前自动打 Git 检查点，方向不对一键还原整个工作区，放心放手让它干。
 
 ---
 

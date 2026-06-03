@@ -10,13 +10,14 @@ Chat with your codebase, let the agent read, search, edit, build and test across
 
 <table>
 <tr>
-<td align="center" width="33%"><img src="media/readme/precise.svg" width="56" height="56" alt="Precise" /><br/><b>Precise</b></td>
-<td align="center" width="33%"><img src="media/readme/fast.svg" width="56" height="56" alt="Fast" /><br/><b>Fast</b></td>
-<td align="center" width="33%"><img src="media/readme/cheap.svg" width="56" height="56" alt="Cheap" /><br/><b>Cheap</b></td>
+<td align="center" width="25%"><img src="media/readme/precise.svg" width="56" height="56" alt="Precise" /><br/><b>Precise</b></td>
+<td align="center" width="25%"><img src="media/readme/fast.svg" width="56" height="56" alt="Fast" /><br/><b>Fast</b></td>
+<td align="center" width="25%"><img src="media/readme/cheap.svg" width="56" height="56" alt="Cheap" /><br/><b>Cheap</b></td>
+<td align="center" width="25%"><img src="media/readme/secure.svg" width="56" height="56" alt="Secure" /><br/><b>Secure</b></td>
 </tr>
 </table>
 
-**Precise · Fast · Cheap — those three things are what BurstCode is all about.**
+**Precise · Fast · Cheap · Secure — those four things are what BurstCode is all about.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![VS Code ^1.106](https://img.shields.io/badge/VS%20Code-%5E1.106-007ACC.svg) ![Local LLM](https://img.shields.io/badge/LLM-local%20%2F%20OpenAI--compatible-success.svg)
 
@@ -46,7 +47,7 @@ Chat with your codebase, let the agent read, search, edit, build and test across
 
 ## Why BurstCode
 
-Most agentic coding extensions assume you'll ship your code to a hosted, cloud frontier model — metered per token, with your source leaving the building. BurstCode is built around three principles instead — **Precise, Fast, and Cheap** — running entirely on models you control locally.
+Most agentic coding extensions assume you'll ship your code to a hosted, cloud frontier model — metered per token, with your source leaving the building. BurstCode is built around four principles instead — **Precise, Fast, Cheap, and Secure** — running entirely on models you control locally.
 
 ### <img src="media/readme/precise.svg" width="22" height="22" align="absmiddle" alt="" /> Precise — change the right thing, not everything
 
@@ -65,6 +66,12 @@ Most agentic coding extensions assume you'll ship your code to a hosted, cloud f
 - **100% local-first** — your source never leaves your machine unless *you* point the endpoint at a remote server: **no cloud account, no telemetry, no per-token bill.**
 - **Bring your own model** — Qwen-Coder, DeepSeek-Coder, Llama, Codestral… anything your server exposes at `/v1/models`.
 - **Two independent profiles** — a fast/large model for chat and a cheaper, smaller one for background work, so you spend compute where it matters.
+
+### <img src="media/readme/secure.svg" width="22" height="22" align="absmiddle" alt="" /> Secure — your code stays local, every change is controlled and reversible
+
+- **Your data never leaves the machine** — unless *you* point the endpoint at a remote server, your source, prompts and context stay local: no cloud account, no telemetry.
+- **Every step is reviewable** — changes land as per-hunk Accept / Reject diffs and shell commands are gated by approval, so nothing touches your code or environment behind your back.
+- **Reversible at any time** — a Git checkpoint is taken before each agent turn, so one click rolls the whole workspace back if a turn goes the wrong way.
 
 ---
 

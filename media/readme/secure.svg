@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="64" height="64" role="img" aria-label="Secure">
+  <defs>
+    <linearGradient id="secure-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="secure-accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FDE68A"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="84" height="84" rx="22" fill="url(#secure-bg)"/>
+  <rect x="6.75" y="6.75" width="82.5" height="82.5" rx="21.25" fill="none" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1.5"/>
+  <path d="M48 18 L72 27 V46 C72 62 61 72 48 78 C35 72 24 62 24 46 V27 Z" fill="none" stroke="#FFFFFF" stroke-opacity="0.85" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M39 47 L46 54 L60 39" fill="none" stroke="url(#secure-accent)" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

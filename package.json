@@ -1,7 +1,7 @@
 {
   "name": "burstcode",
   "displayName": "BurstCode",
-  "description": "Precise, Fast, Cheap — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
+  "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
   "version": "0.1.75",
   "publisher": "burstcode",
   "repository": {
