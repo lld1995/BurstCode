@@ -176,6 +176,10 @@ const PROTOCOL = `WORKING PROTOCOL:
      disk EAGERLY (so the user can compile / run with them immediately) and queued for
      review; Accept just confirms keeping them, Reject rolls the affected hunks back.
      DOES NOT BLOCK — you may keep verifying (build, test, read_file) right after.
+     ⚠ KEY: There is NO separate IDE "cached view" or "pending-only copy". When
+     read_file returns a file after propose_edit, the content you see IS the live
+     on-disk file — no further refresh step exists. The Accept/Reject banner is a
+     pure UI confirmation; it does NOT gate compilation, testing, or your next turn.
    • write_file — for agent-generated scripts, temp files, or any file the agent will
      immediately execute or read back. Writes to disk instantly, no review step.
 
@@ -183,8 +187,8 @@ const PROTOCOL = `WORKING PROTOCOL:
    plan updates, additional propose_edit calls to refine, run_shell to build/test) or end
    the turn with a brief summary. Do NOT wait for the user — they accept/reject
    asynchronously. NEVER say "please accept the pending edits before building/testing" —
-   the edits are ALREADY ON DISK the moment propose_edit returns. Build and test
-   immediately without any user action required.
+   the edits are ALREADY ON DISK the moment propose_edit returns. There is no IDE cache
+   to invalidate. Build and test immediately without any user action required.
 
 10. If you call propose_edit multiple times for the same file, prefer non-overlapping hunks.
     Overlapping hunks replace the earlier queued ones.

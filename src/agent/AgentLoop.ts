@@ -273,6 +273,23 @@ function isContextLengthError(err: unknown): boolean {
   return false;
 }
 
+/**
+ * Detect truncated-request / malformed-body 400 errors that are almost always
+ * transient (network proxy cut the POST body mid-flight, HTTP/2 frame limit,
+ * reverse-proxy buffering glitch, etc.). Retrying the same request usually
+ * succeeds, so we give these a higher auto-resume budget.
+ */
+function isTruncatedRequestError(err: unknown): boolean {
+  const msg = String(err).toLowerCase();
+  // Python httpparser / json.JSONDecodeError from upstream proxies
+  if (msg.includes('unexpected end of data')) return true;
+  if (msg.includes('unexpected end of json')) return true;
+  // Common variants from nginx, Cloudflare, API gateways
+  if (msg.includes('request body incomplete')) return true;
+  if (msg.includes('connection reset') && msg.includes('400')) return true;
+  return false;
+}
+
 export interface AgentOptions {
   contextWindow: number;
   maxIterations: number;
@@ -708,26 +725,37 @@ export class AgentLoop {
             };
             continue outerLoop;
           }
-          if (resumeAttempt >= maxResumes) {
+          // Truncated-request errors ("unexpected end of data") are almost always
+          // transient network-level issues — a proxy, load balancer, or HTTP/2
+          // frame limit cut the POST body mid-flight. Retrying usually succeeds,
+          // so we grant extra auto-resume attempts beyond the normal budget.
+          const truncated = isTruncatedRequestError(err);
+          const effectiveMax = truncated ? maxResumes + 3 : maxResumes;
+          if (resumeAttempt >= effectiveMax) {
             this.logger.error('LLM stream error', String(err));
             const detail = String(err);
             const suffix =
-              maxResumes > 0
+              resumeAttempt > 0
                 ? ` (after ${resumeAttempt} auto-resume${resumeAttempt === 1 ? '' : 's'})`
                 : '';
-            yield { type: 'error', payload: `Stream interrupted${suffix}: ${detail}` };
+            const hint = truncated
+              ? ' The upstream server received an incomplete request body (network truncation). ' +
+                'If this persists, check your network/proxy settings or try a shorter conversation.'
+              : '';
+            yield { type: 'error', payload: `Stream interrupted${suffix}: ${detail}${hint}` };
             return;
           }
           resumeAttempt++;
           const delayMs = Math.min(500 * 2 ** (resumeAttempt - 1), 4000);
+          const reason = truncated ? 'truncated request body (network)' : 'stream error';
           this.logger.warn(
-            `LLM stream interrupted (attempt ${resumeAttempt}/${maxResumes}); resuming in ${delayMs}ms: ${String(err)}`
+            `LLM stream interrupted — ${reason} (attempt ${resumeAttempt}/${effectiveMax}); resuming in ${delayMs}ms: ${String(err)}`
           );
           yield {
             type: 'auto-resume',
             payload: {
               attempt: resumeAttempt,
-              max: maxResumes,
+              max: effectiveMax,
               error: String(err),
               delayMs
             }
