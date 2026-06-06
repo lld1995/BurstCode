@@ -43,6 +43,8 @@ const EN: Dict = {
   'models.chatProfile.desc': 'baseURL / apiKey / model',
   'models.bgProfile': 'Background profile settings…',
   'models.bgProfile.desc': 'inherit / baseURL / apiKey / model',
+  'models.imageProfile': 'Image profile settings…',
+  'models.imageProfile.desc': 'baseURL / apiKey / model / size',
 
   // Permissions group
   'perm.group': 'Permissions',
@@ -120,6 +122,8 @@ const ZH: Dict = {
   'models.chatProfile.desc': 'baseURL / apiKey / 模型',
   'models.bgProfile': '后台配置…',
   'models.bgProfile.desc': '继承 / baseURL / apiKey / 模型',
+  'models.imageProfile': '图片配置…',
+  'models.imageProfile.desc': 'baseURL / apiKey / 模型 / 尺寸',
 
   // Permissions group
   'perm.group': '权限',

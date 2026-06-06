@@ -111,6 +111,146 @@ export function readBackgroundProfile(): BackgroundProfile {
   return { ...readProfile('background'), inherit };
 }
 
+/* ------------------------------------------------------------------ */
+/* Image generation profile (/v1/images/generations)                    */
+/* ------------------------------------------------------------------ */
+
+export interface ImageConfig {
+  baseURL: string;
+  apiKey: string;
+  model: string;
+  size: string;
+  allowSelfSignedCerts: boolean;
+}
+
+const DEFAULT_IMAGE_MODEL = 'gpt-image-1';
+const DEFAULT_IMAGE_SIZE = '1024x1024';
+
+/**
+ * Resolve the image-generation profile. Each field falls back to the chat
+ * profile when left empty so the user only has to set the parts that differ
+ * (typically just the model id, e.g. `gpt-image-2`). Image models speak the
+ * `/v1/images/generations` endpoint, NOT `/v1/chat/completions`, so they can
+ * never be used as the chat model directly.
+ */
+export function readImageConfig(): ImageConfig {
+  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
+  const chat = readLLMConfig();
+  const baseURL = (cfg.get<string>('image.baseURL') ?? '').trim();
+  const apiKey = cfg.get<string>('image.apiKey');
+  const model = (cfg.get<string>('image.model') ?? '').trim();
+  const size = (cfg.get<string>('image.size') ?? '').trim();
+  const allow = cfg.get<boolean>('image.allowSelfSignedCerts');
+  return {
+    baseURL: baseURL || chat.baseURL,
+    apiKey: typeof apiKey === 'string' && apiKey ? apiKey : chat.apiKey,
+    model: model || DEFAULT_IMAGE_MODEL,
+    size: size || DEFAULT_IMAGE_SIZE,
+    allowSelfSignedCerts:
+      typeof allow === 'boolean' ? allow : chat.allowSelfSignedCerts === true
+  };
+}
+
+export interface GeneratedImage {
+  /** Raw image bytes (decoded from b64_json or downloaded from the URL). */
+  data: Buffer;
+  /** Reported MIME type, defaults to image/png. */
+  mimeType: string;
+  /** The revised prompt the model actually used, when provided. */
+  revisedPrompt?: string;
+}
+
+/**
+ * Generate one image via the OpenAI-compatible `/v1/images/generations`
+ * endpoint. Prefers `response_format: b64_json` so the bytes come back inline
+ * (no second download round-trip); falls back to fetching the returned URL
+ * when an endpoint only supports URL responses.
+ */
+export async function generateImage(
+  cfg: ImageConfig,
+  prompt: string,
+  opts: { size?: string; signal?: AbortSignal } = {}
+): Promise<GeneratedImage> {
+  const clientOpts: ConstructorParameters<typeof OpenAI>[0] = {
+    baseURL: cfg.baseURL,
+    apiKey: cfg.apiKey || 'no-key',
+    maxRetries: 0
+  };
+  if (cfg.allowSelfSignedCerts) {
+    clientOpts.httpAgent = new https.Agent({ rejectUnauthorized: false });
+  }
+  const client = new OpenAI(clientOpts);
+
+  const size = (opts.size || cfg.size || DEFAULT_IMAGE_SIZE).trim();
+  const res = await client.images.generate(
+    {
+      model: cfg.model,
+      prompt,
+      n: 1,
+      size: size as never
+    } as never,
+    opts.signal ? { signal: opts.signal } : undefined
+  );
+
+  const first = res.data?.[0] as
+    | { b64_json?: string; url?: string; revised_prompt?: string }
+    | undefined;
+  if (!first) throw new Error('Image endpoint returned no image data.');
+
+  let data: Buffer;
+  let mimeType = 'image/png';
+  if (first.b64_json) {
+    data = Buffer.from(first.b64_json, 'base64');
+  } else if (first.url) {
+    const fetched = await downloadBytes(first.url, cfg.allowSelfSignedCerts, opts.signal);
+    data = fetched.body;
+    if (fetched.mimeType) mimeType = fetched.mimeType;
+  } else {
+    throw new Error('Image endpoint returned neither b64_json nor url.');
+  }
+
+  return { data, mimeType, revisedPrompt: first.revised_prompt };
+}
+
+/** Minimal HTTPS/HTTP GET that buffers the body (for URL-style image responses). */
+function downloadBytes(
+  url: string,
+  allowSelfSigned: boolean | undefined,
+  signal?: AbortSignal
+): Promise<{ body: Buffer; mimeType: string }> {
+  return new Promise((resolve, reject) => {
+    let mod: typeof https | typeof import('http');
+    try {
+      mod = url.startsWith('https:') ? https : require('http');
+    } catch {
+      mod = https;
+    }
+    const reqOpts: https.RequestOptions = {};
+    if (allowSelfSigned && url.startsWith('https:')) {
+      reqOpts.agent = new https.Agent({ rejectUnauthorized: false });
+    }
+    const req = mod.get(url, reqOpts, (resp) => {
+      if (!resp.statusCode || resp.statusCode >= 400) {
+        reject(new Error(`Image download failed: HTTP ${resp.statusCode}`));
+        resp.resume();
+        return;
+      }
+      const chunks: Buffer[] = [];
+      resp.on('data', (c: Buffer) => chunks.push(c));
+      resp.on('end', () =>
+        resolve({
+          body: Buffer.concat(chunks),
+          mimeType: String(resp.headers['content-type'] || 'image/png').split(';')[0].trim()
+        })
+      );
+    });
+    req.on('error', reject);
+    if (signal) {
+      signal.addEventListener('abort', () => req.destroy(new Error('aborted')), { once: true });
+    }
+  });
+}
+
 export function readLLMConfig(): LLMConfig {
   const p = readChatProfile();
   return {

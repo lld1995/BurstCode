@@ -50,6 +50,12 @@ export class GitCheckpoint {
     'out', '__pycache__', 'vendor',
   ]);
 
+  /** Hot cache for the last `resolveCheckpointChain` result, keyed by ref.
+   *  Avoids redundant chain-resolution when `listAffectedFiles` and
+   *  `restoreFileCheckpoint` operate on the same ref back-to-back. */
+  private _resolvedSourceMapCache: Map<string, string> | null = null;
+  private _resolvedSourceMapRef = '';
+
   constructor(private readonly logger: Logger) {}
 
   isEnabled(): boolean {
@@ -599,7 +605,9 @@ export class GitCheckpoint {
       // Compose the full snapshot by walking the delta chain (base → … →
       // target). Each entry maps a workspace-relative path to the stored
       // checkpoint blob it should be restored from; newer checkpoints win.
-      const sourceMap = await this.resolveCheckpointChain(wsRoot, ref, new Set());
+      const sourceMap = this._resolvedSourceMapRef === ref && this._resolvedSourceMapCache
+        ? new Map(this._resolvedSourceMapCache)
+        : await this.resolveCheckpointChain(wsRoot, ref, new Set());
 
       // Concurrent restore
       const skippedPaths: string[] = [];
@@ -655,6 +663,12 @@ export class GitCheckpoint {
       this.logger.error('Restore failed', String(err));
       vscode.window.showErrorMessage(`BurstCode: failed to restore checkpoint: ${String(err)}`);
       return false;
+    } finally {
+      // Always invalidate the chain cache after a restore attempt (success OR
+      // failure): disk state may have changed and forward checkpoints may have
+      // been pruned, so any cached sourceMap (and its blob paths) is now stale.
+      this._resolvedSourceMapCache = null;
+      this._resolvedSourceMapRef = '';
     }
   }
 
@@ -675,6 +689,11 @@ export class GitCheckpoint {
   ): Promise<Map<string, string>> {
     const result = new Map<string, string>();
     if (!ref.startsWith(GitCheckpoint.FILE_REF_PREFIX)) return result;
+
+    // Return cached result when this is a top-level call on the same ref.
+    if (visited.size === 0 && ref === this._resolvedSourceMapRef && this._resolvedSourceMapCache) {
+      return new Map(this._resolvedSourceMapCache);
+    }
 
     const timestamp = ref.slice(GitCheckpoint.FILE_REF_PREFIX.length);
     if (visited.has(timestamp)) {
@@ -706,6 +725,12 @@ export class GitCheckpoint {
     for (const file of manifest.files ?? []) {
       const encoded = file.relativePath.replace(/[^a-zA-Z0-9._-]/g, '_');
       result.set(file.relativePath, path.join(checkpointDir, encoded));
+    }
+
+    // Cache the full result at the top-level call.
+    if (visited.size === 1) {
+      this._resolvedSourceMapRef = ref;
+      this._resolvedSourceMapCache = new Map(result);
     }
     return result;
   }

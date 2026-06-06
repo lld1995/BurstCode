@@ -159,6 +159,15 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
           title: 'Open Background Profile Settings',
           arguments: ['burstcode.llm.background']
         }
+      }),
+      new BasicNode('leaf', t('models.imageProfile'), {
+        description: t('models.imageProfile.desc'),
+        icon: 'file-media',
+        command: {
+          command: 'workbench.action.openSettings',
+          title: 'Open Image Profile Settings',
+          arguments: ['burstcode.llm.image']
+        }
       })
     ];
 

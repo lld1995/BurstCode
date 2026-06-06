@@ -21,6 +21,7 @@ import { AgentLoop } from '../agent/AgentLoop';
 import { Tool } from '../agent/tools/types';
 import { buildReadFileTool, buildWriteFileTool, buildCollectContextTool, listDirTool, grepSearchTool, workspaceOutlineTool } from '../agent/tools/core';
 import { readWebpageTool, webSearchTool } from '../agent/tools/web';
+import { buildImageTool } from '../agent/tools/image';
 import { WorkspaceIndex } from '../context/WorkspaceIndex';
 import { buildSystemPrompt } from '../agent/prompts';
 import { buildLspTools } from '../agent/tools/lsp';
@@ -1085,94 +1086,107 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this.applier.rejectAllFrom(messageIndex);
     }
 
-    // Re-verify the ref still resolves before claiming we can restore disk
-    // state. `git gc` / `git reflog expire` / a manual `update-ref -d` could
-    // have clobbered the ref between when we wrote it and when the user
-    // clicks rollback (e.g. across a long-lived VS Code session). Failing
-    // verification here downgrades the action to chat-only truncation
-    // BEFORE the modal so the user is asked the right question.
-    let hasCheckpoint = !!ref;
-    if (hasCheckpoint && !(await this.gitCheckpoint.refExists(ref))) {
-      this.logger.warn('Rollback ref no longer exists — downgrading to chat-only', { ref });
-      hasCheckpoint = false;
-    }
+    // Show the overlay immediately so the user sees feedback while we verify
+    // the checkpoint ref and scan affected files (both involve disk I/O).
+    this.post({ type: 'rollback-start' });
 
-    // Build a preview of the files that will actually revert so the user can
-    // see the blast radius before confirming — and let them click into each
-    // file's diff (checkpoint snapshot ↔ current) before deciding.
-    let confirmed = false;
-    if (hasCheckpoint) {
-      const affected = await this.gitCheckpoint.listAffectedFiles(ref);
-      if (affected.length > 0) {
-        confirmed = await this.confirmRollbackWithDiffs(ref, affected);
+    try {
+      // Re-verify the ref still resolves before claiming we can restore disk
+      // state. `git gc` / `git reflog expire` / a manual `update-ref -d` could
+      // have clobbered the ref between when we wrote it and when the user
+      // clicks rollback (e.g. across a long-lived VS Code session). Failing
+      // verification here downgrades the action to chat-only truncation
+      // BEFORE the modal so the user is asked the right question.
+      let hasCheckpoint = !!ref;
+      if (hasCheckpoint && !(await this.gitCheckpoint.refExists(ref))) {
+        this.logger.warn('Rollback ref no longer exists — downgrading to chat-only', { ref });
+        hasCheckpoint = false;
+      }
+
+      let confirmed = false;
+
+      // Build a preview of the files that will actually revert so the user can
+      // see the blast radius before confirming — and let them click into each
+      // file's diff (checkpoint snapshot ↔ current) before deciding.
+      if (hasCheckpoint) {
+        const affected = await this.gitCheckpoint.listAffectedFiles(ref);
+        if (affected.length > 0) {
+          confirmed = await this.confirmRollbackWithDiffs(ref, affected);
+        } else {
+          const choice = await vscode.window.showWarningMessage(
+            'Roll back the working tree to the state right before this prompt? Conversation after this point will also be removed. Your current working tree will first be saved as a safety checkpoint.' +
+              '\n\nNo file changes detected since this prompt — only the chat history will be truncated.',
+            { modal: true },
+            'Roll Back'
+          );
+          confirmed = choice === 'Roll Back';
+        }
       } else {
         const choice = await vscode.window.showWarningMessage(
-          'Roll back the working tree to the state right before this prompt? Conversation after this point will also be removed. Your current working tree will first be saved as a safety checkpoint.' +
-            '\n\nNo file changes detected since this prompt — only the chat history will be truncated.',
+          'No checkpoint was captured for this prompt, so the code on disk CANNOT be restored. Only the chat history will be truncated back to this point. Continue?',
           { modal: true },
-          'Roll Back'
+          'Truncate Chat Only'
         );
-        confirmed = choice === 'Roll Back';
+        confirmed = choice === 'Truncate Chat Only';
       }
-    } else {
-      const choice = await vscode.window.showWarningMessage(
-        'No checkpoint was captured for this prompt, so the code on disk CANNOT be restored. Only the chat history will be truncated back to this point. Continue?',
-        { modal: true },
-        'Truncate Chat Only'
-      );
-      confirmed = choice === 'Truncate Chat Only';
-    }
-    if (!confirmed) return;
-
-    this.post({ type: 'rollback-start' });
-    if (hasCheckpoint) {
-      const ok = await this.gitCheckpoint.restoreCheckpoint(ref);
-      if (!ok) {
-        this.post({ type: 'rollback-end' });
+      if (!confirmed) {
         return;
       }
-    }
-
-    const session = this.currentSession;
-    // Capture the text of the user message we're rolling back BEFORE we
-    // slice it out, so we can pre-fill the composer with it (Cursor-style
-    // edit-and-resend). The message at `messageIndex` is guaranteed to be
-    // a user message because that's the only kind that exposes a rollback
-    // button in the webview.
-    const rolledBackMsg = session.messages[messageIndex];
-    const prefillText =
-      rolledBackMsg && rolledBackMsg.role === 'user' && typeof rolledBackMsg.content === 'string'
-        ? rolledBackMsg.content
-        : '';
-
-    session.messages = session.messages.slice(0, messageIndex);
-    session.checkpoints = (session.checkpoints ?? []).filter(
-      (c) => (!ref || c.ref !== ref) && c.messageIndex < messageIndex
-    );
-    session.plan = [];
-    await this.persistCurrentSession();
-
-    // Rebuild the chat panel from the trimmed transcript.
-    this.post({ type: 'reset' });
-    this.post({
-      type: 'load-session',
-      payload: {
-        id: session.id,
-        title: session.title,
-        transcript: buildTranscript(session.messages, session.checkpoints),
-        plan: session.plan ?? []
+      if (hasCheckpoint) {
+        const ok = await this.gitCheckpoint.restoreCheckpoint(ref);
+        if (!ok) {
+          return;
+        }
       }
-    });
-    // Drop the rolled-back prompt back into the composer so the user can
-    // tweak it and resend instead of retyping the whole thing.
-    if (prefillText) {
-      this.post({ type: 'prefill-composer', payload: { text: prefillText } });
+
+      const session = this.currentSession;
+      // Capture the text of the user message we're rolling back BEFORE we
+      // slice it out, so we can pre-fill the composer with it (Cursor-style
+      // edit-and-resend). The message at `messageIndex` is guaranteed to be
+      // a user message because that's the only kind that exposes a rollback
+      // button in the webview.
+      const rolledBackMsg = session.messages[messageIndex];
+      const prefillText =
+        rolledBackMsg && rolledBackMsg.role === 'user' && typeof rolledBackMsg.content === 'string'
+          ? rolledBackMsg.content
+          : '';
+
+      session.messages = session.messages.slice(0, messageIndex);
+      session.checkpoints = (session.checkpoints ?? []).filter(
+        (c) => (!ref || c.ref !== ref) && c.messageIndex < messageIndex
+      );
+      session.plan = [];
+      await this.persistCurrentSession();
+
+      // Rebuild the chat panel from the trimmed transcript.
+      this.post({ type: 'reset' });
+      this.post({
+        type: 'load-session',
+        payload: {
+          id: session.id,
+          title: session.title,
+          transcript: buildTranscript(session.messages, session.checkpoints),
+          plan: session.plan ?? []
+        }
+      });
+      // Drop the rolled-back prompt back into the composer so the user can
+      // tweak it and resend instead of retyping the whole thing.
+      if (prefillText) {
+        this.post({ type: 'prefill-composer', payload: { text: prefillText } });
+      }
+      vscode.window.showInformationMessage(
+        hasCheckpoint
+          ? 'BurstCode: rolled back code & chat to the previous prompt.'
+          : 'BurstCode: chat history truncated. Code on disk was NOT restored — no checkpoint was available.'
+      );
+    } finally {
+      // Always clear the overlay, on every exit path (cancel, failed restore,
+      // success, or an unexpected throw). The outer handleMessage().catch()
+      // does NOT post rollback-end, so without this the overlay could stick
+      // forever now that we show it BEFORE the disk I/O. Posting it after a
+      // successful reset is harmless (idempotent — it just hides the overlay).
+      this.post({ type: 'rollback-end' });
     }
-    vscode.window.showInformationMessage(
-      hasCheckpoint
-        ? 'BurstCode: rolled back code & chat to the previous prompt.'
-        : 'BurstCode: chat history truncated. Code on disk was NOT restored — no checkpoint was available.'
-    );
   }
 
   private async runAgent(userText: string): Promise<void> {
@@ -1349,6 +1363,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ...buildLangTools(),
       ...editTools,
       writeFileTool,
+      buildImageTool(this.logger),
       ...buildShellTools({ askUser }),
       buildPlanTool(onPlanUpdate),
       ...buildLessonTools(this.lessons, (list) => {

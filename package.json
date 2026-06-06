@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.76",
+"version": "0.1.78",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -253,6 +253,36 @@
           "default": [],
           "order": 27,
           "description": "Background profile · manually-curated model ids for the picker."
+        },
+        "burstcode.llm.image.model": {
+          "type": "string",
+          "default": "",
+          "order": 30,
+          "markdownDescription": "**Image profile** · model id used by the `generate_image` tool, e.g. `gpt-image-1`, `gpt-image-2`, `dall-e-3`. These are called via `/v1/images/generations` — they CANNOT be used as the chat model. Leave empty to default to `gpt-image-1`."
+        },
+        "burstcode.llm.image.baseURL": {
+          "type": "string",
+          "default": "",
+          "order": 31,
+          "description": "Image profile · OpenAI-compatible base URL for image generation. Leave empty to inherit from the chat profile."
+        },
+        "burstcode.llm.image.apiKey": {
+          "type": "string",
+          "default": "",
+          "order": 32,
+          "description": "Image profile · API key for the image endpoint. Leave empty to inherit from the chat profile."
+        },
+        "burstcode.llm.image.size": {
+          "type": "string",
+          "default": "1024x1024",
+          "order": 33,
+          "description": "Image profile · default image size (e.g. 1024x1024, 1024x1536, 1536x1024)."
+        },
+        "burstcode.llm.image.allowSelfSignedCerts": {
+          "type": "boolean",
+          "default": false,
+          "order": 34,
+          "description": "Image profile · skip TLS certificate verification for the image baseURL."
         },
         "burstcode.ui.language": {
           "type": "string",
