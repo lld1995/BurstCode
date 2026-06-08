@@ -1075,7 +1075,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Pending edits from EARLIER turns are left untouched: the user may still
     // be reviewing them and the restore-to-this-checkpoint preserves their
     // on-disk state.
-    const pendingFromHere = this.applier.pendingHunksFrom(messageIndex);
+    const pendingFromHere = this.applier.pendingHunksFrom(messageIndex, this.currentSession.id);
     if (pendingFromHere > 0) {
       const choice = await vscode.window.showWarningMessage(
         'BurstCode: there are still pending edits from this prompt onward. Discard them and roll back?',
@@ -1083,7 +1083,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         'Discard & Roll Back'
       );
       if (choice !== 'Discard & Roll Back') return;
-      await this.applier.rejectAllFrom(messageIndex);
+      await this.applier.rejectAllFrom(messageIndex, this.currentSession.id);
     }
 
     // Show the overlay immediately so the user sees feedback while we verify

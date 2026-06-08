@@ -249,10 +249,14 @@ export class HunkApplier implements vscode.Disposable {
    * Count pending hunks that belong to turn `minTurnIndex` or later. A
    * rollback to turn N uses this to decide whether it actually needs to
    * discard anything — pending edits from earlier turns are left untouched.
+   * When `sessionId` is provided, only edits owned by that chat session (plus
+   * legacy session-less entries) are counted; message indexes are per-session
+   * and must never be compared across different chat tabs.
    */
-  pendingHunksFrom(minTurnIndex: number): number {
+  pendingHunksFrom(minTurnIndex: number, sessionId?: string | null): number {
     let n = 0;
     for (const f of this.pending.values()) {
+      if (!this.matchesSession(f, sessionId)) continue;
       if (f.turnIndex < minTurnIndex) continue;
       n += f.hunks.filter((h) => h.status === 'pending').length;
     }
@@ -1107,11 +1111,13 @@ export class HunkApplier implements vscode.Disposable {
    * leaving pending edits from earlier (unrelated) turns intact. Used by
    * rollback: rolling back to turn N must NOT throw away edits the user is
    * still reviewing from turns before N. Brand-new files queued at/after the
-   * boundary with no surviving hunks are removed from disk.
+   * boundary with no surviving hunks are removed from disk. When `sessionId`
+   * is provided, the turn boundary is applied only within that chat session;
+   * message indexes from other tabs are unrelated and must not be rejected.
    */
-  async rejectAllFrom(minTurnIndex: number): Promise<void> {
+  async rejectAllFrom(minTurnIndex: number, sessionId?: string | null): Promise<void> {
     const snapshot = Array.from(this.pending.values()).filter(
-      (f) => f.turnIndex >= minTurnIndex
+      (f) => this.matchesSession(f, sessionId) && f.turnIndex >= minTurnIndex
     );
     await Promise.all(
       snapshot.map((file) =>
