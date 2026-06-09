@@ -47,18 +47,55 @@ const ORPHAN_PRUNE_TRIGGER_RATIO = 0.6;
 const ORPHAN_PRUNE_RECENT_GRACE = 6;
 
 /**
- * Minimum cumulative read_file / collect_context calls before we even consider
- * injecting the context-offload hint. Below this count the context window is
- * almost certainly small enough that inline reads are fine.
+ * Context-budget awareness tiers, as fractions of the model's context window.
+ * The agent has no intrinsic sense of how full its window is, so we feed it a
+ * `[context-status]` note whenever usage escalates into a higher tier. This lets
+ * the model self-regulate: narrow its read_file line ranges, push broad reading
+ * to sub-agents, or proactively compress — instead of blindly dumping whole
+ * files until the hard auto-compress at AUTO_COMPRESS_TRIGGER_RATIO kicks in.
+ *
+ *   tier 1 (>=55%): roomy but be intentional — read tight ranges.
+ *   tier 2 (>=72%): tightening — narrow reads, prefer sub-agents, consider compress.
+ *   tier 3 (>=85%): critical — auto-compression imminent; stop large reads.
  */
-const CONTEXT_OFFLOAD_MIN_READS = 3;
+const CONTEXT_STATUS_TIER_RATIOS = [0.55, 0.72, 0.85];
 
-/**
- * Only inject the offload hint when messages already occupy at least this
- * fraction of the model's context window. If the context is still small,
- * direct reads are cheaper and faster than spawning a sub-agent.
- */
-const CONTEXT_OFFLOAD_TOKEN_RATIO = 0.4;
+function contextStatusTier(ratio: number): number {
+  let tier = 0;
+  for (const t of CONTEXT_STATUS_TIER_RATIOS) if (ratio >= t) tier++;
+  return tier;
+}
+
+function buildContextStatusNote(tier: number, used: number, max: number): string {
+  const pct = max > 0 ? Math.round((used / max) * 100) : 0;
+  const remaining = Math.max(0, max - used);
+  const head =
+    `[context-status] Context window ~${pct}% full ` +
+    `(${used.toLocaleString()} / ${max.toLocaleString()} tokens; ~${remaining.toLocaleString()} left).`;
+  if (tier >= 3) {
+    return (
+      head +
+      ' CRITICAL — automatic compression will trigger soon and may drop detail. ' +
+      'Do NOT start new large reads. Finish or narrow the current step. If you still need to read, ' +
+      'delegate it to launch_subagent (it reads in its own isolated window; only a summary returns here). ' +
+      'If the remaining work is a distinct sub-task, call save_topic_doc then compress_context to reclaim budget.'
+    );
+  }
+  if (tier >= 2) {
+    return (
+      head +
+      ' Budget is tightening — scale down what you pull into context: ' +
+      '(1) read NARROW line ranges via read_file (startLine/endLine) instead of whole files; ' +
+      '(2) push broad exploration to launch_subagent so raw file content stays out of this window; ' +
+      '(3) if the current topic is wrapping up, save_topic_doc then compress_context.'
+    );
+  }
+  return (
+    head +
+    ' Still roomy, but be intentional from here: read only the line ranges you actually need rather than ' +
+    'whole large files, and batch related lookups into one collect_context call instead of many one-off reads.'
+  );
+}
 
 /**
  * After how many CONSECUTIVE turns of identical tool-call batches we consider
@@ -406,11 +443,12 @@ export class AgentLoop {
       if (state.recentDecision) decisionBuffer.push(state.recentDecision);
     });
 
-    // ---- context-offload hint state ----
-    // Counts cumulative read_file + collect_context calls this run.
-    // A one-shot hint is injected once the threshold is crossed.
-    let cumulativeReadCalls = 0;
-    let offloadHintInjected = false;
+    // ---- context-budget awareness state ----
+    // Highest context-status tier the model has already been told about. We only
+    // inject a fresh note when usage ESCALATES into a higher tier; when usage
+    // drops (e.g. after compression) this tracks back down so a later climb
+    // re-notifies. See contextStatusTier / buildContextStatusNote.
+    let lastContextStatusTier = 0;
 
     try {
     outerLoop: for (let iter = 0; iter < this.options.maxIterations; iter++) {
@@ -491,6 +529,29 @@ export class AgentLoop {
           payload: { before, after: usedTokens, max: ctxMax }
         };
       }
+
+      // ── Context-budget awareness ──────────────────────────────────────────
+      // Feed the model a compact status note whenever usage escalates into a
+      // higher tier, so it can self-regulate read granularity / offload to
+      // sub-agents / compress — rather than reading blindly until the hard
+      // auto-compress above fires. Escalation-only (tier must increase) keeps
+      // this from spamming context every turn; the tier tracks back down with
+      // usage so a later climb re-notifies.
+      const ctxStatusTier = ctxMax > 0 ? contextStatusTier(usedTokens / ctxMax) : 0;
+      if (ctxStatusTier > lastContextStatusTier) {
+        messages.push({
+          role: 'user',
+          content: buildContextStatusNote(ctxStatusTier, usedTokens, ctxMax)
+        });
+        this.logger.info(
+          `Context-status note injected: tier ${ctxStatusTier} ` +
+            `(${((usedTokens / ctxMax) * 100).toFixed(1)}% of ${ctxMax} tokens).`
+        );
+        // Re-measure so the gauge below reflects the appended note.
+        usedTokens = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
+      }
+      lastContextStatusTier = ctxStatusTier;
+
       yield {
         type: 'context-usage',
         payload: { used: usedTokens, max: ctxMax }
@@ -1256,10 +1317,6 @@ export class AgentLoop {
         const c = prepared[i];
         const result = results[i];
         if (!result) continue; // can happen if cancelled mid-batch
-        // Track cumulative heavy-read calls for context-offload hint.
-        if (c.name === 'read_file' || c.name === 'collect_context') {
-          cumulativeReadCalls++;
-        }
         const storedContent = normalizeToolResult(c.name, result.content);
         messages.push({
           role: 'tool',
@@ -1268,42 +1325,11 @@ export class AgentLoop {
         } as ChatMessage);
       }
 
-      // Inject a one-shot context-offload hint only when the context window is
-      // already getting large AND the model has made several read calls.
-      // Conditions (both must be true):
-      //   1. cumulativeReadCalls >= CONTEXT_OFFLOAD_MIN_READS — don't nudge on
-      //      the very first reads; small context means subagent overhead isn't
-      //      worth it.
-      //   2. Current messages already occupy >= CONTEXT_OFFLOAD_TOKEN_RATIO of
-      //      the model's context window — only then is offloading worthwhile.
-      if (!offloadHintInjected && cumulativeReadCalls >= CONTEXT_OFFLOAD_MIN_READS) {
-        const usedTokens = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
-        const contextWindow = this.options.contextWindow ?? 128_000;
-        const usageRatio = usedTokens / contextWindow;
-        if (usageRatio >= CONTEXT_OFFLOAD_TOKEN_RATIO) {
-          offloadHintInjected = true;
-          messages.push({
-            role: 'user',
-            content:
-              `[context-offload hint] You have now called read_file / collect_context ` +
-              `${cumulativeReadCalls} times in this run. Each call injects raw file content into ` +
-              `the shared context window, which grows without bound and forces expensive ` +
-              `compression. If you still need to read more files or gather more workspace ` +
-              `context, STRONGLY PREFER delegating that work to launch_subagent: give the ` +
-              `sub-agent a focused objective and let it read/grep inside its own isolated ` +
-              `context window — only the concise summary comes back here. Reserve direct ` +
-              `read_file / collect_context calls for single targeted lookups that cannot ` +
-              `be delegated (e.g. re-reading a file you are about to propose_edit on).`
-          });
-          this.logger.info(
-            `Context-offload hint injected after ${cumulativeReadCalls} reads (context usage: ${(usageRatio * 100).toFixed(1)}% of ${contextWindow} tokens).`
-          );
-        } else {
-          this.logger.debug(
-            `Context-offload hint suppressed: ${cumulativeReadCalls} reads but context only at ${(usageRatio * 100).toFixed(1)}% (threshold: ${(CONTEXT_OFFLOAD_TOKEN_RATIO * 100).toFixed(0)}%).`
-          );
-        }
-      }
+      // Context-budget awareness is handled at the next iteration boundary (see
+      // contextStatusTier / buildContextStatusNote above), where post-tool usage
+      // is freshly measured and a tiered `[context-status]` note is injected on
+      // escalation — superseding the old one-shot read-count offload hint.
+
       // propose_edit is non-blocking: the model gets a "queued" tool reply and
       // we just keep iterating. The user can accept/reject the queued edits
       // at any time — even after this run finishes — via the chat banner.

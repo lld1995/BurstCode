@@ -2487,6 +2487,32 @@ function preserveToolScrollableAutoScroll(det, root) {
 function preserveStreamingPreviewAutoScroll(det, body) {
   preserveToolScrollableAutoScroll(det, body);
 }
+// When a streamed tool finishes, applyRichTool tears out the live preview and
+// appends a freshly-built body — a brand-new scrollable whose scrollTop starts
+// at 0, so the box visibly jumps to the top right as the user finishes watching
+// it stream. Snapshot the live preview's scroll state BEFORE the swap so we can
+// put the new body back where the old one was (bottom if the user was following,
+// otherwise the same offset).
+const TC_SCROLLABLE_SEL = '.tc-code, .tool-args-stream, .tool-progress-log, pre';
+function captureToolScroll(det) {
+  if (!det || !det.querySelector) return null;
+  const el = det.querySelector(TC_SCROLLABLE_SEL);
+  // Only meaningful when the element actually overflows; a non-scrolling box has
+  // nothing to preserve (and reads as scrollTop 0 either way).
+  if (!el || el.scrollHeight <= el.clientHeight + 1) return null;
+  return { atBottom: tcScrollableAtBottom(el), scrollTop: el.scrollTop };
+}
+function restoreToolScroll(det, snap) {
+  if (!det || !snap || !det.querySelector) return;
+  // Double rAF: the new body's layout (and final scrollHeight) isn't settled in
+  // the frame it was appended, mirroring scheduleScrollToBottom's two-pass fix.
+  const apply = () => {
+    const el = det.querySelector(TC_SCROLLABLE_SEL);
+    if (!el) return;
+    el.scrollTop = snap.atBottom ? el.scrollHeight : Math.min(snap.scrollTop, el.scrollHeight);
+  };
+  requestAnimationFrame(() => { apply(); requestAnimationFrame(apply); });
+}
 function forceScrollToBottom() {
   autoScroll = true;
   scheduleScrollToBottom(true);
@@ -3640,10 +3666,15 @@ function applyRichTool(det, name, args, meta, result, isError, done) {
     // Replace the default body with the rich body if we can build one.
     const body = tcRichBody(name, args, meta, result, isError);
     if (body) {
+      // Snapshot where the live preview was scrolled BEFORE we discard it, so the
+      // freshly-built body doesn't snap back to the top (the new node's scrollTop
+      // is 0). Captured pre-removal; restored after the new body is in the DOM.
+      const scrollSnap = captureToolScroll(det);
       // Remove any default <pre> dumps / arg streams / live previews we made earlier.
       det.querySelectorAll(':scope > pre, :scope > .tool-args-stream, :scope > .tc-stream-preview').forEach((el) => el.remove());
       det.appendChild(body);
       preserveToolScrollableAutoScroll(det, body);
+      restoreToolScroll(det, scrollSnap);
     }
   }
   return true;
