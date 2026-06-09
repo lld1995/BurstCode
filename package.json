@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-"version": "0.1.79",
+  "version": "0.1.80",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -102,6 +102,14 @@
       {
         "command": "burstcode.selectLanguage",
         "title": "BurstCode: Select Side Panel Language"
+      },
+      {
+        "command": "burstcode.openGlobalRules",
+        "title": "BurstCode: Open Global Rules"
+      },
+      {
+        "command": "burstcode.openGlobalSkills",
+        "title": "BurstCode: Open Global Skills Folder"
       },
       {
         "command": "burstcode.restoreCheckpoint",

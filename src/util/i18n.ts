@@ -74,6 +74,10 @@ const EN: Dict = {
   'actions.openChat': 'Open chat',
   'actions.newChat': 'New chat',
   'actions.runNow': 'Run background analysis now',
+  'actions.globalRules': 'Global rules',
+  'actions.globalRules.tip': 'Open .burstcode/rules.md. Its contents are injected into every agent run in this workspace.',
+  'actions.globalSkills': 'Global skills',
+  'actions.globalSkills.tip': 'Open .burstcode/skills/. Create one skill per Markdown file; BurstCode injects only skills matching the current task.',
   'actions.showLog': 'Show background activity log',
   'actions.restoreCheckpoint': 'Restore Git checkpoint…',
 
@@ -153,6 +157,10 @@ const ZH: Dict = {
   'actions.openChat': '打开聊天',
   'actions.newChat': '新建聊天',
   'actions.runNow': '立即运行后台分析',
+  'actions.globalRules': '全局规则',
+  'actions.globalRules.tip': '打开 .burstcode/rules.md。该文件内容会注入此工作区的每次 agent 执行。',
+  'actions.globalSkills': '全局技能',
+  'actions.globalSkills.tip': '打开 .burstcode/skills/。每个 Markdown 文件对应一个 skill；BurstCode 只注入匹配当前任务的 skill。',
   'actions.showLog': '查看后台活动日志',
   'actions.restoreCheckpoint': '恢复 Git 检查点…',
 

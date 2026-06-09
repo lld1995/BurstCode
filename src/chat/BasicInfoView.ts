@@ -251,6 +251,18 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
         icon: 'play',
         command: { command: 'burstcode.background.runOnce', title: 'Run Once' }
       }),
+      new BasicNode('leaf', t('actions.globalRules'), {
+        description: '.burstcode/rules.md',
+        icon: 'law',
+        tooltip: t('actions.globalRules.tip'),
+        command: { command: 'burstcode.openGlobalRules', title: 'Open Global Rules' }
+      }),
+      new BasicNode('leaf', t('actions.globalSkills'), {
+        description: '.burstcode/skills/',
+        icon: 'tools',
+        tooltip: t('actions.globalSkills.tip'),
+        command: { command: 'burstcode.openGlobalSkills', title: 'Open Global Skills Folder' }
+      }),
       new BasicNode('leaf', t('actions.showLog'), {
         icon: 'output',
         command: { command: 'burstcode.background.showActivityLog', title: 'Show Log' }

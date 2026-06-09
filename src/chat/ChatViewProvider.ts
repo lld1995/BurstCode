@@ -33,6 +33,7 @@ import { buildShellTools } from '../agent/tools/shell';
 import { buildContextTools } from '../agent/tools/context';
 import { buildSubagentTool } from '../agent/tools/subagent';
 import { LessonStore, renderLessonsBlock } from '../memory/LessonStore';
+import { readGlobalRules, readGlobalSkills } from '../memory/GlobalRules';
 import { CheckpointInfo, GitCheckpoint } from '../git/GitCheckpoint';
 import {
   Session,
@@ -898,12 +899,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * protocol with a freshly-walked workspace outline. Falls back gracefully if
    * no folder is open or the walk fails.
    */
-  private async buildSystemPromptForRun(): Promise<string> {
+  private async buildSystemPromptForRun(taskText = ''): Promise<string> {
     const lessonsRender = renderLessonsBlock(this.lessons.list());
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const currentPlan = this.currentSession?.plan;
+    const globalRules = root
+      ? await readGlobalRules(root).catch((err) => {
+        this.logger.warn('Failed to read global rules', String(err));
+        return undefined;
+      })
+      : undefined;
+    const globalSkills = root
+      ? await readGlobalSkills(root, taskText).catch((err) => {
+        this.logger.warn('Failed to read global skills', String(err));
+        return undefined;
+      })
+      : undefined;
     if (!root) {
       return buildSystemPrompt({
+        globalRules: globalRules?.text,
+        globalRulesTruncated: globalRules?.truncated,
+        globalSkills: globalSkills?.text,
+        globalSkillsTruncated: globalSkills?.truncated,
         lessonsBlock: lessonsRender.text,
         lessonsTruncated: lessonsRender.truncated,
         currentPlan
@@ -919,6 +936,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         workspaceRoot: root,
         workspaceOutline: outline.text,
         outlineTruncated: outline.truncated,
+        globalRules: globalRules?.text,
+        globalRulesTruncated: globalRules?.truncated,
+        globalSkills: globalSkills?.text,
+        globalSkillsTruncated: globalSkills?.truncated,
         lessonsBlock: lessonsRender.text,
         lessonsTruncated: lessonsRender.truncated,
         currentPlan,
@@ -928,6 +949,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.logger.warn('Failed to build workspace outline', String(err));
       return buildSystemPrompt({
         workspaceRoot: root,
+        globalRules: globalRules?.text,
+        globalRulesTruncated: globalRules?.truncated,
+        globalSkills: globalSkills?.text,
+        globalSkillsTruncated: globalSkills?.truncated,
         lessonsBlock: lessonsRender.text,
         lessonsTruncated: lessonsRender.truncated,
         currentPlan,
@@ -1285,7 +1310,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     })();
 
-    const systemPromptPromise = this.buildSystemPromptForRun();
+    const systemPromptPromise = this.buildSystemPromptForRun(userText);
     if (isActive()) this.broadcastContextUsage();
     void this.persistSession(session);
 
@@ -2422,6 +2447,45 @@ function scheduleScrollToBottom(force) {
 }
 function scrollToBottom() {
   if (autoScroll) scheduleScrollToBottom(false);
+}
+function tcScrollableAtBottom(el) {
+  return !!el && el.scrollHeight - el.scrollTop - el.clientHeight <= SCROLL_BOTTOM_THRESHOLD;
+}
+function preserveToolScrollableAutoScroll(det, root) {
+  const nodes = [];
+  if (root && root.matches && root.matches('.tc-code, .tool-progress-log, .tool-args-stream, pre')) nodes.push(root);
+  if (root && root.querySelectorAll) nodes.push(...Array.from(root.querySelectorAll('.tc-code, .tool-progress-log, .tool-args-stream, pre')));
+  const scrollables = Array.from(new Set(nodes)).filter((el) => el && el.scrollHeight > el.clientHeight);
+  if (!scrollables.length) return;
+  if (!det.dataset.tcPreviewAutoScroll) det.dataset.tcPreviewAutoScroll = 'true';
+  const shouldFollow = det.dataset.tcPreviewAutoScroll !== 'false';
+  for (const el of scrollables) {
+    if (!el.dataset.tcAutoScrollBound) {
+      el.dataset.tcAutoScrollBound = 'true';
+      const markManual = () => { det.dataset.tcPreviewManualScrollAt = String(Date.now()); };
+      el.addEventListener('wheel', markManual, { passive: true });
+      el.addEventListener('touchmove', markManual, { passive: true });
+      el.addEventListener('pointerdown', markManual, { passive: true });
+      el.addEventListener('scroll', () => {
+        const manualAt = Number(det.dataset.tcPreviewManualScrollAt || '0');
+        const atBottom = tcScrollableAtBottom(el);
+        if (Date.now() - manualAt < 800 || atBottom) {
+          det.dataset.tcPreviewAutoScroll = atBottom ? 'true' : 'false';
+        }
+      }, { passive: true });
+    }
+    if (shouldFollow) {
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight;
+        requestAnimationFrame(() => {
+          if (det.dataset.tcPreviewAutoScroll !== 'false') el.scrollTop = el.scrollHeight;
+        });
+      });
+    }
+  }
+}
+function preserveStreamingPreviewAutoScroll(det, body) {
+  preserveToolScrollableAutoScroll(det, body);
 }
 function forceScrollToBottom() {
   autoScroll = true;
@@ -3579,6 +3643,7 @@ function applyRichTool(det, name, args, meta, result, isError, done) {
       // Remove any default <pre> dumps / arg streams / live previews we made earlier.
       det.querySelectorAll(':scope > pre, :scope > .tool-args-stream, :scope > .tc-stream-preview').forEach((el) => el.remove());
       det.appendChild(body);
+      preserveToolScrollableAutoScroll(det, body);
     }
   }
   return true;
@@ -3649,6 +3714,7 @@ function tcStreamRichPreview(det, name, partialArgs) {
   det.querySelectorAll(':scope > .tc-stream-preview, :scope > .tool-args-stream').forEach((el) => el.remove());
   body.classList.add('tc-stream-preview');
   det.appendChild(body);
+  preserveStreamingPreviewAutoScroll(det, body);
   const sum = det.querySelector('summary');
   if (sum) {
     const html = tcSummaryHtml(name, partialArgs, null, false, false);
@@ -4431,6 +4497,7 @@ window.addEventListener('message', (e) => {
             }
             const shown = argDet.dataset.argsBuf;
             argPre.textContent = shown.length > 8000 ? '...' + shown.slice(-7000) : shown;
+            preserveToolScrollableAutoScroll(argDet, argPre);
           }
         }
         scrollToBottom();
@@ -4454,9 +4521,10 @@ window.addEventListener('message', (e) => {
         }
         const line = String((msg.payload && msg.payload.message) || '');
         progPre.textContent = (progPre.textContent ? progPre.textContent + '\\n' : '') + line;
-        if (progPre.textContent.length > 8000) {
-          progPre.textContent = '...' + progPre.textContent.slice(-7500);
-        }
+          if (progPre.textContent.length > 8000) {
+            progPre.textContent = '...' + progPre.textContent.slice(-7500);
+          }
+          preserveToolScrollableAutoScroll(progDet, progPre);
       }
       scrollToBottom();
       break;
@@ -4495,6 +4563,7 @@ window.addEventListener('message', (e) => {
           const pre = document.createElement('pre');
           pre.textContent = (msg.payload.result || '').slice(0, 4000);
           det.appendChild(pre);
+          preserveToolScrollableAutoScroll(det, pre);
         }
       }
       if (key) runningTools.delete(key);

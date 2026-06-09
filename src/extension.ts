@@ -16,6 +16,10 @@ import {
   fetchProfileModels,
   writeCachedFetchedModels
 } from './llm/OpenAIClient';
+import {
+  openGlobalRulesFile,
+  openGlobalSkillsDirectory
+} from './memory/GlobalRules';
 import { WorkspaceIndex } from './context/WorkspaceIndex';
 import { BackgroundExplorer, ExplorerStatus } from './background/BackgroundExplorer';
 import { t, UI_LANGUAGE_CONFIG_KEY } from './util/i18n';
@@ -270,6 +274,33 @@ export function activate(context: vscode.ExtensionContext): void {
       basicInfoView.setBackgroundStatus(s);
     }),
     chatProvider.onDidForegroundActivity((reason) => backgroundExplorer.notifyForegroundActivity(reason))
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('burstcode.openGlobalRules', async () => {
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!root) {
+        vscode.window.showWarningMessage('BurstCode: open a workspace folder first.');
+        return;
+      }
+      try {
+        await openGlobalRulesFile(root);
+      } catch (err) {
+        vscode.window.showErrorMessage(`BurstCode: failed to open global rules — ${String((err as Error).message ?? err)}`);
+      }
+    }),
+    vscode.commands.registerCommand('burstcode.openGlobalSkills', async () => {
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!root) {
+        vscode.window.showWarningMessage('BurstCode: open a workspace folder first.');
+        return;
+      }
+      try {
+        await openGlobalSkillsDirectory(root);
+      } catch (err) {
+        vscode.window.showErrorMessage(`BurstCode: failed to open global skills folder — ${String((err as Error).message ?? err)}`);
+      }
+    })
   );
 
   context.subscriptions.push(

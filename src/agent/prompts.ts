@@ -11,6 +11,14 @@ export interface SystemPromptInput {
   outlineTruncated?: boolean;
   /** Absolute path of the active workspace root. */
   workspaceRoot?: string;
+  /** User-authored workspace rules read from `.burstcode/rules.md`. */
+  globalRules?: string;
+  /** True when the global rules block was truncated due to size. */
+  globalRulesTruncated?: boolean;
+  /** Relevant user-authored workspace skills selected from `.burstcode/skills/`. */
+  globalSkills?: string;
+  /** True when one or more selected skills were truncated due to size. */
+  globalSkillsTruncated?: boolean;
   /**
    * Pre-rendered lessons block (see `renderLessonsBlock`). When omitted or
    * empty the prompt still mentions the lessons protocol so the agent can
@@ -393,6 +401,28 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): string {
 
   if (input.workspaceRoot) {
     volatile.push(`<workspace_root>${input.workspaceRoot}</workspace_root>`);
+  }
+
+  if (input.globalRules && input.globalRules.trim().length > 0) {
+    const rulesTrunc = input.globalRulesTruncated
+      ? '\n(Note: global rules were truncated — open .burstcode/rules.md for the full file if needed.)'
+      : '';
+    const escapedRules = input.globalRules.trim().replace(/<\/user_global_rules>/gi, '<\\/user_global_rules>');
+    volatile.push(
+      `<user_global_rules path=".burstcode/rules.md">\n${escapedRules}\n</user_global_rules>${rulesTrunc}\n` +
+      `These are user-authored workspace-wide requirements. Follow them for every agent action unless the user explicitly overrides them in the current turn.`
+    );
+  }
+
+  if (input.globalSkills && input.globalSkills.trim().length > 0) {
+    const skillsTrunc = input.globalSkillsTruncated
+      ? '\n(Note: one or more selected skills were truncated — open .burstcode/skills/ for the full files if needed.)'
+      : '';
+    const escapedSkills = input.globalSkills.trim().replace(/<\/user_global_skills>/gi, '<\\/user_global_skills>');
+    volatile.push(
+      `<user_global_skills path=".burstcode/skills/" selection="task-relevant">\n${escapedSkills}\n</user_global_skills>${skillsTrunc}\n` +
+      `These are user-authored reusable skills/workflows selected from multiple files for the current task. Apply matching skill instructions unless the user explicitly overrides them in the current turn.`
+    );
   }
 
   if (input.workspaceOutline && input.workspaceOutline.trim().length > 0) {

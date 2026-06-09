@@ -510,7 +510,7 @@ export class AgentLoop {
         { id?: string; name: string; arguments: string }
       >();
       const preAnnounced = new Set<number>();
-      const argDeltaBuffers = new Map<string, string>(); // id -> buffered arg text not yet emitted
+      const argDeltaBuffers = new Map<string, { id?: string; text: string }>(); // idx -> buffered arg text + current tool-call id
       let finishReason: string | undefined;
 
       // Auto-resume on transient stream errors. We retry the whole turn
@@ -607,13 +607,13 @@ export class AgentLoop {
               // buffer key so we don't need entry.id, which may be absent.
               if (preAnnounced.has(idx) && chunk.toolCallDelta.argumentsDelta) {
                 const bufKey = String(idx);
-                const prev = argDeltaBuffers.get(bufKey) ?? '';
-                const next = prev + chunk.toolCallDelta.argumentsDelta;
+                const prev = argDeltaBuffers.get(bufKey);
+                const next = (prev?.text ?? '') + chunk.toolCallDelta.argumentsDelta;
                 if (next.length >= 40) {
-                  argDeltaBuffers.set(bufKey, '');
+                  argDeltaBuffers.set(bufKey, { id: entry.id, text: '' });
                   yield { type: 'tool-call-args-delta', payload: { id: entry.id, delta: next } };
                 } else {
-                  argDeltaBuffers.set(bufKey, next);
+                  argDeltaBuffers.set(bufKey, { id: entry.id, text: next });
                 }
               }
             }
@@ -625,10 +625,10 @@ export class AgentLoop {
           }
           streamOk = true;
           // Flush any buffered arg delta text that didn't reach the 40-char threshold.
-          // The buffer keys are String(idx), not entry.id — send id:undefined so the
-          // webview falls back to activeStreamingToolEl for element lookup.
+          // Keep the generated per-call id so multiple simultaneous streamed tool calls
+          // do not route their tail fragments to the last active tool card.
           for (const [, buf] of argDeltaBuffers) {
-            if (buf) yield { type: 'tool-call-args-delta', payload: { id: undefined, delta: buf } };
+            if (buf.text) yield { type: 'tool-call-args-delta', payload: { id: buf.id, delta: buf.text } };
           }
           argDeltaBuffers.clear();
           // Empty response with no finish_reason = transient backend issue (silent
