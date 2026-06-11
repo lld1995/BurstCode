@@ -628,8 +628,9 @@ function normalizeDeepSeekReasoning(messages: ChatMessage[], model: string): Cha
  *   endpoints always receive a shape-correct request body.
  */
 function prepareMessagesForModel(messages: ChatMessage[], model: string): ChatMessage[] {
+  let out: ChatMessage[];
   if (model.toLowerCase().includes('claude')) {
-    return messages.map((m) => {
+    out = messages.map((m) => {
       if (m.role !== 'assistant') return m;
       // 1. Drop reasoning_content so no proxy can synthesise a thinking block.
       const { reasoning_content: _rc, ...rest } =
@@ -649,11 +650,109 @@ function prepareMessagesForModel(messages: ChatMessage[], model: string): ChatMe
       }
       return msg;
     });
+  } else if (model.toLowerCase().includes('deepseek')) {
+    out = normalizeDeepSeekReasoning(messages, model);
+  } else {
+    out = normalizeReasoningContent(messages);
   }
-  if (model.toLowerCase().includes('deepseek')) {
-    return normalizeDeepSeekReasoning(messages, model);
+  // FINAL pre-flight pass — runs for EVERY model at the single request
+  // chokepoint. Per-model normalisation above can null out assistant content
+  // or strip blocks, and (more importantly) the persistent history may have
+  // been left with a dangling assistant `tool_calls` whose `tool` reply never
+  // arrived — e.g. when a tool batch was cancelled mid-flight (AgentLoop's
+  // `if (!result) continue`) or a stream was interrupted/auto-resumed before
+  // the matching tool reply was pushed. Anthropic-style proxies reject such a
+  // request with:
+  //   400 unexpected `tool_use_id` found in `tool_result` blocks / each
+  //       `tool_result` must have a corresponding `tool_use` in the previous
+  //       message.
+  // sanitizeToolPairing strips any unpaired tool_calls and orphan tool
+  // replies so the body is always valid regardless of how history got here.
+  return enforceToolCallPairing(out);
+}
+
+/**
+ * Final defensive guarantee that the message list satisfies the strict
+ * tool-call ↔ tool-result contract demanded by Anthropic-style backends:
+ *   - every assistant `tool_calls` entry has a matching `tool` reply that
+ *     comes immediately after it (ids that never get a reply are dropped), and
+ *   - every `tool` reply references a `tool_call_id` declared on the directly
+ *     preceding assistant message (orphans are dropped).
+ *
+ * This duplicates the intent of Compressor.sanitizeToolPairing but is applied
+ * here as the LAST transform before the wire, so it also catches inconsistency
+ * introduced AFTER compression (per-model rewriting) or by a persistent history
+ * that was left dangling by a cancelled/interrupted turn.
+ */
+function enforceToolCallPairing(messages: ChatMessage[]): ChatMessage[] {
+  type AssistantWithCalls = ChatMessage & {
+    tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
+  };
+
+  // Pass 1: for each assistant tool-call message, collect the set of ids that
+  // are actually answered by `tool` replies in the contiguous run that follows
+  // it (a run is broken by any assistant/user/system message).
+  const answeredAt = new Map<number, Set<string>>();
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role !== 'assistant') continue;
+    const calls = (m as AssistantWithCalls).tool_calls;
+    if (!calls || calls.length === 0) continue;
+    const ids = new Set(calls.map((c) => c.id));
+    const answered = new Set<string>();
+    for (let j = i + 1; j < messages.length; j++) {
+      const r = messages[j];
+      if (r.role !== 'tool') break; // run ends at the first non-tool message
+      const id = (r as ChatMessage & { tool_call_id?: string }).tool_call_id;
+      if (id && ids.has(id)) answered.add(id);
+    }
+    answeredAt.set(i, answered);
   }
-  return normalizeReasoningContent(messages);
+
+  // Pass 2: rebuild, pruning unpaired tool_calls and orphan tool replies.
+  const out: ChatMessage[] = [];
+  let activeIds: Set<string> | null = null;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role === 'assistant') {
+      const calls = (m as AssistantWithCalls).tool_calls;
+      if (calls && calls.length > 0) {
+        const answered = answeredAt.get(i) ?? new Set<string>();
+        const kept = calls.filter((c) => answered.has(c.id));
+        if (kept.length === 0) {
+          // No tool reply arrived: demote to a plain assistant message (or drop
+          // it entirely if it has no visible content either).
+          const rest = { ...(m as AssistantWithCalls) };
+          delete rest.tool_calls;
+          const hasText =
+            typeof rest.content === 'string'
+              ? rest.content.length > 0
+              : Array.isArray(rest.content)
+                ? rest.content.length > 0
+                : false;
+          if (hasText) out.push(rest as ChatMessage);
+          activeIds = null;
+        } else {
+          out.push({ ...(m as AssistantWithCalls), tool_calls: kept } as ChatMessage);
+          activeIds = new Set(kept.map((c) => c.id));
+        }
+      } else {
+        out.push(m);
+        activeIds = null;
+      }
+    } else if (m.role === 'tool') {
+      const id = (m as ChatMessage & { tool_call_id?: string }).tool_call_id;
+      if (activeIds && id && activeIds.has(id)) {
+        out.push(m);
+        activeIds.delete(id); // each id is answered at most once
+      }
+      // else: orphan tool reply — drop it.
+    } else {
+      out.push(m);
+      if (m.role === 'user' || m.role === 'system') activeIds = null;
+    }
+  }
+  return out;
 }
 
 export class OpenAIClient {

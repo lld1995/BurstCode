@@ -1130,17 +1130,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       let confirmed = false;
 
+      // Scope the rollback to ONLY the files this chat session actually wrote
+      // (propose_edit / write_file). Files changed by another chat tab, a
+      // background run, or by hand are never reverted or deleted — a rollback
+      // must only undo what THIS session produced. We union the in-memory
+      // tracker with the set persisted on the checkpoint entry so the scope
+      // survives an extension reload (in-memory tracker starts empty then).
+      const sessionScope = new Set(this.applier.touchedFilesFor(this.currentSession.id));
+      const persisted = (this.currentSession.checkpoints ?? []).find((c) => ref && c.ref === ref);
+      for (const p of persisted?.touchedFiles ?? []) sessionScope.add(p);
+
       // Build a preview of the files that will actually revert so the user can
       // see the blast radius before confirming — and let them click into each
       // file's diff (checkpoint snapshot ↔ current) before deciding.
       if (hasCheckpoint) {
-        const affected = await this.gitCheckpoint.listAffectedFiles(ref);
+        const affected = await this.gitCheckpoint.listAffectedFiles(ref, sessionScope);
         if (affected.length > 0) {
           confirmed = await this.confirmRollbackWithDiffs(ref, affected);
         } else {
           const choice = await vscode.window.showWarningMessage(
             'Roll back the working tree to the state right before this prompt? Conversation after this point will also be removed. Your current working tree will first be saved as a safety checkpoint.' +
-              '\n\nNo file changes detected since this prompt — only the chat history will be truncated.',
+              '\n\nNo file changes by this session detected since this prompt — only the chat history will be truncated.',
             { modal: true },
             'Roll Back'
           );
@@ -1158,7 +1168,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       if (hasCheckpoint) {
-        const ok = await this.gitCheckpoint.restoreCheckpoint(ref);
+        const ok = await this.gitCheckpoint.restoreCheckpoint(ref, sessionScope);
         if (!ok) {
           return;
         }
@@ -1364,7 +1374,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const systemPrompt = await systemPromptPromise;
     const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
     const coreReadTools: Tool[] = [buildCollectContextTool(this.applier), buildReadFileTool(this.applier), listDirTool, grepSearchTool, workspaceOutlineTool, webSearchTool, readWebpageTool];
-    const writeFileTool = buildWriteFileTool();
+    const writeFileTool = buildWriteFileTool(this.applier);
     const lspTools = buildLspTools(bridge, this.depGuard);
     const editTools = buildEditTools(this.applier, askUser);
     const subagentTool = buildSubagentTool({
@@ -1512,6 +1522,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             : 'completed';
       this.foregroundActivityEmitter.fire('chat-end');
       if (isActive()) this.broadcastContextUsage();
+      // Persist the set of files THIS run wrote onto its checkpoint so a later
+      // rollback stays session-scoped even after an extension reload (the
+      // in-memory tracker in HunkApplier starts empty on restart).
+      try {
+        const cps = session.checkpoints ?? [];
+        if (cps.length > 0) {
+          const latest = cps.reduce((a, b) => (b.messageIndex >= a.messageIndex ? b : a));
+          latest.touchedFiles = this.applier.touchedFilesFor(session.id);
+        }
+      } catch (err) {
+        this.logger.debug('Failed to persist touched files on checkpoint', String(err));
+      }
       await this.persistSession(session);
       this.broadcastSessions();
     }

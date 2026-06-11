@@ -348,7 +348,7 @@ export const grepSearchTool: Tool = {
  * existing source files that belong to the user, prefer propose_edit so the
  * user can review and accept the diff.
  */
-export function buildWriteFileTool(): Tool {
+export function buildWriteFileTool(applier?: HunkApplier): Tool {
   return {
     name: 'write_file',
     parallelSafe: true,
@@ -380,6 +380,9 @@ export function buildWriteFileTool(): Tool {
         let existed = false;
         try { await fsModule.access(uri.fsPath); existed = true; } catch { existed = false; }
         await fsModule.writeFile(uri.fsPath, content, 'utf8');
+        // Bind this write to the current session so a later rollback only
+        // reverts/deletes files THIS session actually wrote.
+        try { applier?.recordTouchedFile(uri); } catch { /* non-fatal */ }
         const relPath = vscode.workspace.asRelativePath(uri);
         return {
           content: `Written ${content.split(/\r?\n/).length} line(s) to ${relPath}`,

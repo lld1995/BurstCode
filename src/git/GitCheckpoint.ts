@@ -58,6 +58,20 @@ export class GitCheckpoint {
 
   constructor(private readonly logger: Logger) {}
 
+  /**
+   * Normalize a set of workspace-relative paths to POSIX form (forward
+   * slashes, no leading "./") so they compare cleanly against snapshot keys
+   * regardless of the OS path separator the caller used.
+   */
+  private static normalizePathSet(paths: Set<string>): Set<string> {
+    const out = new Set<string>();
+    for (const p of paths) {
+      if (!p) continue;
+      out.add(p.replace(/\\/g, '/').replace(/^\.\//, ''));
+    }
+    return out;
+  }
+
   isEnabled(): boolean {
     return (
       vscode.workspace.getConfiguration('burstcode.git').get<boolean>('autoCheckpoint') ?? true
@@ -421,7 +435,7 @@ export class GitCheckpoint {
    * blob are omitted (restoring them is a no-op). Returns an empty array for
    * legacy git refs or when nothing resolves.
    */
-  async listAffectedFiles(ref: string): Promise<string[]> {
+  async listAffectedFiles(ref: string, allowedPaths?: Set<string>): Promise<string[]> {
     if (!ref || !ref.startsWith(GitCheckpoint.FILE_REF_PREFIX)) return [];
     const wsRoot = await this.workspaceRoot();
     if (!wsRoot) return [];
@@ -431,8 +445,14 @@ export class GitCheckpoint {
     } catch {
       return [];
     }
+    // When the caller scopes the rollback to the current session's files, the
+    // preview must list ONLY those files — never files owned by another tab.
+    const scope = allowedPaths ? GitCheckpoint.normalizePathSet(allowedPaths) : null;
     const changed: string[] = [];
-    const checks = Array.from(sourceMap.entries()).map(([relativePath, sourcePath]) => async () => {
+    const entries = scope
+      ? Array.from(sourceMap.entries()).filter(([rel]) => scope.has(rel.replace(/\\/g, '/')))
+      : Array.from(sourceMap.entries());
+    const checks = entries.map(([relativePath, sourcePath]) => async () => {
       try {
         const snapshot = await fs.promises.readFile(sourcePath, 'utf-8');
         let current: string | null = null;
@@ -447,6 +467,20 @@ export class GitCheckpoint {
       }
     });
     await GitCheckpoint.runPool(checks, GitCheckpoint.IO_CONCURRENCY);
+    // Session-created files (written this session, absent from the snapshot)
+    // will be DELETED by a scoped rollback, so surface them in the preview too.
+    if (scope) {
+      for (const rel of scope) {
+        const inSnapshot = sourceMap.has(rel) || sourceMap.has(rel.replace(/\//g, path.sep));
+        if (inSnapshot) continue;
+        try {
+          await fs.promises.access(path.join(wsRoot, rel));
+          if (!changed.includes(rel)) changed.push(rel);
+        } catch {
+          /* not on disk → nothing to delete */
+        }
+      }
+    }
     changed.sort();
     return changed;
   }
@@ -569,9 +603,9 @@ export class GitCheckpoint {
     return infos.sort((a, b) => b.createdAt - a.createdAt);
   }
 
-  async restoreCheckpoint(ref: string): Promise<boolean> {
+  async restoreCheckpoint(ref: string, allowedPaths?: Set<string>): Promise<boolean> {
     if (ref.startsWith(GitCheckpoint.FILE_REF_PREFIX)) {
-      return this.restoreFileCheckpoint(ref);
+      return this.restoreFileCheckpoint(ref, allowedPaths);
     }
     if (ref.startsWith(GitCheckpoint.GIT_REF_PREFIX)) {
       return this.restoreGitCheckpoint(ref);
@@ -580,7 +614,7 @@ export class GitCheckpoint {
     return false;
   }
 
-  private async restoreFileCheckpoint(ref: string): Promise<boolean> {
+  private async restoreFileCheckpoint(ref: string, allowedPaths?: Set<string>): Promise<boolean> {
     const wsRoot = await this.workspaceRoot();
     if (!wsRoot) {
       vscode.window.showErrorMessage('BurstCode: no workspace folder available.');
@@ -605,9 +639,25 @@ export class GitCheckpoint {
       // Compose the full snapshot by walking the delta chain (base → … →
       // target). Each entry maps a workspace-relative path to the stored
       // checkpoint blob it should be restored from; newer checkpoints win.
-      const sourceMap = this._resolvedSourceMapRef === ref && this._resolvedSourceMapCache
+      const fullSourceMap = this._resolvedSourceMapRef === ref && this._resolvedSourceMapCache
         ? new Map(this._resolvedSourceMapCache)
         : await this.resolveCheckpointChain(wsRoot, ref, new Set());
+
+      // SESSION-SCOPED ROLLBACK: when the caller passes `allowedPaths` (the set
+      // of files the current chat session actually wrote), restrict BOTH the
+      // restore and the orphan-deletion to those files. Files changed by another
+      // chat tab, a background run, or by hand are left exactly as they are — a
+      // rollback must never clobber work it did not produce. With no scope set
+      // we fall back to the legacy whole-tree behaviour (e.g. the quick-pick
+      // "Restore Checkpoint" command, which is intentionally global).
+      const scope = allowedPaths ? GitCheckpoint.normalizePathSet(allowedPaths) : null;
+      const sourceMap = scope
+        ? new Map(
+            Array.from(fullSourceMap.entries()).filter(([rel]) =>
+              scope.has(rel.replace(/\\/g, '/'))
+            )
+          )
+        : fullSourceMap;
 
       // Concurrent restore
       const skippedPaths: string[] = [];
@@ -647,15 +697,36 @@ export class GitCheckpoint {
         if (removed > 0) this.logger.info('Pruned forward checkpoints after rollback', { removed });
       }
 
-      // Post-restore cleanup: delete files that exist on disk but are NOT in the
-      // resolved snapshot. These are files created AFTER the checkpoint (by
-      // write_file or propose_edit new-file creation) that the snapshot doesn't
-      // know about — without this step they'd survive the rollback as orphans.
-      // We skip the checkpoint directory itself and common build artifacts.
-      const snapshotPaths = new Set(sourceMap.keys());
-      const postRestoreDeleted = await this.deleteOrphanFiles(wsRoot, wsRoot, snapshotPaths, new Set());
-      if (postRestoreDeleted > 0) {
-        this.logger.info('Deleted orphan files after restore', { count: postRestoreDeleted });
+      if (scope) {
+        // Scoped rollback: only delete files the SESSION created — i.e. paths
+        // the session wrote that did NOT exist at checkpoint time (absent from
+        // the full snapshot). We must not walk the whole tree here: that would
+        // delete files belonging to other sessions / the user.
+        let deletedCreated = 0;
+        for (const rel of scope) {
+          if (fullSourceMap.has(rel) || fullSourceMap.has(rel.replace(/\//g, path.sep))) continue;
+          const abs = path.join(wsRoot, rel);
+          try {
+            await fs.promises.unlink(abs);
+            deletedCreated++;
+          } catch {
+            /* missing or locked — nothing to clean up */
+          }
+        }
+        if (deletedCreated > 0) {
+          this.logger.info('Deleted session-created files after scoped restore', { count: deletedCreated });
+        }
+      } else {
+        // Legacy whole-tree rollback (quick-pick command): delete files that
+        // exist on disk but are NOT in the resolved snapshot. These are files
+        // created AFTER the checkpoint that the snapshot doesn't know about —
+        // without this step they'd survive the rollback as orphans. We skip the
+        // checkpoint directory itself and common build artifacts.
+        const snapshotPaths = new Set(sourceMap.keys());
+        const postRestoreDeleted = await this.deleteOrphanFiles(wsRoot, wsRoot, snapshotPaths, new Set());
+        if (postRestoreDeleted > 0) {
+          this.logger.info('Deleted orphan files after restore', { count: postRestoreDeleted });
+        }
       }
 
       return true;

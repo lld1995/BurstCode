@@ -1316,8 +1316,18 @@ export class AgentLoop {
       for (let i = 0; i < prepared.length; i++) {
         const c = prepared[i];
         const result = results[i];
-        if (!result) continue; // can happen if cancelled mid-batch
-        const storedContent = normalizeToolResult(c.name, result.content);
+        // EVERY tool_call id declared on the assistant message MUST get a
+        // matching `tool` reply, otherwise the next request carries a dangling
+        // tool_use/tool_result pair and Anthropic-style backends reject it with
+        //   400 unexpected `tool_use_id` ... each `tool_result` must have a
+        //   corresponding `tool_use` block in the previous message.
+        // When a batch is cancelled mid-flight `results[i]` is undefined — push
+        // a synthetic reply so the pairing in the PERSISTENT history stays
+        // valid (the request-time sanitizer in OpenAIClient is the safety net,
+        // but keeping the stored array consistent avoids relying on it).
+        const storedContent = result
+          ? normalizeToolResult(c.name, result.content)
+          : 'Tool call was cancelled before it produced a result.';
         messages.push({
           role: 'tool',
           tool_call_id: c.callId,

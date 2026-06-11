@@ -154,6 +154,14 @@ export class HunkApplier implements vscode.Disposable {
    */
   private currentSessionId = '';
   /**
+   * Per-session record of every workspace-relative POSIX path the agent has
+   * WRITTEN during this session (via propose_edit or write_file). Rollback
+   * uses this so it only ever reverts / deletes files the CURRENT session
+   * actually touched — files changed by another chat tab or by hand are never
+   * clobbered. Keyed by sessionId; the '' bucket holds session-less writes.
+   */
+  private readonly sessionTouched = new Map<string, Set<string>>();
+  /**
    * True once the diff editor for the first newly-queued file in the current
    * cycle has been opened. Reset together with `cycleInitPromise`.
    */
@@ -231,6 +239,30 @@ export class HunkApplier implements vscode.Disposable {
    */
   setCurrentSession(sessionId: string): void {
     this.currentSessionId = sessionId ?? '';
+  }
+
+  /**
+   * Record that the agent WROTE `uri` during the current session. Called from
+   * the propose_edit queue path and from the write_file tool. The recorded
+   * set is consulted by rollback so it only reverts files THIS session
+   * actually changed — never files touched by another chat tab or by hand.
+   */
+  recordTouchedFile(uri: vscode.Uri): void {
+    const sid = this.currentSessionId ?? '';
+    let set = this.sessionTouched.get(sid);
+    if (!set) {
+      set = new Set<string>();
+      this.sessionTouched.set(sid, set);
+    }
+    set.add(this.workspaceRelative(uri));
+  }
+
+  /**
+   * The workspace-relative POSIX paths the given session has written so far.
+   * Returns an empty array for sessions that haven't touched anything yet.
+   */
+  touchedFilesFor(sessionId: string): string[] {
+    return Array.from(this.sessionTouched.get(sessionId ?? '') ?? []);
   }
 
   /**
@@ -724,6 +756,8 @@ export class HunkApplier implements vscode.Disposable {
       };
       this.pending.set(key, entry);
       newlyQueued = uri;
+      // Bind this write to the current session so rollback can scope itself.
+      this.recordTouchedFile(uri);
     } else {
       entry = existingEntry;
       entry.lastSummary = summary;

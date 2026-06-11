@@ -38,6 +38,14 @@ export interface SessionCheckpoint {
   createdAt: number;
   /** Short label captured at creation time (typically the user prompt). */
   label: string;
+  /**
+   * Workspace-relative POSIX paths the agent run following this checkpoint
+   * actually WROTE (propose_edit / write_file). Rollback restricts its
+   * restore/delete to these files so it never clobbers files changed by
+   * another chat tab or by hand. Persisted so the scope survives an extension
+   * reload (the in-memory tracker in HunkApplier is rebuilt empty on restart).
+   */
+  touchedFiles?: string[];
 }
 
 export interface Session extends SessionMeta {
