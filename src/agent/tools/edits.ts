@@ -143,7 +143,12 @@ export interface AskUserSpec {
 
 export type AskUserFn = (spec: AskUserSpec) => Promise<string>;
 
-export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[] {
+export function buildEditTools(
+  applier: HunkApplier,
+  askUser: AskUserFn,
+  sessionId?: string,
+  turnIndex?: number
+): Tool[] {
   const proposeEdit: Tool = {
     name: 'propose_edit',
     // Concurrent-safe: HunkApplier serializes per-file mutations through an
@@ -379,7 +384,7 @@ export function buildEditTools(applier: HunkApplier, askUser: AskUserFn): Tool[]
         return { content: `no edits provided: ${diagnosis}. Re-emit propose_edit with a valid 'edits' array.`, isError: true };
       }
       try {
-        await applier.proposeEdits(files, summary);
+        await applier.proposeEdits(files, summary, sessionId, turnIndex);
       } catch (err) {
         // proposeEdits throws on overlap-rejection (new hunks that clash with
         // already-accepted regions, partially overlap pending hunks, or

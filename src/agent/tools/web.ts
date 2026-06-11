@@ -9,6 +9,7 @@ const MAX_REDIRECTS = 6;
 const TIMEOUT_MS = 25_000;
 const MAX_BODY_BYTES = 3 * 1024 * 1024; // 3 MB cap on raw download
 const DEFAULT_MAX_CHARS = 12_000;
+const USER_AGENT = 'Mozilla/5.0 (compatible; BurstCode-Agent/1.0; +https://github.com/lld1995/BurstCode)';
 
 interface FetchResult {
   body: Buffer;
@@ -17,9 +18,23 @@ interface FetchResult {
   statusCode: number;
 }
 
-/** Read proxy URL from VS Code settings or process environment variables. */
+function getConfiguredProxyUrl(): string {
+  return (vscode.workspace.getConfiguration('burstcode.web').get<string>('proxyUrl') ?? '').trim();
+}
+
+function getBraveApiKey(): string {
+  return (vscode.workspace.getConfiguration('burstcode.web').get<string>('braveApiKey') ?? '').trim();
+}
+
+/** Read proxy URL from BurstCode/VS Code settings or process environment variables. */
 function getProxyUrl(): URL | null {
-  // VS Code setting takes highest priority
+  // BurstCode setting takes highest priority for agent web tools.
+  const burstProxy = getConfiguredProxyUrl();
+  if (burstProxy) {
+    try { return new URL(burstProxy); } catch { /* bad config, fall through */ }
+  }
+
+  // VS Code setting is still supported for users who already configured it globally.
   const vsCfg = vscode.workspace.getConfiguration('http').get<string>('proxy');
   if (vsCfg && vsCfg.trim()) {
     try { return new URL(vsCfg.trim()); } catch { /* bad config, fall through */ }
@@ -84,7 +99,7 @@ function openTunnel(
   });
 }
 
-function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS): Promise<FetchResult> {
+function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}): Promise<FetchResult> {
   return new Promise((resolve, reject) => {
     let parsed: URL;
     try {
@@ -99,10 +114,11 @@ function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS): Promise<Fet
     const path = (parsed.pathname || '/') + (parsed.search || '');
 
     const reqHeaders: Record<string, string> = {
-      'User-Agent': 'Mozilla/5.0 (compatible; BurstCode-Agent/1.0; +https://github.com/lld1995/BurstCode)',
-      'Accept': 'text/html,application/xhtml+xml,application/pdf,text/*;q=0.9,*/*;q=0.7',
+      'User-Agent': USER_AGENT,
+      'Accept': 'text/html,application/xhtml+xml,application/json,application/pdf,text/*;q=0.9,*/*;q=0.7',
       'Accept-Encoding': 'identity',
       'Connection': 'close',
+      ...headers,
     };
 
     const handleResponse = (res: http.IncomingMessage) => {
@@ -114,7 +130,7 @@ function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS): Promise<Fet
         try { next = new URL(res.headers.location, targetUrl).href; }
         catch { reject(new Error(`Redirect to invalid URL: ${res.headers.location}`)); return; }
         res.resume();
-        fetchUrl(next, redirectsLeft - 1).then(resolve).catch(reject);
+        fetchUrl(next, redirectsLeft - 1, headers).then(resolve).catch(reject);
         return;
       }
 
@@ -304,6 +320,18 @@ function decodePdfString(s: string): string {
     .replace(/\\(\d{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
 }
 
+function decodeHtmlEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/(?:&#39;|&apos;)/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+}
+
 // ---------------------------------------------------------------------------
 // web_search — DuckDuckGo HTML scrape (no API key needed)
 // ---------------------------------------------------------------------------
@@ -314,13 +342,13 @@ interface SearchResult {
   snippet: string;
 }
 
-async function duckduckgoSearch(query: string, maxResults: number): Promise<SearchResult[]> {
-  const encoded = encodeURIComponent(query);
-  const searchUrl = `https://html.duckduckgo.com/html/?q=${encoded}&kl=wt-wt`;
-  const res = await fetchUrl(searchUrl);
-  if (res.statusCode >= 400) throw new Error(`DuckDuckGo returned HTTP ${res.statusCode}`);
+async function fetchSearchPage(url: string, headers: Record<string, string> = {}): Promise<string> {
+  const res = await fetchUrl(url, MAX_REDIRECTS, headers);
+  if (res.statusCode >= 400) throw new Error(`search provider returned HTTP ${res.statusCode}`);
+  return res.body.toString('utf-8');
+}
 
-  const html = res.body.toString('utf-8');
+function parseDuckDuckGoResults(html: string, maxResults: number): SearchResult[] {
   const results: SearchResult[] = [];
 
   // Each result block: <div class="result ..."> contains <a class="result__a"> and <a class="result__snippet">
@@ -344,18 +372,100 @@ async function duckduckgoSearch(query: string, maxResults: number): Promise<Sear
     }
     if (!url.startsWith('http')) continue;
 
-    const title = linkM[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    const title = decodeHtmlEntities(linkM[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim());
 
     // Snippet
     const snipM = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i.exec(block);
     const snippet = snipM
-      ? snipM[1].replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim()
+      ? decodeHtmlEntities(snipM[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim())
       : '';
 
     if (title && url) results.push({ title, url, snippet });
   }
 
   return results;
+}
+
+function parseBingResults(html: string, maxResults: number): SearchResult[] {
+  const results: SearchResult[] = [];
+  const blockRe = /<li\s+class="b_algo"[^>]*>([\s\S]*?)(?=<li\s+class="b_algo"|<\/ol>|<\/main>|$)/gi;
+  let bm: RegExpExecArray | null;
+  while ((bm = blockRe.exec(html)) !== null && results.length < maxResults) {
+    const block = bm[1];
+    const linkM = /<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/h2>/i.exec(block);
+    if (!linkM) continue;
+
+    const url = decodeHtmlEntities(linkM[1]);
+    if (!url.startsWith('http')) continue;
+
+    const title = decodeHtmlEntities(linkM[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim());
+    const snipM = /<p[^>]*>([\s\S]*?)<\/p>/i.exec(block);
+    const snippet = snipM
+      ? decodeHtmlEntities(snipM[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim())
+      : '';
+
+    if (title && url) results.push({ title, url, snippet });
+  }
+  return results;
+}
+
+function parseBraveResults(json: string, maxResults: number): SearchResult[] {
+  const payload = JSON.parse(json) as {
+    web?: { results?: Array<{ title?: string; url?: string; description?: string }> };
+  };
+  const raw = payload.web?.results ?? [];
+  return raw
+    .map((r) => ({
+      title: decodeHtmlEntities(String(r.title ?? '').replace(/<[^>]+>/g, '').trim()),
+      url: String(r.url ?? '').trim(),
+      snippet: decodeHtmlEntities(String(r.description ?? '').replace(/<[^>]+>/g, '').trim()),
+    }))
+    .filter((r) => r.title && r.url.startsWith('http'))
+    .slice(0, maxResults);
+}
+
+async function duckduckgoSearch(query: string, maxResults: number): Promise<SearchResult[]> {
+  const encoded = encodeURIComponent(query);
+  const braveKey = getBraveApiKey();
+  const attempts: Array<{
+    name: string;
+    url: string;
+    headers?: Record<string, string>;
+    parse: (body: string, maxResults: number) => SearchResult[];
+  }> = [];
+
+  if (braveKey) {
+    attempts.push({
+      name: 'Brave Search',
+      url: `https://api.search.brave.com/res/v1/web/search?q=${encoded}`,
+      headers: {
+        'Accept': 'application/json',
+        'X-Subscription-Token': braveKey,
+      },
+      parse: parseBraveResults,
+    });
+  }
+
+  attempts.push(
+    { name: 'DuckDuckGo HTML', url: `https://html.duckduckgo.com/html/?q=${encoded}&kl=wt-wt`, parse: parseDuckDuckGoResults },
+    { name: 'DuckDuckGo', url: `https://duckduckgo.com/html/?q=${encoded}&kl=wt-wt`, parse: parseDuckDuckGoResults },
+    { name: 'Bing', url: `https://www.bing.com/search?q=${encoded}`, parse: parseBingResults },
+  );
+  const failures: string[] = [];
+
+  for (const attempt of attempts) {
+    try {
+      const body = await fetchSearchPage(attempt.url, attempt.headers);
+      const results = attempt.parse(body, maxResults);
+      if (results.length > 0) return results;
+      failures.push(`${attempt.name}: no parseable results`);
+    } catch (err) {
+      const message = String((err as Error).message ?? err) || 'unknown error';
+      failures.push(`${attempt.name}: ${message}`);
+    }
+  }
+
+  throw new Error(failures.join('; '));
 }
 
 export const webSearchTool: Tool = {
@@ -367,7 +477,7 @@ export const webSearchTool: Tool = {
     function: {
       name: 'web_search',
       description:
-        'Search the web via DuckDuckGo and return a list of result titles, URLs, and snippets. ' +
+        'Search the web via Brave Search (when burstcode.web.braveApiKey is configured), DuckDuckGo, and Bing, then return a list of result titles, URLs, and snippets. ' +
         'Use this when you need to find documentation, error solutions, API references, or any information not available in the workspace. ' +
         'After getting results, call read_webpage with a specific URL to read the full content.',
       parameters: {

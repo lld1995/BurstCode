@@ -3,6 +3,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { Logger } from '../util/Logger';
+type GitignoreRule = {
+  pattern: string;
+  directoryOnly: boolean;
+  anchored: boolean;
+  basenameOnly: boolean;
+};
+
 
 export interface CheckpointInfo {
   ref: string;
@@ -67,9 +74,79 @@ export class GitCheckpoint {
     const out = new Set<string>();
     for (const p of paths) {
       if (!p) continue;
-      out.add(p.replace(/\\/g, '/').replace(/^\.\//, ''));
+      out.add(GitCheckpoint.normalizeRelativePath(p));
     }
     return out;
+  }
+
+  private static normalizeRelativePath(p: string): string {
+    return p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+  }
+
+  private async readGitignoreRules(root: string): Promise<GitignoreRule[]> {
+    let raw = '';
+    try {
+      raw = await fs.promises.readFile(path.join(root, '.gitignore'), 'utf-8');
+    } catch {
+      return [];
+    }
+
+    const rules: GitignoreRule[] = [];
+    for (const rawLine of raw.split(/\r?\n/)) {
+      const trimmed = rawLine.trim();
+      if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('!')) continue;
+      let pattern = trimmed.replace(/\\/g, '/');
+      const directoryOnly = pattern.endsWith('/');
+      pattern = pattern.replace(/\/+$/, '');
+      const anchored = pattern.startsWith('/');
+      pattern = pattern.replace(/^\/+/, '');
+      if (!pattern) continue;
+      rules.push({ pattern, directoryOnly, anchored, basenameOnly: !pattern.includes('/') });
+    }
+    return rules;
+  }
+
+  private static isIgnoredByGitignore(relativePath: string, rules: GitignoreRule[]): boolean {
+    const rel = GitCheckpoint.normalizeRelativePath(relativePath);
+    if (!rel || rel === '.gitignore') return false;
+    if (rel === '.burstcode/checkpoints' || rel.startsWith('.burstcode/checkpoints/')) return true;
+    return rules.some((r) => GitCheckpoint.gitignoreRuleMatches(rel, r));
+  }
+
+  private static gitignoreRuleMatches(rel: string, rule: GitignoreRule): boolean {
+    if (rule.basenameOnly) {
+      const parts = rel.split('/');
+      return rule.directoryOnly
+        ? parts.some((p, i) => GitCheckpoint.gitignoreSegmentMatches(p, rule.pattern) && i < parts.length - 1)
+        : parts.some((p) => GitCheckpoint.gitignoreSegmentMatches(p, rule.pattern));
+    }
+
+    const candidates = rule.anchored ? [rel] : GitCheckpoint.pathSuffixes(rel);
+    return candidates.some((candidate) => {
+      if (rule.directoryOnly) {
+        return candidate === rule.pattern || candidate.startsWith(`${rule.pattern}/`);
+      }
+      return GitCheckpoint.gitignorePathMatches(candidate, rule.pattern);
+    });
+  }
+
+  private static pathSuffixes(rel: string): string[] {
+    const parts = rel.split('/');
+    const out: string[] = [];
+    for (let i = 0; i < parts.length; i++) out.push(parts.slice(i).join('/'));
+    return out;
+  }
+
+  private static gitignorePathMatches(rel: string, pattern: string): boolean {
+    const relParts = rel.split('/');
+    const patParts = pattern.split('/');
+    if (relParts.length !== patParts.length) return false;
+    return patParts.every((p, i) => GitCheckpoint.gitignoreSegmentMatches(relParts[i], p));
+  }
+
+  private static gitignoreSegmentMatches(text: string, pattern: string): boolean {
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]');
+    return new RegExp(`^${escaped}$`, process.platform === 'win32' ? 'i' : '').test(text);
   }
 
   isEnabled(): boolean {
@@ -129,7 +206,8 @@ export class GitCheckpoint {
    */
   private async gatherCandidates(
     currentDir: string,
-    baseDir: string
+    baseDir: string,
+    ignoreRules: GitignoreRule[]
   ): Promise<Array<{ fullPath: string; relativePath: string }>> {
     let entries: fs.Dirent[];
     try {
@@ -143,14 +221,17 @@ export class GitCheckpoint {
 
     for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
+      const relativePath = GitCheckpoint.normalizeRelativePath(path.relative(baseDir, fullPath));
+      if (GitCheckpoint.isIgnoredByGitignore(relativePath, ignoreRules)) continue;
+
       if (entry.isDirectory()) {
         if (!entry.name.startsWith('.') && !GitCheckpoint.SKIP_DIRS.has(entry.name)) {
-          subdirPromises.push(this.gatherCandidates(fullPath, baseDir));
+          subdirPromises.push(this.gatherCandidates(fullPath, baseDir, ignoreRules));
         }
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
         if (!GitCheckpoint.BINARY_EXTENSIONS.has(ext)) {
-          fileCandidates.push({ fullPath, relativePath: path.relative(baseDir, fullPath) });
+          fileCandidates.push({ fullPath, relativePath });
         }
       }
     }
@@ -210,7 +291,8 @@ export class GitCheckpoint {
 
     try {
       // Phase 1: parallel directory walk — collect candidate paths
-      const candidates = await this.gatherCandidates(wsRoot, wsRoot);
+      const ignoreRules = await this.readGitignoreRules(wsRoot);
+      const candidates = await this.gatherCandidates(wsRoot, wsRoot, ignoreRules);
 
       // Phase 2: concurrent file reads. In delta mode, unchanged files (mtime
       // older than the base checkpoint) are skipped before reading — that is
@@ -243,7 +325,7 @@ export class GitCheckpoint {
       if (baseRef) {
         const baseEffective = await this.resolveCheckpointChain(wsRoot, baseRef, new Set());
         const currentPaths = new Set(candidates.map(c => c.relativePath));
-        deleted = [...baseEffective.keys()].filter(p => !currentPaths.has(p));
+        deleted = [...baseEffective.keys()].filter(p => !currentPaths.has(p) || GitCheckpoint.isIgnoredByGitignore(p, ignoreRules));
       }
 
       // Write manifest (tiny, no need to parallelize). `baseRef` lets restore
@@ -723,7 +805,8 @@ export class GitCheckpoint {
         // without this step they'd survive the rollback as orphans. We skip the
         // checkpoint directory itself and common build artifacts.
         const snapshotPaths = new Set(sourceMap.keys());
-        const postRestoreDeleted = await this.deleteOrphanFiles(wsRoot, wsRoot, snapshotPaths, new Set());
+        const ignoreRules = await this.readGitignoreRules(wsRoot);
+        const postRestoreDeleted = await this.deleteOrphanFiles(wsRoot, wsRoot, snapshotPaths, new Set(), ignoreRules);
         if (postRestoreDeleted > 0) {
           this.logger.info('Deleted orphan files after restore', { count: postRestoreDeleted });
         }
@@ -816,7 +899,8 @@ export class GitCheckpoint {
     currentDir: string,
     baseDir: string,
     knownPaths: Set<string>,
-    visited: Set<string>
+    visited: Set<string>,
+    ignoreRules: GitignoreRule[]
   ): Promise<number> {
     const resolved = path.resolve(currentDir);
     if (visited.has(resolved)) return 0;
@@ -832,10 +916,13 @@ export class GitCheckpoint {
     let deleted = 0;
     for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
+      const relativePath = GitCheckpoint.normalizeRelativePath(path.relative(baseDir, fullPath));
+      if (GitCheckpoint.isIgnoredByGitignore(relativePath, ignoreRules)) continue;
+
       if (entry.isDirectory()) {
         // Skip hidden dirs, build artifacts, and the checkpoint store itself.
         if (entry.name.startsWith('.') || GitCheckpoint.SKIP_DIRS.has(entry.name)) continue;
-        deleted += await this.deleteOrphanFiles(fullPath, baseDir, knownPaths, visited);
+        deleted += await this.deleteOrphanFiles(fullPath, baseDir, knownPaths, visited, ignoreRules);
         // After processing children, try to remove the directory if empty.
         try {
           const remaining = await fs.promises.readdir(fullPath);
@@ -848,7 +935,6 @@ export class GitCheckpoint {
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
         if (GitCheckpoint.BINARY_EXTENSIONS.has(ext)) continue;
-        const relativePath = path.relative(baseDir, fullPath);
         if (!knownPaths.has(relativePath)) {
           try {
             await fs.promises.unlink(fullPath);

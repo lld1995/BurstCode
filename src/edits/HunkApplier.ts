@@ -247,8 +247,8 @@ export class HunkApplier implements vscode.Disposable {
    * set is consulted by rollback so it only reverts files THIS session
    * actually changed — never files touched by another chat tab or by hand.
    */
-  recordTouchedFile(uri: vscode.Uri): void {
-    const sid = this.currentSessionId ?? '';
+  recordTouchedFile(uri: vscode.Uri, sessionId = this.currentSessionId): void {
+    const sid = sessionId ?? '';
     let set = this.sessionTouched.get(sid);
     if (!set) {
       set = new Set<string>();
@@ -273,7 +273,6 @@ export class HunkApplier implements vscode.Disposable {
    */
   private matchesSession(file: PendingFile, sessionId?: string | null): boolean {
     if (sessionId === undefined || sessionId === null) return true;
-    if (!file.sessionId) return true;
     return file.sessionId === sessionId;
   }
 
@@ -339,7 +338,12 @@ export class HunkApplier implements vscode.Disposable {
    * The user accepts/rejects at their leisure via the chat banner or the
    * inline CodeLenses — even across multiple agent turns.
    */
-  async proposeEdits(files: ProposedEditFile[], summary: string): Promise<void> {
+  async proposeEdits(
+    files: ProposedEditFile[],
+    summary: string,
+    sessionId = this.currentSessionId,
+    turnIndex = this.currentTurnIndex
+  ): Promise<void> {
     if (files.length === 0) return;
     this.latestSummary = summary;
     // One-shot per-cycle preamble (checkpoint). Concurrent callers all await
@@ -363,7 +367,7 @@ export class HunkApplier implements vscode.Disposable {
       files.map((f) =>
         this.withFileLock(this.resolveUri(f.path).toString(), async () => {
           try {
-            const queuedNew = await this.processFile(f, summary);
+            const queuedNew = await this.processFile(f, summary, sessionId, turnIndex);
             if (queuedNew && !firstNewlyQueuedUri) firstNewlyQueuedUri = queuedNew;
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -472,7 +476,9 @@ export class HunkApplier implements vscode.Disposable {
    */
   private async processFile(
     f: ProposedEditFile,
-    summary: string
+    summary: string,
+    sessionId: string,
+    turnIndex: number
   ): Promise<vscode.Uri | undefined> {
     const uri = this.resolveUri(f.path);
     const key = uri.toString();
@@ -751,13 +757,13 @@ export class HunkApplier implements vscode.Disposable {
         eol: loaded.eol,
         isNewFile: loaded.isNewFile,
         lastSummary: summary,
-        turnIndex: this.currentTurnIndex,
-        sessionId: this.currentSessionId
+        turnIndex,
+        sessionId
       };
       this.pending.set(key, entry);
       newlyQueued = uri;
-      // Bind this write to the current session so rollback can scope itself.
-      this.recordTouchedFile(uri);
+      // Bind this write to the owning session so rollback can scope itself.
+      this.recordTouchedFile(uri, sessionId);
     } else {
       entry = existingEntry;
       entry.lastSummary = summary;
@@ -919,9 +925,10 @@ export class HunkApplier implements vscode.Disposable {
   }
 
   /** Open the diff editor for the first file with pending hunks (Review button). */
-  async openPendingDiff(): Promise<void> {
-    // Prefer files that still have pending hunks; fall back to any queued file.
-    const entries = Array.from(this.pending.values());
+  async openPendingDiff(sessionId?: string | null): Promise<void> {
+    // Prefer files that still have pending hunks for this session; fall back to
+    // any queued file owned by this session.
+    const entries = Array.from(this.pending.values()).filter((f) => this.matchesSession(f, sessionId));
     const target =
       entries.find((f) => f.hunks.some((h) => h.status === 'pending')) ?? entries[0];
     if (!target) return;
@@ -935,9 +942,9 @@ export class HunkApplier implements vscode.Disposable {
    *
    * Accepts the source uri.toString() (as returned in `PendingFileSummary.uri`).
    */
-  async openDiffForFile(sourceUriKey: string): Promise<void> {
+  async openDiffForFile(sourceUriKey: string, sessionId?: string | null): Promise<void> {
     const entry = this.pending.get(sourceUriKey);
-    if (!entry) return;
+    if (!entry || !this.matchesSession(entry, sessionId)) return;
     await this.openDiffForEntry(entry);
   }
 
@@ -1345,13 +1352,14 @@ export class HunkApplier implements vscode.Disposable {
    * Returns an empty array when the file has no pending entry.
    */
   getHunkRangesInModifiedCoords(
-    uri: vscode.Uri
+    uri: vscode.Uri,
+    sessionId?: string | null
   ): Array<{ id: string; status: 'pending' | 'accepted' | 'rejected'; modStart: number; modEnd: number }> {
     const key = uri.scheme === DiffPreview.scheme
       ? uri.with({ scheme: 'file', path: uri.path.replace(/\.proposed$/, '') }).toString()
       : uri.toString();
     const entry = this.pending.get(key);
-    if (!entry) return [];
+    if (!entry || !this.matchesSession(entry, sessionId)) return [];
     // Annotate in original-startLine ASC order so cumulative delta walks
     // monotonically (same convention as processFile). REJECTED hunks are
     // excluded — they were never applied to modifiedContent, so including

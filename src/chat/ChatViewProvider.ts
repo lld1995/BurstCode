@@ -5,6 +5,7 @@ import { DependencyGuard } from '../deps/DependencyGuard';
 import { HunkApplier, PendingState } from '../edits/HunkApplier';
 import {
   OpenAIClient,
+  LLMConfig,
   readLLMConfig,
   readChatProfile,
   setChatModel,
@@ -42,7 +43,8 @@ import {
   SessionStore,
   buildTranscript,
   createSessionId,
-  deriveTitle
+  deriveTitle,
+  rebaseCheckpointsAfterMessageCompaction
 } from './SessionStore';
 import type { ExplorerStatus } from '../background/BackgroundExplorer';
 
@@ -444,10 +446,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private activeChatModel(): string {
+    const cfg = readLLMConfig();
+    return this.currentSession?.llm?.model || cfg.model;
+  }
+
+  private llmConfigForSession(session: Session): LLMConfig {
+    const cfg = readLLMConfig();
+    return { ...cfg, model: session.llm?.model || cfg.model };
+  }
+
+  async selectChatModel(model: string): Promise<void> {
+    const trimmed = model.trim();
+    if (!trimmed) return;
+    // Persist to settings as the default for future sessions / windows.
+    await setChatModel(trimmed);
+    // Also snapshot onto the currently-selected session only. Other already-open
+    // sessions keep their own session.llm.model and therefore do not jump when
+    // the global default changes.
+    if (this.currentSession) {
+      this.currentSession.llm = { ...(this.currentSession.llm ?? {}), model: trimmed };
+      await this.persistCurrentSession();
+    }
+    this.broadcastModels();
+    this.broadcastContextUsage();
+  }
+
   private broadcastModels(): void {
     if (!this.view) return;
     const chat = readChatProfile();
-    const activeModel = chat.model || chat.models[0] || '';
+    const defaultModel = chat.model || chat.models[0] || '';
+    const activeModel = this.activeChatModel() || defaultModel;
     const cached = getCachedFetchedModels(this.context.globalState, chat.baseURL);
     this.post({
       type: 'models',
@@ -455,7 +484,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         active: { model: activeModel },
         chat: {
           baseURL: chat.baseURL,
-          model: activeModel,
+          model: defaultModel,
           models: chat.models.slice()
         },
         fetched: cached
@@ -507,6 +536,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.broadcastSessions();
     this.broadcastContextUsage();
+    this.broadcastModels();
     // Refresh the pending-edits banner so it shows THIS session's edits only.
     this.broadcastPendingEdits();
   }
@@ -580,7 +610,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       createdAt: now,
       updatedAt: now,
       messages: [],
-      plan: []
+      plan: [],
+      llm: { model: readLLMConfig().model }
     };
     // Brand-new chats auto-join the tab strip.
     this.openTab(this.currentSession.id);
@@ -642,9 +673,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'review-edits': {
         const uri = String((msg.payload as { uri?: string })?.uri ?? '').trim();
         if (uri) {
-          await this.applier.openDiffForFile(uri);
+          await this.applier.openDiffForFile(uri, this.currentSession?.id);
         } else {
-          await this.applier.openPendingDiff();
+          await this.applier.openPendingDiff(this.currentSession?.id);
         }
         break;
       }
@@ -721,8 +752,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const p = (msg.payload ?? {}) as { model?: string };
         const model = String(p.model ?? '').trim();
         if (model) {
-          await setChatModel(model);
-          // onDidChangeConfiguration will broadcast the new active selection.
+          await this.selectChatModel(model);
         }
         break;
       }
@@ -732,7 +762,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (model) {
           await addChatModel(model);
           if (p.activate !== false) {
-            await setChatModel(model);
+            await this.selectChatModel(model);
           }
         }
         break;
@@ -1289,11 +1319,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     // Create checkpoint in background - don't block the UI
-    void (async () => {
+    const checkpointPromise = (async (): Promise<string> => {
       try {
         const info = await this.gitCheckpoint.createCheckpoint(`prompt: ${deriveTitle(userText)}`);
         const entry: SessionCheckpoint = {
           messageIndex,
+          messageText: userText,
           ref: info.ref,
           sha: info.sha,
           createdAt: info.createdAt,
@@ -1305,6 +1336,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // checkpointRef=undefined (sent immediately before the async create)
         // and the click handler would always send an empty ref.
         postLive({ type: 'update-checkpoint-ref', payload: { messageIndex, ref: info.ref } });
+        return info.ref;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         this.logger.warn('Failed to create per-prompt checkpoint', message);
@@ -1317,6 +1349,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             `BurstCode: rollback unavailable — checkpoint failed (${message}). See BurstCode output for details.`
           );
         }
+        return '';
       }
     })();
 
@@ -1324,7 +1357,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (isActive()) this.broadcastContextUsage();
     void this.persistSession(session);
 
-    const llmCfg = readLLMConfig();
+    const llmCfg = this.llmConfigForSession(session);
     const client = new OpenAIClient(llmCfg, this.logger);
     const bridge = new LspBridge(
       vscode.workspace.getConfiguration('burstcode.lsp').get<number>('maxWaitMs') ?? 60000
@@ -1373,10 +1406,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const systemPrompt = await systemPromptPromise;
     const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
-    const coreReadTools: Tool[] = [buildCollectContextTool(this.applier), buildReadFileTool(this.applier), listDirTool, grepSearchTool, workspaceOutlineTool, webSearchTool, readWebpageTool];
-    const writeFileTool = buildWriteFileTool(this.applier);
+    const coreReadTools: Tool[] = [buildCollectContextTool(this.applier, session.id), buildReadFileTool(this.applier, session.id), listDirTool, grepSearchTool, workspaceOutlineTool, webSearchTool, readWebpageTool];
+    const writeFileTool = buildWriteFileTool(this.applier, session.id);
     const lspTools = buildLspTools(bridge, this.depGuard);
-    const editTools = buildEditTools(this.applier, askUser);
+    const editTools = buildEditTools(this.applier, askUser, session.id, messageIndex);
     const subagentTool = buildSubagentTool({
       clientFactory: () => new OpenAIClient(llmCfg, this.logger),
       logger: this.logger,
@@ -1437,7 +1470,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             workspaceRoot,
             llmCfg.contextWindow,
             (info) => {
-              session.checkpoints = [];
+              session.checkpoints = rebaseCheckpointsAfterMessageCompaction(session.messages, session.checkpoints);
               // Sync the UI context gauge with the post-compression token count
               // (reuse the same event the auto-compressor emits, so the webview
               // updates the bar and flashes a notice).
@@ -1487,6 +1520,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             postLive({ type: 'context-usage', payload: event.payload });
             break;
           case 'context-compressed':
+            session.checkpoints = rebaseCheckpointsAfterMessageCompaction(session.messages, session.checkpoints);
             postLive({ type: 'context-compressed', payload: event.payload });
             break;
           case 'stuck-detected':
@@ -1524,13 +1558,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (isActive()) this.broadcastContextUsage();
       // Persist the set of files THIS run wrote onto its checkpoint so a later
       // rollback stays session-scoped even after an extension reload (the
-      // in-memory tracker in HunkApplier starts empty on restart).
+      // in-memory tracker in HunkApplier starts empty on restart). Context
+      // compression can shrink `session.messages`, so first rebase checkpoint
+      // message indexes against the compacted transcript and then update only
+      // this run's checkpoint.
       try {
-        const cps = session.checkpoints ?? [];
-        if (cps.length > 0) {
-          const latest = cps.reduce((a, b) => (b.messageIndex >= a.messageIndex ? b : a));
-          latest.touchedFiles = this.applier.touchedFilesFor(session.id);
-        }
+        const checkpointRef = await checkpointPromise;
+        session.checkpoints = rebaseCheckpointsAfterMessageCompaction(session.messages, session.checkpoints);
+        const own = (session.checkpoints ?? []).find((c) => c.ref === checkpointRef);
+        if (own) own.touchedFiles = this.applier.touchedFilesFor(session.id);
       } catch (err) {
         this.logger.debug('Failed to persist touched files on checkpoint', String(err));
       }

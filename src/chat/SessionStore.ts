@@ -38,6 +38,8 @@ export interface SessionCheckpoint {
   createdAt: number;
   /** Short label captured at creation time (typically the user prompt). */
   label: string;
+  /** Original user prompt text for rebasing this checkpoint after context compression. */
+  messageText?: string;
   /**
    * Workspace-relative POSIX paths the agent run following this checkpoint
    * actually WROTE (propose_edit / write_file). Rollback restricts its
@@ -48,10 +50,16 @@ export interface SessionCheckpoint {
   touchedFiles?: string[];
 }
 
+export interface SessionLLMState {
+  /** Per-session chat model snapshot. Global settings remain the default for future sessions. */
+  model?: string;
+}
+
 export interface Session extends SessionMeta {
   messages: ChatMessage[];
   plan?: PlanStep[];
   checkpoints?: SessionCheckpoint[];
+  llm?: SessionLLMState;
 }
 
 export function isTerminalStatus(s: SessionStatus | undefined): boolean {
@@ -222,4 +230,50 @@ export function buildTranscript(
     }
   }
   return entries;
+}
+
+/**
+ * Context compression can remove historical assistant/tool messages while keeping
+ * user prompts. Checkpoint entries store message indexes into the live messages
+ * array, so any compaction pass must rebase them before rollback buttons are
+ * replayed or persisted. Match by the checkpoint's user-message text occurrence
+ * (not by old index), which also preserves duplicate prompts in order.
+ */
+export function rebaseCheckpointsAfterMessageCompaction(
+  messages: ChatMessage[],
+  checkpoints?: SessionCheckpoint[]
+): SessionCheckpoint[] {
+  if (!checkpoints?.length) return [];
+
+  const userOccurrences = new Map<string, number[]>();
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role !== 'user') continue;
+    const text = typeof m.content === 'string' ? m.content : '';
+    const arr = userOccurrences.get(text) ?? [];
+    arr.push(i);
+    userOccurrences.set(text, arr);
+  }
+
+  const usedByText = new Map<string, number>();
+  const rebased: SessionCheckpoint[] = [];
+  for (const cp of checkpoints.slice().sort((a, b) => a.createdAt - b.createdAt)) {
+    const oldMessage = messages[cp.messageIndex];
+    const oldText = cp.messageText ?? (
+      oldMessage?.role === 'user' && typeof oldMessage.content === 'string'
+        ? oldMessage.content
+        : undefined
+    );
+    if (!oldText) continue;
+
+    const candidates = userOccurrences.get(oldText) ?? [];
+    const used = usedByText.get(oldText) ?? 0;
+    const nextIndex = candidates[used];
+    if (nextIndex === undefined) continue;
+
+    usedByText.set(oldText, used + 1);
+    rebased.push({ ...cp, messageIndex: nextIndex, messageText: oldText });
+  }
+
+  return rebased.sort((a, b) => a.messageIndex - b.messageIndex || a.createdAt - b.createdAt);
 }

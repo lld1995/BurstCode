@@ -9,7 +9,6 @@ import { Logger } from './util/Logger';
 import {
   readChatProfile,
   readBackgroundProfile,
-  setChatModel,
   addChatModel,
   updateBackgroundProfile,
   addBackgroundModel,
@@ -226,7 +225,7 @@ export function activate(context: vscode.ExtensionContext): void {
             placeHolder: 'Pick a model to activate'
           });
           if (sub) {
-            await setChatModel(sub);
+            await chatProvider.selectChatModel(sub);
             vscode.window.showInformationMessage(`BurstCode: chat model set to "${sub}".`);
           }
         } catch (err) {
@@ -240,11 +239,11 @@ export function activate(context: vscode.ExtensionContext): void {
         const trimmed = id?.trim();
         if (trimmed) {
           await addChatModel(trimmed);
-          await setChatModel(trimmed);
+          await chatProvider.selectChatModel(trimmed);
           vscode.window.showInformationMessage(`BurstCode: chat model set to "${trimmed}".`);
         }
       } else if (picked.action === 'pick' && picked.model) {
-        await setChatModel(picked.model);
+        await chatProvider.selectChatModel(picked.model);
         vscode.window.showInformationMessage(`BurstCode: chat model set to "${picked.model}".`);
       }
     }),

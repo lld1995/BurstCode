@@ -56,6 +56,20 @@ const EN: Dict = {
   'perm.autoApprove': 'Auto-approve shell',
   'perm.autoApprove.tip': 'Skip the per-command approval prompt. Leave OFF unless you trust the model fully.',
 
+  // Web tools group
+  'web.group': 'Web tools',
+  'web.proxy': 'Proxy',
+  'web.proxy.configured': 'configured',
+  'web.proxy.fallback': 'VS Code/env fallback',
+  'web.proxy.tipConfigured': 'web_search/read_webpage use proxy: {0}\nClick to configure.',
+  'web.proxy.tipEmpty': 'No BurstCode web proxy configured. Falls back to VS Code http.proxy, then HTTPS_PROXY/HTTP_PROXY. Click to configure.',
+  'web.brave.on': 'Brave enabled',
+  'web.brave.off': 'Brave not configured',
+  'web.braveKey': 'Brave Search API key',
+  'web.braveKey.tip': 'Set a Brave Search API key. web_search tries Brave before DuckDuckGo/Bing when configured.',
+  'web.configured': 'configured',
+  'web.notConfigured': 'not configured',
+
   // Background Explorer group
   'bg.group': 'Background Explorer',
   'bg.idleAnalyser': 'Idle-time codebase analyser',
@@ -138,6 +152,20 @@ const ZH: Dict = {
   'perm.shellCommands.tip': '允许智能体通过 run_shell 工具执行终端命令。',
   'perm.autoApprove': '自动批准终端',
   'perm.autoApprove.tip': '跳过每条命令的批准提示。除非完全信任模型，否则请保持关闭。',
+
+  // Web tools group
+  'web.group': '联网工具',
+  'web.proxy': '代理',
+  'web.proxy.configured': '已配置',
+  'web.proxy.fallback': '使用 VS Code/环境变量',
+  'web.proxy.tipConfigured': 'web_search/read_webpage 使用代理：{0}\n点击配置。',
+  'web.proxy.tipEmpty': '未配置 BurstCode 联网代理。会回退到 VS Code http.proxy，然后回退到 HTTPS_PROXY/HTTP_PROXY。点击配置。',
+  'web.brave.on': 'Brave 已启用',
+  'web.brave.off': 'Brave 未配置',
+  'web.braveKey': 'Brave 搜索 API Key',
+  'web.braveKey.tip': '设置 Brave Search API Key。配置后 web_search 会优先使用 Brave，再回退到 DuckDuckGo/Bing。',
+  'web.configured': '已配置',
+  'web.notConfigured': '未配置',
 
   // Background Explorer group
   'bg.group': '后台探索器',

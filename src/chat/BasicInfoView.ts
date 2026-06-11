@@ -68,7 +68,9 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
         e.affectsConfiguration('burstcode.llm') ||
         e.affectsConfiguration('burstcode.background') ||
         e.affectsConfiguration('burstcode.shell') ||
-        e.affectsConfiguration('burstcode.ui')
+        e.affectsConfiguration('burstcode.ui') ||
+        e.affectsConfiguration('burstcode.web') ||
+        e.affectsConfiguration('http.proxy')
       ) {
         this.refresh();
       }
@@ -99,6 +101,7 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     const bgProfile = readBackgroundProfile();
     const bg = vscode.workspace.getConfiguration('burstcode.background');
     const shell = vscode.workspace.getConfiguration('burstcode.shell');
+    const web = vscode.workspace.getConfiguration('burstcode.web');
 
     const bgEnabled = bg.get<boolean>('enabled') ?? false;
     const bgRunTests = bg.get<boolean>('runGeneratedTests') ?? false;
@@ -106,6 +109,9 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
 
     const shellEnabled = shell.get<boolean>('enabled') ?? true;
     const shellAuto = shell.get<boolean>('autoApprove') ?? false;
+    const proxyUrl = (web.get<string>('proxyUrl') ?? '').trim();
+    const braveKey = (web.get<string>('braveApiKey') ?? '').trim();
+    const proxyDesc = proxyUrl ? t('web.proxy.configured') : t('web.proxy.fallback');
 
     const status = this.backgroundStatus;
     const phaseLabel = formatPhase(status?.phase ?? 'unknown', bgEnabled);
@@ -192,6 +198,35 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
         t('perm.autoApprove.tip'),
         shellAuto ? 'unlock' : 'lock'
       )
+    ];
+
+    // ---------- Web tools ----------
+    const webGroup = new BasicNode('group', t('web.group'), {
+      description: braveKey ? t('web.brave.on') : t('web.brave.off'),
+      icon: 'search',
+      expanded: true
+    });
+    webGroup.children = [
+      new BasicNode('leaf', t('web.proxy'), {
+        description: proxyDesc,
+        icon: proxyUrl ? 'plug' : 'globe',
+        tooltip: proxyUrl ? t('web.proxy.tipConfigured', proxyUrl) : t('web.proxy.tipEmpty'),
+        command: {
+          command: 'workbench.action.openSettings',
+          title: 'Configure Web Proxy',
+          arguments: ['burstcode.web.proxyUrl']
+        }
+      }),
+      new BasicNode('leaf', t('web.braveKey'), {
+        description: braveKey ? t('web.configured') : t('web.notConfigured'),
+        icon: braveKey ? 'key' : 'warning',
+        tooltip: t('web.braveKey.tip'),
+        command: {
+          command: 'workbench.action.openSettings',
+          title: 'Configure Brave Search API Key',
+          arguments: ['burstcode.web.braveApiKey']
+        }
+      })
     ];
 
     // ---------- Background Explorer (behaviour only — no model here) ----------
@@ -305,7 +340,7 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
       icon: 'info'
     });
 
-    return [modelsGroup, permissions, bgGroup, actions, language, advanced, about];
+    return [modelsGroup, permissions, webGroup, bgGroup, actions, language, advanced, about];
   }
 
   private toggleNode(

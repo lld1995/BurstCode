@@ -134,16 +134,32 @@ function parseDsmlAttributes(raw: string): Record<string, string> {
   return attrs;
 }
 
-function coerceDsmlParameter(value: string, attrs: Record<string, string>): unknown {
+function coerceDsmlParameter(value: string, attrs: Record<string, string>, parseJsonStrings = false): unknown {
   const decoded = decodeDsmlText(value);
-  if (attrs.string === 'true') return decoded;
   const trimmed = decoded.trim();
+  if (attrs.string === 'true' && !parseJsonStrings) return decoded;
   if (!trimmed) return decoded;
   try {
     return JSON.parse(trimmed);
   } catch {
     return decoded;
   }
+}
+
+function buildDsmlArguments(params: Record<string, unknown>): string {
+  const keys = Object.keys(params);
+  if (keys.length === 1) {
+    const key = keys[0];
+    const value = params[key];
+    // Be tolerant of common LLM variants:
+    //   <parameter name="json_arg">{"path":"..."}</parameter>
+    //   <parameter name="arguments" string="true">{"path":"..."}</parameter>
+    // Both should become the tool's argument object, not { json_arg: ... }.
+    if ((key === 'json_arg' || key === 'arguments') && value && typeof value === 'object' && !Array.isArray(value)) {
+      return JSON.stringify(value);
+    }
+  }
+  return JSON.stringify(params);
 }
 
 function extractDsmlToolCalls(text: string): { text: string; calls: AccumulatedToolCall[] } {
@@ -161,15 +177,15 @@ function extractDsmlToolCalls(text: string): { text: string; calls: AccumulatedT
       const invokeAttrs = parseDsmlAttributes(invoke[1]);
       const name = invokeAttrs.name;
       if (!name) continue;
-      const args: Record<string, unknown> = {};
+      const params: Record<string, unknown> = {};
       let param: RegExpExecArray | null;
       while ((param = paramRe.exec(invoke[2]))) {
         const paramAttrs = parseDsmlAttributes(param[1]);
         const paramName = paramAttrs.name;
         if (!paramName) continue;
-        args[paramName] = coerceDsmlParameter(param[2], paramAttrs);
+        params[paramName] = coerceDsmlParameter(param[2], paramAttrs, paramName === 'arguments');
       }
-      calls.push({ name, arguments: JSON.stringify(args) });
+      calls.push({ name, arguments: buildDsmlArguments(params) });
     }
   }
 

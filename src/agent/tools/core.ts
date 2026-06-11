@@ -30,7 +30,7 @@ function resolveUri(target: string): vscode.Uri {
   return vscode.Uri.file(absPath);
 }
 
-export function buildReadFileTool(applier?: HunkApplier): Tool {
+export function buildReadFileTool(applier?: HunkApplier, sessionId?: string): Tool {
   return {
     name: 'read_file',
     schema: {
@@ -100,7 +100,7 @@ export function buildReadFileTool(applier?: HunkApplier): Tool {
       // — and a wrong guess silently corrupts subsequent propose_edits.
       let hunkMap = '';
       if (pendingContent !== undefined && applier) {
-        const ranges = applier.getHunkRangesInModifiedCoords(uri);
+        const ranges = applier.getHunkRangesInModifiedCoords(uri, sessionId);
         const visible = ranges.filter((r) => {
           // Show every hunk that intersects the visible window OR is non-empty.
           if (r.modStart > r.modEnd) return r.modStart >= start && r.modStart <= end;
@@ -348,7 +348,7 @@ export const grepSearchTool: Tool = {
  * existing source files that belong to the user, prefer propose_edit so the
  * user can review and accept the diff.
  */
-export function buildWriteFileTool(applier?: HunkApplier): Tool {
+export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string): Tool {
   return {
     name: 'write_file',
     parallelSafe: true,
@@ -382,7 +382,7 @@ export function buildWriteFileTool(applier?: HunkApplier): Tool {
         await fsModule.writeFile(uri.fsPath, content, 'utf8');
         // Bind this write to the current session so a later rollback only
         // reverts/deletes files THIS session actually wrote.
-        try { applier?.recordTouchedFile(uri); } catch { /* non-fatal */ }
+        try { applier?.recordTouchedFile(uri, sessionId); } catch { /* non-fatal */ }
         const relPath = vscode.workspace.asRelativePath(uri);
         return {
           content: `Written ${content.split(/\r?\n/).length} line(s) to ${relPath}`,
@@ -408,8 +408,8 @@ const CC_MAX_GREPS = 16;
 const CC_MAX_LISTS = 8;
 const CC_MAX_OUTLINES = 8;
 
-export function buildCollectContextTool(applier?: HunkApplier): Tool {
-  const readFileTool = buildReadFileTool(applier);
+export function buildCollectContextTool(applier?: HunkApplier, sessionId?: string): Tool {
+  const readFileTool = buildReadFileTool(applier, sessionId);
 
   return {
     name: 'collect_context',

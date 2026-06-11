@@ -605,6 +605,16 @@ function normalizeDeepSeekReasoning(messages: ChatMessage[], model: string): Cha
   });
 }
 
+function stripAssistantReasoningContent(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((m) => {
+    if (m.role !== 'assistant') return m;
+    const am = m as ChatMessage & { reasoning_content?: unknown };
+    if (typeof am.reasoning_content === 'undefined') return m;
+    const { reasoning_content: _rc, ...rest } = am;
+    return rest as ChatMessage;
+  });
+}
+
 /**
  * Prepare messages for the target model, applying model-specific normalisation:
  *
@@ -618,6 +628,11 @@ function normalizeDeepSeekReasoning(messages: ChatMessage[], model: string): Cha
  *      after a cancelled stream or a schema migration) and trigger the same error
  *      on round-trip.
  *
+ * Gemini (OpenAI-compatible proxies that translate to Google GenerateContent):
+ *   Strip `reasoning_content` entirely. It is an OpenAI-compatible extension used
+ *   by Qwen/DeepSeek-style backends; Gemini's request schema rejects unknown
+ *   message fields with a generic 400 INVALID_ARGUMENT.
+ *
  * DeepSeek (deepseek-reasoner / V3.x thinking):
  *   Delegate to normalizeDeepSeekReasoning — strip reasoning_content for pure
  *   reasoners and plain answer turns, but round-trip it on tool-call turns of
@@ -628,15 +643,13 @@ function normalizeDeepSeekReasoning(messages: ChatMessage[], model: string): Cha
  *   endpoints always receive a shape-correct request body.
  */
 function prepareMessagesForModel(messages: ChatMessage[], model: string): ChatMessage[] {
+  const modelLower = model.toLowerCase();
   let out: ChatMessage[];
-  if (model.toLowerCase().includes('claude')) {
-    out = messages.map((m) => {
+  if (modelLower.includes('claude')) {
+    out = stripAssistantReasoningContent(messages).map((m) => {
       if (m.role !== 'assistant') return m;
-      // 1. Drop reasoning_content so no proxy can synthesise a thinking block.
-      const { reasoning_content: _rc, ...rest } =
-        m as ChatMessage & { reasoning_content?: unknown };
-      let msg = rest as ChatMessage;
-      // 2. Strip thinking blocks that are missing a valid signature.
+      let msg: ChatMessage = m;
+      // Strip thinking blocks that are missing a valid signature.
       if (Array.isArray(msg.content)) {
         const filtered = (msg.content as Array<unknown>).filter((block) => {
           if (!block || typeof block !== 'object') return true;
@@ -650,7 +663,9 @@ function prepareMessagesForModel(messages: ChatMessage[], model: string): ChatMe
       }
       return msg;
     });
-  } else if (model.toLowerCase().includes('deepseek')) {
+  } else if (modelLower.includes('gemini')) {
+    out = stripAssistantReasoningContent(messages);
+  } else if (modelLower.includes('deepseek')) {
     out = normalizeDeepSeekReasoning(messages, model);
   } else {
     out = normalizeReasoningContent(messages);
@@ -759,6 +774,8 @@ export class OpenAIClient {
   private client: OpenAI;
 
   constructor(private readonly config: LLMConfig, private readonly logger: Logger) {
+    const modelLower = config.model.toLowerCase();
+    const isGemini = modelLower.includes('gemini');
     const opts: ConstructorParameters<typeof OpenAI>[0] = {
       baseURL: config.baseURL,
       apiKey: config.apiKey || 'no-key',
@@ -807,27 +824,38 @@ export class OpenAIClient {
     // models accessed via OpenRouter as "anthropic/claude-*") reject the
     // temperature field entirely. Match on any model name that contains "claude"
     // regardless of prefix so both direct and proxied names are covered.
-    const supportsTemperature = !this.config.model.toLowerCase().includes('claude');
+    const modelLower = this.config.model.toLowerCase();
+    const isGemini = modelLower.includes('gemini');
+    const supportsTemperature = !modelLower.includes('claude');
 
-    try {
-      const stream = await this.client.chat.completions.create(
-        {
-          model: this.config.model,
-          messages: safeMessages,
-          tools: tools.length ? tools : undefined,
-          tool_choice: tools.length ? 'auto' : undefined,
-          // Encourage the model to batch independent tool calls into a single
-          // assistant message. OpenAI GPT-4o / o-series default to true but
-          // some OpenAI-compatible backends (DashScope, certain vLLM builds,
-          // OpenRouter proxies) need this set explicitly to actually emit
-          // multiple tool_calls per turn. Unknown servers ignore the field.
-          parallel_tool_calls: tools.length ? true : undefined,
-          ...(supportsTemperature ? { temperature: this.config.temperature } : {}),
-          stream: true
-        },
-        { signal: ac.signal }
-      );
+    const buildRequest = (): OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & Record<string, unknown> => ({
+      model: this.config.model,
+      messages: safeMessages,
+      tools: tools.length ? tools : undefined,
+      tool_choice: tools.length ? 'auto' : undefined,
+      // Encourage the model to batch independent tool calls into a single
+      // assistant message. OpenAI GPT-4o / o-series default to true but
+      // some OpenAI-compatible backends (DashScope, certain vLLM builds,
+      // OpenRouter proxies) need this set explicitly to actually emit
+      // multiple tool_calls per turn. Do not send it to Gemini translators:
+      // native GenerateContentRequest has no equivalent field and may reject
+      // the whole request as INVALID_ARGUMENT.
+      parallel_tool_calls: tools.length && !isGemini ? true : undefined,
+      ...(supportsTemperature ? { temperature: this.config.temperature } : {}),
+      // Gemini OpenAI-compatible adapters may synthesize an invalid native
+      // safety_settings default (seen as GenerateContentRequest.safety_settings[4]
+      // category predicate failures). Send an explicit empty array on the FIRST
+      // request so the adapter has no opportunity to inject that bad default.
+      ...(isGemini ? { safety_settings: [] } : {}),
+      stream: true
+    });
 
+    const streamSdkOnce = async function* (
+      client: OpenAI,
+      request: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & Record<string, unknown>,
+      signal: AbortSignal
+    ): AsyncGenerator<StreamChunk, void, void> {
+      const stream = await client.chat.completions.create(request, { signal });
       const splitter = new ThinkSplitter();
 
       for await (const part of stream) {
@@ -837,10 +865,9 @@ export class OpenAIClient {
         if (delta?.content) {
           for (const c of splitter.feed(delta.content)) yield c;
         }
-        // @ts-expect-error - reasoning_content may be present for thinking models (DeepSeek V4, OpenRouter, etc.)
-        if (delta?.reasoning_content) {
-          // @ts-expect-error
-          yield { reasoningDelta: delta.reasoning_content };
+        const reasoning = (delta as typeof delta & { reasoning_content?: string }).reasoning_content;
+        if (reasoning) {
+          yield { reasoningDelta: reasoning };
         }
         if (delta?.tool_calls) {
           for (const tc of delta.tool_calls) {
@@ -864,6 +891,201 @@ export class OpenAIClient {
       // Defensive flush in case the upstream stream ends without ever sending
       // a finish_reason (some self-hosted vLLM/sglang frontends do this).
       for (const c of splitter.feed('', true)) yield c;
+    };
+
+    const emitOpenAIStreamPart = function* (
+      part: { choices?: Array<{ delta?: { content?: string; reasoning_content?: string; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> }; finish_reason?: string }> },
+      splitter: ThinkSplitter
+    ): Generator<StreamChunk, void, void> {
+      const choice = part.choices?.[0];
+      if (!choice) return;
+      const delta = choice.delta;
+      if (delta?.content) {
+        for (const c of splitter.feed(delta.content)) yield c;
+      }
+      const reasoning = delta?.reasoning_content;
+      if (reasoning) yield { reasoningDelta: reasoning };
+      if (delta?.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          yield {
+            toolCallDelta: {
+              index: tc.index,
+              id: tc.id,
+              name: tc.function?.name,
+              argumentsDelta: tc.function?.arguments
+            }
+          };
+        }
+      }
+      if (choice.finish_reason) {
+        for (const c of splitter.feed('', true)) yield c;
+        yield { finishReason: choice.finish_reason };
+      }
+    };
+
+    const toGeminiText = (value: unknown): string => {
+      if (typeof value === 'string') return value;
+      if (Array.isArray(value)) {
+        return value
+          .map((part) => {
+            if (part && typeof part === 'object' && 'text' in part) return String((part as { text?: unknown }).text ?? '');
+            return JSON.stringify(part);
+          })
+          .join('\n');
+      }
+      return value == null ? '' : JSON.stringify(value);
+    };
+
+    const buildGeminiTextToolMessages = (
+      request: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & Record<string, unknown>
+    ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] => {
+      const rawMessages = (request.messages ?? []) as OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+      const rawTools = Array.isArray(request.tools)
+        ? (request.tools as OpenAI.Chat.Completions.ChatCompletionTool[])
+        : [];
+      if (rawTools.length === 0) return rawMessages;
+
+      const catalog = rawTools.map((t) => ({
+        name: t.function.name,
+        description: t.function.description,
+        parameters: t.function.parameters
+      }));
+      const dsmlInstructions =
+        'GEMINI TEXT TOOL CALLING MODE (BurstCode compatibility): the native OpenAI `tools` field is intentionally omitted for Gemini/Bifrost because that adapter injects invalid GenerateContentRequest.safety_settings when native tool calling is enabled. When you need a tool, do NOT answer with prose only. Emit exactly one XML-like block in assistant text. Put the real tool arguments directly inside one JSON parameter named `arguments` (or use parameter names matching the tool schema):\n' +
+        '<|DSML|tool_calls>\n' +
+        '  <|DSML|invoke name="document_symbols">\n' +
+        '    <|DSML|parameter name="arguments">{"path":"src/agent/AgentLoop.ts"}</|DSML|parameter>\n' +
+        '  </|DSML|invoke>\n' +
+        '</|DSML|tool_calls>\n' +
+        'BurstCode will parse and execute this DSML block exactly like native tool_calls. Available tools:\n' +
+        JSON.stringify(catalog);
+
+      const converted = rawMessages.map((m) => {
+        if (m.role === 'assistant') {
+          const am = m as typeof m & { tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> };
+          if (Array.isArray(am.tool_calls) && am.tool_calls.length > 0) {
+            const replay = am.tool_calls
+              .map((tc) =>
+                `<|DSML|invoke name="${tc.function?.name ?? ''}"><|DSML|parameter name="arguments" string="true">${tc.function?.arguments ?? '{}'}<\/|DSML|parameter><\/|DSML|invoke>`
+              )
+              .join('\n');
+            return {
+              role: 'assistant' as const,
+              content: `${toGeminiText(am.content)}\n<|DSML|tool_calls>\n${replay}\n<\/|DSML|tool_calls>`.trim()
+            };
+          }
+        }
+        if (m.role === 'tool') {
+          const tm = m as typeof m & { tool_call_id?: string };
+          return {
+            role: 'user' as const,
+            content: `[tool result for ${tm.tool_call_id ?? 'unknown'}]\n${toGeminiText(tm.content)}`
+          };
+        }
+        return m;
+      });
+
+      const firstSystem = converted.findIndex((m) => m.role === 'system');
+      if (firstSystem >= 0) {
+        const current = converted[firstSystem] as typeof converted[number] & { content?: unknown };
+        converted[firstSystem] = {
+          role: 'system' as const,
+          content: `${toGeminiText(current.content)}\n\n${dsmlInstructions}`
+        };
+      } else {
+        converted.unshift({ role: 'system', content: dsmlInstructions });
+      }
+      return converted;
+    };
+
+    const streamGeminiDirect = async function* (
+      config: LLMConfig,
+      request: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & Record<string, unknown>,
+      signal: AbortSignal
+    ): AsyncGenerator<StreamChunk, void, void> {
+      const base = config.baseURL.replace(/\/+$/, '');
+      const endpoint = `${base}/chat/completions`;
+      const body = JSON.stringify({
+        ...request,
+        messages: buildGeminiTextToolMessages(request),
+        // Do not send native OpenAI tool fields to Gemini/Bifrost. The real
+        // failing payload still had safety_settings: [] but Bifrost generated
+        // invalid native GenerateContentRequest.safety_settings[4] when tools
+        // were present. DSML text tool calls above avoid that adapter path.
+        tools: undefined,
+        tool_choice: undefined,
+        parallel_tool_calls: undefined,
+        safety_settings: []
+      });
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${config.apiKey || 'no-key'}`,
+          'content-type': 'application/json',
+          accept: 'text/event-stream'
+        },
+        body,
+        signal
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Gemini direct chat/completions HTTP ${res.status}: ${text}\n[sanitized_payload]\n${body}`);
+      }
+      if (!res.body) return;
+
+      const splitter = new ThinkSplitter();
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const frames = buf.split(/\r?\n\r?\n/);
+          buf = frames.pop() ?? '';
+          for (const frame of frames) {
+            const data = frame
+              .split(/\r?\n/)
+              .filter((line) => line.startsWith('data:'))
+              .map((line) => line.slice(5).trimStart())
+              .join('\n')
+              .trim();
+            if (!data || data === '[DONE]') continue;
+            const part = JSON.parse(data) as Parameters<typeof emitOpenAIStreamPart>[0];
+            for (const c of emitOpenAIStreamPart(part, splitter)) yield c;
+          }
+        }
+        const tail = buf.trim();
+        if (tail) {
+          const data = tail
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart())
+            .join('\n')
+            .trim();
+          if (data && data !== '[DONE]') {
+            const part = JSON.parse(data) as Parameters<typeof emitOpenAIStreamPart>[0];
+            for (const c of emitOpenAIStreamPart(part, splitter)) yield c;
+          }
+        }
+        for (const c of splitter.feed('', true)) yield c;
+      } finally {
+        reader.releaseLock();
+      }
+    };
+
+    try {
+      if (isGemini) {
+        for await (const c of streamGeminiDirect(this.config, buildRequest(), ac.signal)) {
+          yield c;
+        }
+        return;
+      }
+
+      for await (const c of streamSdkOnce(this.client, buildRequest(), ac.signal)) {
+        yield c;
+      }
     } finally {
       sub.dispose();
     }

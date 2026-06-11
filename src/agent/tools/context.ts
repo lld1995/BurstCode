@@ -59,6 +59,8 @@ export function buildContextTools(
   contextWindow = defaultCompressorConfig.contextWindow,
   onCompressed?: (info: { before: number; after: number; max: number }) => void
 ): Tool[] {
+  let didCompressThisRun = false;
+
   const compressContext: Tool = {
     name: 'compress_context',
     parallelSafe: false,
@@ -73,7 +75,8 @@ export function buildContextTools(
           'This frees token budget so the new topic can proceed cleanly. ' +
           'ALWAYS call save_topic_doc FIRST if the current topic produced useful findings worth keeping. ' +
           'DO NOT call this when the user is still investigating the same issue from a different angle, ' +
-          'or doing any kind of follow-up or refinement on the same area of code.',
+          'or doing any kind of follow-up or refinement on the same area of code. ' +
+          'Call at most ONCE per assistant run; after it succeeds, continue the user\'s current request instead of compressing again.',
         parameters: {
           type: 'object',
           properties: {
@@ -94,6 +97,18 @@ export function buildContextTools(
       const before = estimateMessagesTokens(
         messages as Array<{ role: string; content: unknown }>
       );
+
+      if (didCompressThisRun) {
+        return {
+          content:
+            `compress_context was already executed in this assistant run; skipped duplicate compression. ` +
+            `Current context is ~${before}/${contextWindow} tokens. ` +
+            `Do NOT call compress_context again for this same request — continue with the user's task using the compacted context. ` +
+            `Duplicate reason: ${reason}.`
+        };
+      }
+
+      didCompressThisRun = true;
       const compacted = compressMessages(messages, topicSwitchConfig(contextWindow));
       messages.splice(0, messages.length, ...compacted);
       const after = estimateMessagesTokens(
@@ -104,7 +119,8 @@ export function buildContextTools(
         content:
           `Context compressed for topic switch: ${before} → ${after} tokens freed ~${before - after}. ` +
           `Reason: ${reason}. ` +
-          `The session now retains only the most recent exchange in full; older history is summarised.`
+          `The session now retains only the most recent exchange in full; older history is summarised. ` +
+          `Do not call compress_context again for this same request; continue with the user's task.`
       };
     }
   };
