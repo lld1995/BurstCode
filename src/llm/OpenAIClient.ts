@@ -767,7 +767,18 @@ function enforceToolCallPairing(messages: ChatMessage[]): ChatMessage[] {
       if (m.role === 'user' || m.role === 'system') activeIds = null;
     }
   }
-  return out;
+  // Some OpenAI-compatible gateways (e.g. MiniMax-M3 and other .NET-based
+  // proxies) iterate `content` as a multimodal array and call LINQ on it,
+  // throwing `Value cannot be null. (Parameter 'source')` when an assistant
+  // tool_call message (whose content is legitimately null per the OpenAI
+  // spec) or a tool reply carries `content: null`. Normalise those to "" so
+  // the body never sends a null content the gateway can choke on.
+  return out.map((m) => {
+    if ((m.role === 'assistant' || m.role === 'tool') && m.content == null) {
+      return { ...m, content: '' } as ChatMessage;
+    }
+    return m;
+  });
 }
 
 export class OpenAIClient {
