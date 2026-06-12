@@ -340,9 +340,16 @@ export function buildLspTools(bridge: LspBridge, guard: DependencyGuard): Tool[]
         const byPrefix = await bridge.workspaceSymbols(prefixQuery);
         candidates = byPrefix.filter((s) => s.name.includes(name) || name.includes(s.name));
       }
+      // Workspace-symbol providers can be empty while a language server is still
+      // indexing or when a symbol is not exported/top-level. In that case, scan
+      // likely source files that contain the requested text and ask their
+      // document-symbol providers for a precise position before running refs.
+      if (candidates.length === 0) {
+        candidates = await findDocumentSymbolCandidates(name, bridge, kindFilter, fileHint);
+      }
       if (candidates.length === 0) {
         return {
-          content: `# no workspace symbols matched "${name}"\nThe language server may still be indexing, or the symbol name is wrong. Note: workspace symbols only cover top-level/exported declarations — local variables and parameters won't appear here. Try a partial name, or fall back to grep_search.`,
+          content: `# no workspace symbols matched "${name}"\nTried workspace symbols, prefix workspace-symbol search, and local document-symbol fallback, but no matching symbol was found. The language server may still be indexing, the symbol may be generated/dynamic, or the name/path hint may be wrong. Try a partial name, pass fileHint, or fall back to grep_search.`,
           isError: true
         };
       }
@@ -427,6 +434,62 @@ function matchSymbolKind(s: string): vscode.SymbolKind | undefined {
     object: vscode.SymbolKind.Object
   };
   return map[s.toLowerCase().replace(/[\s_-]/g, '')];
+}
+
+async function findDocumentSymbolCandidates(
+  name: string,
+  bridge: LspBridge,
+  kindFilter?: vscode.SymbolKind,
+  fileHint?: string
+): Promise<vscode.SymbolInformation[]> {
+  const files = await vscode.workspace.findFiles(
+    '**/*.{ts,tsx,js,jsx,mjs,cjs,cs,py,vue,go,rs,java,kt,kts,cpp,c,h,hpp,xaml,axaml}',
+    '**/{node_modules,.git,out,dist,build,bin,obj,coverage,.next,.nuxt}/**',
+    2000
+  );
+  const wanted = name.toLowerCase();
+  const sorted = files.sort((a, b) => scoreUriForFallback(b, wanted, fileHint) - scoreUriForFallback(a, wanted, fileHint));
+  const matches: vscode.SymbolInformation[] = [];
+
+  for (const uri of sorted) {
+    if (fileHint && !vscode.workspace.asRelativePath(uri).toLowerCase().includes(fileHint)) continue;
+    const doc = await vscode.workspace.openTextDocument(uri);
+    if (!doc.getText().toLowerCase().includes(wanted)) continue;
+    const symbols = await bridge.documentSymbols(uri);
+    collectMatchingSymbols(symbols, name, uri, matches, kindFilter);
+    if (matches.length >= 200) break;
+  }
+  return matches;
+}
+
+function scoreUriForFallback(uri: vscode.Uri, wanted: string, fileHint?: string): number {
+  const rel = vscode.workspace.asRelativePath(uri).toLowerCase();
+  let score = 0;
+  if (fileHint && rel.includes(fileHint)) score += 100;
+  if (path.basename(rel, path.extname(rel)).includes(wanted)) score += 20;
+  if (rel.includes(wanted)) score += 5;
+  return score;
+}
+
+function collectMatchingSymbols(
+  symbols: vscode.DocumentSymbol[],
+  name: string,
+  uri: vscode.Uri,
+  out: vscode.SymbolInformation[],
+  kindFilter?: vscode.SymbolKind,
+  containerName = ''
+): void {
+  const wanted = name.toLowerCase();
+  for (const symbol of symbols) {
+    const symbolName = symbol.name.toLowerCase();
+    const matched = symbolName === wanted || symbolName.includes(wanted) || wanted.includes(symbolName);
+    if (matched && (kindFilter === undefined || symbol.kind === kindFilter)) {
+      out.push(new vscode.SymbolInformation(symbol.name, symbol.kind, containerName, new vscode.Location(uri, symbol.selectionRange)));
+    }
+    if (symbol.children.length > 0) {
+      collectMatchingSymbols(symbol.children, name, uri, out, kindFilter, symbol.name);
+    }
+  }
 }
 
 function findContaining(symbols: vscode.DocumentSymbol[], line: number): vscode.DocumentSymbol | undefined {
