@@ -23,6 +23,12 @@ function pickFirstString(
   return undefined;
 }
 
+function pickFiniteNumber(obj: Record<string, unknown>, key: string): number | undefined {
+  if (obj[key] === undefined) return undefined;
+  const n = Number(obj[key]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 function findLooseJsonStringEnd(text: string, start: number): number {
   let escape = false;
   for (let i = start; i < text.length; i++) {
@@ -163,6 +169,7 @@ export function buildEditTools(
         name: 'propose_edit',
         description:
           "Apply edits to one or more files IMMEDIATELY — they land on disk as soon as this tool returns and the user can compile / run with them right away. The changes are ALSO staged for user review; Accept simply marks them as finalized, while Reject rolls the affected hunks back to the original content. Use this for modifications to the user's existing source files. For agent-generated scripts or temp files you'll execute immediately, use write_file instead.\n\n" +
+          "FAST DELETE-LINES MODE: when the intended edit is ONLY deleting whole line ranges, set operation='delete_lines' and pass either {path,startLine,endLine} for one range or {ranges:[{path,startLine,endLine}, ...]} for batches. Do NOT pass oldText/newText in this mode; propose_edit internally emits line-range deletion hunks with newText:'' and no oldText, avoiding the empty-oldText trap.\n\n" +
           "RECOMMENDED FORM (anchor-based, robust to line drift): supply 'oldText' = the EXACT contiguous lines you want to replace (whitespace-exact, full lines). 'newText' is what they become. The applier locates oldText in the file's current view and rewrites the line range for you, so stale line numbers no longer corrupt edits. If oldText appears multiple times, set 'startLine' to the 1-indexed line where the intended match starts as a tie-breaker, OR add more context lines to oldText to make it unique.\n\n" +
           "FALLBACK FORM (line-range, used when oldText is omitted): supply 1-indexed inclusive [startLine, endLine] matching the on-disk content you see via read_file (propose_edit writes eagerly, so read_file already shows the live post-edit state; the `pending hunks` footnote is just metadata — not a separate layer). To INSERT without replacing in this form, set startLine = endLine + 1 and end newText with a newline.\n\n" +
           "CREATING A NEW FILE: set path to the new file path (parent dirs auto-created), startLine=1, endLine=0, omit oldText, and put the full file contents in newText. Do NOT stuff new code into an unrelated existing file just because the target doesn't exist yet — propose_edit handles file creation natively.\n\n" +
@@ -171,6 +178,27 @@ export function buildEditTools(
           type: 'object',
           properties: {
             summary: { type: 'string', description: 'One-paragraph human summary.' },
+            operation: {
+              type: 'string',
+              enum: ['edit', 'delete_lines'],
+              description: "Optional mode selector. Use 'delete_lines' for pure line-range deletion with path/startLine/endLine or ranges[]. Omit or use 'edit' for normal edits[]."
+            },
+            path: { type: 'string', description: "Single-file shortcut for operation='delete_lines', or fallback path for edits[]." },
+            startLine: { type: 'number', description: "Single-range shortcut for operation='delete_lines'. 1-indexed inclusive first line to delete." },
+            endLine: { type: 'number', description: "Single-range shortcut for operation='delete_lines'. 1-indexed inclusive last line to delete." },
+            ranges: {
+              type: 'array',
+              description: "Batch form for operation='delete_lines'. Each range deletes whole lines and must include path/startLine/endLine.",
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string' },
+                  startLine: { type: 'number' },
+                  endLine: { type: 'number' }
+                },
+                required: ['path', 'startLine', 'endLine']
+              }
+            },
             edits: {
               type: 'array',
               items: {
@@ -201,7 +229,7 @@ export function buildEditTools(
               }
             }
           },
-          required: ['summary', 'edits']
+          required: ['summary']
         }
       }
     },
@@ -294,6 +322,48 @@ export function buildEditTools(
         'targetFile',
         'uri'
       ]);
+      // Delete-lines convenience mode: keep a single public write tool, but let
+      // the caller explicitly choose a safe line-deletion shape that never
+      // carries oldText. This avoids adding another tool while preventing the
+      // common oldText:"" footgun.
+      const operation = String(
+        argsRecord.operation ?? argsRecord.mode ?? argsRecord.action ?? ''
+      ).toLowerCase().replace(/[\s-]+/g, '_');
+      const rawRangesCandidate =
+        (argsRecord as Record<string, unknown>).ranges ??
+        (argsRecord as Record<string, unknown>).deletions ??
+        (argsRecord as Record<string, unknown>).deleteRanges;
+      const wantsDeleteLines =
+        ['delete_lines', 'delete', 'delete_range', 'delete_ranges', 'remove_lines'].includes(operation) ||
+        Array.isArray(rawRangesCandidate);
+      let synthesizedDeleteLines = false;
+      if (rawEdits.length === 0 && wantsDeleteLines) {
+        const rawRanges = Array.isArray(rawRangesCandidate) && rawRangesCandidate.length > 0
+          ? rawRangesCandidate
+          : [argsRecord];
+        rawEdits = rawRanges.map((rawRange) => {
+          const r = rawRange && typeof rawRange === 'object'
+            ? (rawRange as Record<string, unknown>)
+            : {};
+          const rangePath = pickFirstString(r, [
+            'path',
+            'file',
+            'filePath',
+            'filename',
+            'fileName',
+            'target',
+            'targetFile',
+            'uri'
+          ]) ?? topLevelPath;
+          return {
+            ...(rangePath ? { [rangePath.key]: rangePath.value } : {}),
+            startLine: r.startLine ?? r.start ?? r.fromLine ?? r.from,
+            endLine: r.endLine ?? r.end ?? r.toLine ?? r.to,
+            newText: ''
+          };
+        });
+        synthesizedDeleteLines = true;
+      }
       // Flattened-single-edit fallback: the model FREQUENTLY emits a single
       // edit's fields at the TOP LEVEL with no wrapping array at all —
       // {summary, path, oldText, newText} — instead of the canonical
@@ -340,9 +410,15 @@ export function buildEditTools(
         const newTextPicked = pickFirstString(e, ['newText', 'new_text', 'replacement', 'code', 'content', 'text']);
         const newText = newTextPicked?.value ?? '';
         const oldTextPicked = pickFirstString(e, ['oldText', 'old_text', 'original', 'search']);
-        const hasOldText = oldTextPicked !== undefined;
         const startLineRaw = e.startLine === undefined ? NaN : Number(e.startLine);
         const endLineRaw = e.endLine === undefined ? NaN : Number(e.endLine);
+        const hasEmptyOldTextDeleteRange =
+          oldTextPicked?.value === '' &&
+          newText === '' &&
+          Number.isFinite(startLineRaw) &&
+          Number.isFinite(endLineRaw) &&
+          startLineRaw <= endLineRaw;
+        const hasOldText = oldTextPicked !== undefined && !hasEmptyOldTextDeleteRange;
         if (!path) {
           const presentKeys = Object.keys(e);
           skipReasons.push(
@@ -351,7 +427,10 @@ export function buildEditTools(
           continue;
         }
         // oldText form: line numbers optional (used as hint).
-        // Line-range form: both startLine and endLine required.
+        // Line-range form: both startLine and endLine required. Treat
+        // oldText:"" + newText:"" + a valid non-empty line range as the
+        // intended line-range deletion, because models often include the empty
+        // optional field even when they mean to omit it.
         if (!hasOldText && (!Number.isFinite(startLineRaw) || !Number.isFinite(endLineRaw))) {
           skipReasons.push(
             `edits[${i}] (${path}): no 'oldText' was supplied AND startLine/endLine are not finite numbers — supply oldText, or both line numbers`
@@ -411,6 +490,11 @@ export function buildEditTools(
       }
       if (usedAlias) {
         aliasNotes.push(`top-level field 'edits' was sent as '${usedAlias}'`);
+      }
+      if (synthesizedDeleteLines) {
+        aliasNotes.push(
+          "operation='delete_lines' was converted into normal line-range deletion hunks with newText:'' and no oldText"
+        );
       }
       if (aliasedPathKey) {
         aliasNotes.push(`per-edit field 'path' was sent as '${aliasedPathKey}'`);
