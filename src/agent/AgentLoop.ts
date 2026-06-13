@@ -7,7 +7,7 @@ import { estimateMessagesTokens } from '../llm/tokenizer';
 import { Logger } from '../util/Logger';
 import { extractFirstJsonObject, repairJsonControlChars, repairJsonUnescapedQuotes } from '../util/jsonRepair';
 import { HunkApplier } from '../edits/HunkApplier';
-import { AskUserFn } from './tools/edits';
+import { AskUserFn, salvageProposeEditArgs } from './tools/edits';
 
 export interface AgentEvent {
   type:
@@ -162,36 +162,39 @@ function buildDsmlArguments(params: Record<string, unknown>): string {
   return JSON.stringify(params);
 }
 
-function extractDsmlToolCalls(text: string): { text: string; calls: AccumulatedToolCall[] } {
+function extractDsmlInvokesFromText(text: string): AccumulatedToolCall[] {
   const calls: AccumulatedToolCall[] = [];
   const dsml = '[|｜]DSML[|｜]';
-  const blockRe = new RegExp(`<${dsml}tool_calls\\b[^>]*>([\\s\\S]*?)<\\/${dsml}tool_calls>`, 'g');
   const invokeRe = new RegExp(`<${dsml}invoke\\b([^>]*)>([\\s\\S]*?)<\\/${dsml}invoke>`, 'g');
   const paramRe = new RegExp(`<${dsml}parameter\\b([^>]*)>([\\s\\S]*?)<\\/${dsml}parameter>`, 'g');
 
-  let cleaned = text;
-  let block: RegExpExecArray | null;
-  while ((block = blockRe.exec(text))) {
-    let invoke: RegExpExecArray | null;
-    while ((invoke = invokeRe.exec(block[1]))) {
-      const invokeAttrs = parseDsmlAttributes(invoke[1]);
-      const name = invokeAttrs.name;
-      if (!name) continue;
-      const params: Record<string, unknown> = {};
-      let param: RegExpExecArray | null;
-      while ((param = paramRe.exec(invoke[2]))) {
-        const paramAttrs = parseDsmlAttributes(param[1]);
-        const paramName = paramAttrs.name;
-        if (!paramName) continue;
-        params[paramName] = coerceDsmlParameter(param[2], paramAttrs, paramName === 'arguments');
-      }
-      calls.push({ name, arguments: buildDsmlArguments(params) });
+  let invoke: RegExpExecArray | null;
+  while ((invoke = invokeRe.exec(text))) {
+    const invokeAttrs = parseDsmlAttributes(invoke[1]);
+    const name = invokeAttrs.name;
+    if (!name) continue;
+    const params: Record<string, unknown> = {};
+    paramRe.lastIndex = 0;
+    let param: RegExpExecArray | null;
+    while ((param = paramRe.exec(invoke[2]))) {
+      const paramAttrs = parseDsmlAttributes(param[1]);
+      const paramName = paramAttrs.name;
+      if (!paramName) continue;
+      params[paramName] = coerceDsmlParameter(param[2], paramAttrs, paramName === 'arguments');
     }
+    calls.push({ name, arguments: buildDsmlArguments(params) });
   }
+  return calls;
+}
 
-  if (calls.length > 0) {
-    cleaned = cleaned.replace(blockRe, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd();
-  }
+function extractDsmlToolCalls(text: string): { text: string; calls: AccumulatedToolCall[] } {
+  const dsml = '[|｜]DSML[|｜]';
+  const blockRe = new RegExp(`<${dsml}tool_calls\\b[^>]*>([\\s\\S]*?)<\\/${dsml}tool_calls>`, 'g');
+
+  const calls = extractDsmlInvokesFromText(text);
+  const cleaned = calls.length > 0
+    ? text.replace(blockRe, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd()
+    : text;
 
   return { text: cleaned, calls };
 }
@@ -341,6 +344,233 @@ function isTruncatedRequestError(err: unknown): boolean {
   if (msg.includes('request body incomplete')) return true;
   if (msg.includes('connection reset') && msg.includes('400')) return true;
   return false;
+}
+
+const CANCELLED_PROGRESS_TEXT_LIMIT = 18_000;
+const CANCELLED_PROGRESS_ARG_LIMIT = 14_000;
+
+function clipMiddle(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const head = Math.max(0, Math.floor(max * 0.35));
+  const tail = Math.max(0, max - head);
+  return (
+    text.slice(0, head) +
+    `\n... [interrupted progress clipped ${text.length - head - tail} chars; keep the tail as the continuation point] ...\n` +
+    text.slice(-tail)
+  );
+}
+
+function buildInterruptedProgressNote(
+  reason: 'cancelled' | 'timeout' | 'stream error',
+  assistantText: string,
+  reasoningText: string,
+  toolCalls: Array<{ index: number; name: string; arguments: string }>,
+  salvage: InterruptedProposeEditSalvage = { fragmentCount: 0, fragments: [] }
+): string | null {
+  const parts: string[] = [];
+  if (salvage.fragmentCount > 0) {
+    const landed = salvage.fragments
+      .map((fragment, i) => {
+        const summary = fragment.summary ? ` summary=${JSON.stringify(fragment.summary)}` : '';
+        const edits = fragment.edits
+          .map((edit, j) => {
+            const loc = edit.path
+              ? `${edit.path}${edit.startLine !== undefined || edit.endLine !== undefined ? `:${edit.startLine ?? '?'}-${edit.endLine ?? '?'}` : ''}`
+              : '(unknown path)';
+            const mode = edit.hasOldText ? 'replace-oldText' : 'line-range';
+            return `    ${j + 1}. ${loc} (${mode}, oldTextChars=${edit.oldTextChars}, newTextChars=${edit.newTextChars})`;
+          })
+          .join('\n');
+        return `  ${i + 1}. fragment #${fragment.index}${summary}\n${edits}`;
+      })
+      .join('\n');
+    parts.push(
+      `${salvage.fragmentCount} complete propose_edit fragment(s) were recovered and applied to disk / pending-edits before resuming. Treat them as committed base work, not draft text.\n` +
+      `These landed edits are already part of the live workspace; DO NOT rewrite, re-emit, or replace the same broad ranges again. Continue only the unfinished remainder.\n` +
+      `For large changes, resume incrementally: first identify which files/ranges are already landed, then patch only the next missing/incorrect range. If later work depends on landed code, edit around it or make small follow-up corrections instead of regenerating the earlier solution. If you believe a broad rewrite is necessary, STOP and instead read the exact current range plus a small margin, then use oldText or delete_lines to replace/delete only the concrete duplicate/incorrect block.
+` +
+      `Before any next edit, inspect/read the current live file contents around the remaining target lines and base the change on what is already on disk. Tool reads may be line-windowed/truncated unless they explicitly cover the needed range, so do NOT infer that missing lines from a read result were deleted from the file.
+` +
+      `Prefer minimal surgical follow-up edits: add missing tail content, modify a small existing block, or delete only duplicated/trailing content. Avoid whole-file or large-range rewrites that overlap the landed fragments; NEVER append a regenerated replacement after already-landed code. If overlap produced duplicates, use delete_lines for the duplicate block or oldText for the exact bad block.
+` +
+      `If a landed fragment needs adjustment, edit only the smallest affected lines in the current file state; do not regenerate the entire earlier fragment. Large pasted replacement blocks are likely to create duplicate code and file bloat.
+` +
+      `Landed fragments:\n${landed}`
+    );
+  }
+  const visible = assistantText.trim();
+  if (visible) {
+    parts.push(
+      `Partial assistant text captured before ${reason} (${assistantText.length} chars):\n` +
+      clipMiddle(assistantText, CANCELLED_PROGRESS_TEXT_LIMIT)
+    );
+  }
+  if (reasoningText.trim()) {
+    parts.push(
+      `Partial reasoning was also present (${reasoningText.length} chars; not shown to avoid polluting context).`
+    );
+  }
+  for (const tc of toolCalls) {
+    const args = tc.arguments ?? '';
+    if (!tc.name && !args.trim()) continue;
+    parts.push(
+      `Partial tool call #${tc.index}${tc.name ? ` (${tc.name})` : ''} captured before ${reason} ` +
+      `(${args.length} arg chars; likely incomplete${salvage.fragmentCount > 0 && tc.name === 'propose_edit' ? ', complete fragments already applied' : ''}, DO NOT execute as-is):\n` +
+      clipMiddle(args, CANCELLED_PROGRESS_ARG_LIMIT)
+    );
+  }
+  if (parts.length === 0) return null;
+  const lead = reason === 'timeout'
+    ? 'timed out after partial output had already streamed'
+    : reason === 'stream error'
+      ? 'hit a stream error AFTER partial output had already streamed'
+      : 'was cancelled/interrupted AFTER partial output had already streamed';
+  const continuation = salvage.fragmentCount > 0
+    ? `Use the captured progress below to continue from the last coherent point instead of starting over. ` +
+      `The listed propose_edit fragments are already on disk/pending review; treat them as the baseline and do not re-emit them or replace the same broad ranges. ` +
+      `For large tasks, do not restart the implementation plan from scratch: inspect the current live file contents, decide the smallest next missing/incorrect range, then issue a narrow follow-up edit. ` +
+      `If you are tempted to rewrite a large region, do not append/regenerate it; use oldText to replace the exact existing bad block or delete_lines to remove the exact duplicate block. ` +
+      `If the landed work made later intended text obsolete or duplicated, delete/adjust only that duplicate tail rather than rewriting the landed block. ` +
+      `Remember read results may be partial windows rather than whole files. `
+    : `Use the captured progress below to continue from the last coherent point instead of starting over. `;
+  return (
+    `[interrupted-generation] The previous assistant turn ${lead}. ` +
+    continuation +
+    `If a partial propose_edit/tool JSON is shown, treat it as a draft only: re-read/retarget against the current file state and issue smaller complete propose_edit calls (prefer one file/hunk at a time). Do not assume a collect_context/read_file slice is the complete file unless the tool output explicitly covers line 1 through the file total or full:true was used.\n\n` +
+    parts.join('\n\n')
+  );
+}
+
+type SalvagedEditFragment = {
+  index: string;
+  summary?: string;
+  edits: Array<{
+    path?: string;
+    startLine?: number;
+    endLine?: number;
+    hasOldText: boolean;
+    oldTextChars: number;
+    newTextChars: number;
+  }>;
+};
+
+type InterruptedProposeEditSalvage = {
+  fragmentCount: number;
+  fragments: SalvagedEditFragment[];
+};
+
+function describeSalvagedEditFragment(
+  index: string,
+  args: Record<string, unknown>,
+  edits: unknown[]
+): SalvagedEditFragment {
+  const summary = typeof args.summary === 'string' ? args.summary : undefined;
+  return {
+    index,
+    summary,
+    edits: edits.map((edit) => {
+      const rec = edit && typeof edit === 'object' ? edit as Record<string, unknown> : {};
+      const startLine = typeof rec.startLine === 'number' ? rec.startLine : undefined;
+      const endLine = typeof rec.endLine === 'number' ? rec.endLine : undefined;
+      const newText = typeof rec.newText === 'string' ? rec.newText : '';
+      const oldText = typeof rec.oldText === 'string' ? rec.oldText : '';
+      return {
+        path: typeof rec.path === 'string' ? rec.path : undefined,
+        startLine,
+        endLine,
+        hasOldText: oldText.length > 0,
+        oldTextChars: oldText.length,
+        newTextChars: newText.length
+      };
+    })
+  };
+}
+
+/**
+ * Land the COMPLETE propose_edit fragments that finished streaming before a
+ * stream interruption (network error / timeout). Without this, an interrupted
+ * turn discards its whole `toolCallAccumulator` on the next resume attempt, so
+ * a fully-written first edit fragment is lost even though it never had a chance
+ * to execute — the "stream interrupted before execution, first segment didn't
+ * land" bug. We parse each accumulated propose_edit call (normal JSON first,
+ * then the truncation-tolerant loose salvage) and run it through the real tool
+ * so the complete fragments land on disk + keep their diff preview right away.
+ *
+ * Re-applying an identical fragment on a later resume attempt is idempotent
+ * (HunkApplier resolves a same-range re-issue as last-write-wins), and the
+ * `alreadySalvaged` set suppresses needless churn within one resume sequence.
+ * Returns the number of fragments applied.
+ */
+async function salvageInterruptedProposeEdits(
+  toolCallAccumulator: Map<number, { id?: string; name: string; arguments: string }>,
+  proposeEditTool: Tool | undefined,
+  logger: Logger,
+  cancellation: vscode.CancellationToken | undefined,
+  alreadySalvaged: Set<string>,
+  assistantText = ''
+): Promise<InterruptedProposeEditSalvage> {
+  const result: InterruptedProposeEditSalvage = { fragmentCount: 0, fragments: [] };
+  if (!proposeEditTool) return result;
+  const candidates: Array<{ idx: string; id?: string; name: string; arguments: string }> = Array.from(toolCallAccumulator.entries())
+    .map(([idx, v]) => ({ idx: String(idx), ...v }));
+  // Gemini/Bifrost runs use DSML text tool calls instead of native OpenAI tool
+  // deltas. On interruption those calls live ONLY in assistantText; the normal
+  // successful-stream extraction below has not run yet. Salvage every complete
+  // <DSMLinvoke> we can see even if the surrounding <DSMLtool_calls> block or a
+  // later invoke was cut off, otherwise the user-visible written fragment never
+  // reaches HunkApplier / the pending-edits banner.
+  const dsmlCalls = extractDsmlInvokesFromText(assistantText);
+  dsmlCalls.forEach((call, i) => candidates.push({ idx: `dsml:${i}`, ...call }));
+  for (const v of candidates) {
+    if (v.name !== 'propose_edit' || !v.arguments) continue;
+    // The call may be COMPLETE even though a LATER chunk in the same stream
+    // failed, so try a strict parse before falling back to loose salvage.
+    let args: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(v.arguments);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        args = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* fall through to loose salvage */
+    }
+    if (!args) args = salvageProposeEditArgs(v.arguments);
+    if (!args) continue;
+    const edits = (args as { edits?: unknown }).edits;
+    if (!Array.isArray(edits) || edits.length === 0) continue;
+    const sig = `${v.idx}:${JSON.stringify(edits)}`;
+    if (alreadySalvaged.has(sig)) continue;
+    alreadySalvaged.add(sig);
+    try {
+      const salvageTokenSource = cancellation?.isCancellationRequested
+        ? new vscode.CancellationTokenSource()
+        : undefined;
+      try {
+        const res = await proposeEditTool.execute(args, {
+          // Use a fresh token when salvaging after user cancellation. The LLM
+          // stream is already stopped, but complete propose_edit fragments that
+          // finished streaming before the stop must still hit disk; otherwise the
+          // resume prompt can only describe them and the next model turn often
+          // rewrites the whole file.
+          cancellation: salvageTokenSource?.token ?? cancellation ?? new vscode.CancellationTokenSource().token,
+          emitProgress: () => undefined,
+          callId: v.id
+        });
+        if (!res.isError) {
+          result.fragmentCount += edits.length;
+          result.fragments.push(describeSalvagedEditFragment(v.idx, args, edits));
+        }
+        logger.warn(
+          `Salvaged interrupted propose_edit (call #${v.idx}): ran ${edits.length} complete fragment(s) before resume`
+        );
+      } finally {
+        salvageTokenSource?.dispose();
+      }
+    } catch (err) {
+      logger.warn('Interrupted propose_edit salvage failed', String(err));
+    }
+  }
+  return result;
 }
 
 export interface AgentOptions {
@@ -573,13 +803,6 @@ export class AgentLoop {
         payload: { used: usedTokens, max: ctxMax }
       };
 
-      const compressed = compressMessages(messages, {
-        ...defaultCompressorConfig,
-        contextWindow: this.options.contextWindow,
-        inputBudgetRatio: 0.6,
-        keepLastN: 1
-      });
-
       let assistantText = '';
       let reasoningText = '';
       const toolCallAccumulator = new Map<
@@ -600,6 +823,11 @@ export class AgentLoop {
         : 0;
       let resumeAttempt = 0;
       let streamOk = false;
+      // Tracks propose_edit fragments already landed by the interruption-salvage
+      // pass so the same fragment is not re-applied on every resume attempt of
+      // this turn. Re-declared per outer iteration so a deliberate re-issue in a
+      // later turn is never blocked.
+      const salvagedInterruptedEdits = new Set<string>();
       while (!streamOk) {
         // Reset per-attempt streaming state.
         assistantText = '';
@@ -623,6 +851,12 @@ export class AgentLoop {
         // OpenAI HTTP socket open while the next auto-resume opens a fresh
         // one — the server then sees N concurrent identical requests on
         // the wire, exactly the "大量并发相同的请求" symptom.
+        const compressed = compressMessages(messages, {
+          ...defaultCompressorConfig,
+          contextWindow: this.options.contextWindow,
+          inputBudgetRatio: 0.6,
+          keepLastN: 1
+        });
         const streamIter = this.client.streamChat(
           compressed,
           allToolDefs,
@@ -697,6 +931,25 @@ export class AgentLoop {
             if (chunk.finishReason) finishReason = chunk.finishReason;
           }
           if (cancellation.isCancellationRequested) {
+            const interruptedToolCalls = Array.from(toolCallAccumulator.entries())
+              .sort((a, b) => a[0] - b[0])
+              .map(([index, v]) => ({ index, name: v.name, arguments: v.arguments }));
+            const salvage = await salvageInterruptedProposeEdits(
+              toolCallAccumulator,
+              runToolMap.get('propose_edit'),
+              this.logger,
+              cancellation,
+              salvagedInterruptedEdits,
+              assistantText
+            );
+            const progressNote = buildInterruptedProgressNote(
+              'cancelled',
+              assistantText,
+              reasoningText,
+              interruptedToolCalls,
+              salvage
+            );
+            if (progressNote) messages.push({ role: 'user', content: progressNote });
             yield { type: 'done', payload: { reason: 'cancelled' } };
             return;
           }
@@ -769,9 +1022,63 @@ export class AgentLoop {
           // surfaces the 'cancelled' reason rather than a noisy error.
           if (cancellation.isCancellationRequested) {
             this.logger.info(`LLM stream cancelled by user: ${String(err)}`);
+            const interruptedToolCalls = Array.from(toolCallAccumulator.entries())
+              .sort((a, b) => a[0] - b[0])
+              .map(([index, v]) => ({ index, name: v.name, arguments: v.arguments }));
+            const salvage = await salvageInterruptedProposeEdits(
+              toolCallAccumulator,
+              runToolMap.get('propose_edit'),
+              this.logger,
+              cancellation,
+              salvagedInterruptedEdits,
+              assistantText
+            );
+            const progressNote = buildInterruptedProgressNote(
+              'cancelled',
+              assistantText,
+              reasoningText,
+              interruptedToolCalls,
+              salvage
+            );
+            if (progressNote) messages.push({ role: 'user', content: progressNote });
             yield { type: 'done', payload: { reason: 'cancelled' } };
             return;
           }
+          // Stream interrupted (network error / timeout) AFTER one or more
+          // propose_edit fragments had already finished streaming. Land those
+          // COMPLETE fragments on disk now — before the accumulator is discarded
+          // on the next resume attempt — so a fully-written first segment is no
+          // longer lost just because a later segment's stream was cut. Idempotent
+          // across resume attempts via `salvagedInterruptedEdits`.
+          let salvage: InterruptedProposeEditSalvage = { fragmentCount: 0, fragments: [] };
+          try {
+            salvage = await salvageInterruptedProposeEdits(
+              toolCallAccumulator,
+              runToolMap.get('propose_edit'),
+              this.logger,
+              cancellation,
+              salvagedInterruptedEdits,
+              assistantText
+            );
+            if (salvage.fragmentCount > 0) {
+              this.logger.warn(
+                `Stream interrupted mid-propose_edit: salvaged ${salvage.fragmentCount} complete fragment(s) onto disk before resume`
+              );
+            }
+          } catch (salvageErr) {
+            this.logger.warn('Interrupted propose_edit salvage pass failed', String(salvageErr));
+          }
+          const interruptedToolCalls = Array.from(toolCallAccumulator.entries())
+            .sort((a, b) => a[0] - b[0])
+            .map(([index, v]) => ({ index, name: v.name, arguments: v.arguments }));
+          const progressNote = buildInterruptedProgressNote(
+            String(err).includes(`LLM stream timed out after ${STREAM_TIMEOUT_MS}ms`) ? 'timeout' : 'stream error',
+            assistantText,
+            reasoningText,
+            interruptedToolCalls,
+            salvage
+          );
+          if (progressNote) messages.push({ role: 'user', content: progressNote });
           // Context-length errors cannot be fixed by retrying the same request.
           // Force-compress the persistent message array and retry via the outer
           // loop so the model gets a fresh (smaller) context window.
@@ -1085,6 +1392,24 @@ export class AgentLoop {
                   } catch { /* keep the original parseError */ }
                 }
               }
+              // propose_edit-specific salvage: when the args are TRUNCATED
+              // mid-stream (model ran out of output budget), the generic
+              // repairs above cannot help because there is no complete object
+              // to parse. Recover whatever WHOLE edit fragments DID arrive so
+              // they still land on disk and keep their diff preview — the
+              // "write one fragment, land one fragment" guarantee survives even
+              // a cut-off tool call. The half-written tail fragment is dropped
+              // and the tool tells the model to re-issue the remaining edits.
+              if (parseError && tc.name === 'propose_edit') {
+                const salvaged = salvageProposeEditArgs(afterControl);
+                if (salvaged) {
+                  parsed = salvaged;
+                  parseError = undefined;
+                  this.logger.warn(
+                    `Tool args propose_edit: salvaged ${(salvaged.edits as unknown[]).length} complete edit fragment(s) from truncated args`
+                  );
+                }
+              }
             }
             if (parseError) {
               this.logger.warn('Tool args parse failed', tc.name, parseError, tc.arguments);
@@ -1152,16 +1477,28 @@ export class AgentLoop {
           };
         }
         try {
-          return await c.tool.execute(c.parsed, {
-            cancellation,
-            callId: c.callId,
-            emitProgress: (message: string) => {
-              progressQueue.push({ callId: c.callId, name: c.name, message });
-              const r = resolveWaiter;
-              resolveWaiter = null;
-              r?.();
+          let toolTokenSource: vscode.CancellationTokenSource | undefined;
+          try {
+            // Once a propose_edit call has fully streamed, cancellation should not
+            // prevent it from landing on disk. The user's stop request only aborts
+            // further LLM generation; already-complete edit fragments must still be
+            // applied so resume does not rewrite the whole file.
+            if (c.name === 'propose_edit') {
+              toolTokenSource = new vscode.CancellationTokenSource();
             }
-          });
+            return await c.tool.execute(c.parsed, {
+              cancellation: toolTokenSource?.token ?? cancellation,
+              callId: c.callId,
+              emitProgress: (message: string) => {
+                progressQueue.push({ callId: c.callId, name: c.name, message });
+                const r = resolveWaiter;
+                resolveWaiter = null;
+                r?.();
+              }
+            });
+          } finally {
+            toolTokenSource?.dispose();
+          }
         } catch (err) {
           return { content: `Tool error: ${String(err)}`, isError: true };
         }
@@ -1174,6 +1511,34 @@ export class AgentLoop {
       // Hoisted so emitProgress (inside executeOne) can wake the batch drain loop.
       let resolveWaiter: (() => void) | null = null;
 
+      const executeUnrunProposeEditsAfterCancellation = async (fromIndex: number): Promise<Array<{ name: string; id: string; args: Record<string, unknown>; result: ToolResult }>> => {
+        const landed: Array<{ name: string; id: string; args: Record<string, unknown>; result: ToolResult }> = [];
+        for (let i = fromIndex; i < prepared.length; i++) {
+          const c = prepared[i];
+          if (results[i] !== undefined || c.name !== 'propose_edit' || !c.tool || c.parseError) continue;
+          const tokenSource = new vscode.CancellationTokenSource();
+          try {
+            const result = await c.tool.execute(c.parsed, {
+              cancellation: tokenSource.token,
+              callId: c.callId,
+              emitProgress: () => undefined
+            });
+            results[i] = result;
+            landed.push({ name: c.name, id: c.callId, args: c.parsed, result });
+            this.logger.warn(
+              `Cancellation occurred before tool execution; forced propose_edit ${c.callId} to disk before stopping`
+            );
+          } catch (err) {
+            const result: ToolResult = { content: `Tool error while salvaging cancelled propose_edit: ${String(err)}`, isError: true };
+            results[i] = result;
+            landed.push({ name: c.name, id: c.callId, args: c.parsed, result });
+          } finally {
+            tokenSource.dispose();
+          }
+        }
+        return landed;
+      };
+
       // Walk the prepared list, grouping contiguous parallel-safe calls into
       // batches that are executed concurrently. Unsafe tools (ask_user,
       // update_plan, record_lesson, run_shell, ...) run alone and in order
@@ -1182,7 +1547,16 @@ export class AgentLoop {
       // mutations internally, so concurrent file writes do queue up safely.
       let cursor = 0;
       while (cursor < prepared.length) {
-        if (cancellation.isCancellationRequested) break;
+        if (cancellation.isCancellationRequested) {
+          const landed = await executeUnrunProposeEditsAfterCancellation(cursor);
+          for (const item of landed) {
+            yield {
+              type: 'tool-call-end',
+              payload: { name: item.name, id: item.id, args: item.args, result: item.result.content, isError: !!item.result.isError, meta: item.result.meta }
+            };
+          }
+          break;
+        }
         if (isUnsafe(prepared[cursor])) {
           const c = prepared[cursor];
           // Emit start lazily — only now that this tool is actually beginning.
@@ -1265,7 +1639,17 @@ export class AgentLoop {
         const BATCH_SAFETY_TIMEOUT_MS = batchHasNoTimeout ? 0 : 30_000;
         const batchDeadline = BATCH_SAFETY_TIMEOUT_MS > 0 ? Date.now() + BATCH_SAFETY_TIMEOUT_MS : Infinity;
         while ((inFlight > 0 || completionQueue.length > 0 || progressQueue.length > 0) && !batchSettled) {
-          if (cancellation.isCancellationRequested) break;
+          if (cancellation.isCancellationRequested) {
+            const landed = await executeUnrunProposeEditsAfterCancellation(batchStart);
+            for (const item of landed) {
+              yield {
+                type: 'tool-call-end',
+                payload: { name: item.name, id: item.id, args: item.args, result: item.result.content, isError: !!item.result.isError, meta: item.result.meta }
+              };
+            }
+            batchSettled = true;
+            break;
+          }
           while (progressQueue.length > 0) {
             const p = progressQueue.shift()!;
             yield { type: 'tool-progress', payload: { id: p.callId, name: p.name, message: p.message } };

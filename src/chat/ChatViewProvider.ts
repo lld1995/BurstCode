@@ -3543,7 +3543,7 @@ function tcSummaryHtml(name, args, meta, isError, done) {
   const tick = done ? (isError ? '⚠ ' : '') : '';
   if (name === 'propose_edit') {
     let adds = 0, dels = 0, files = [];
-    const edits = Array.isArray(a.edits) ? a.edits : (a.path ? [a] : []);
+    const edits = tcProposePreviewEdits(a, meta);
     for (const e of edits) {
       if (e && e.path) files.push(tcBaseName(e.path));
       const rows = tcLineDiff(e && e.oldText, e && e.newText, e && e.startLine);
@@ -3581,6 +3581,12 @@ function tcSummaryHtml(name, args, meta, isError, done) {
   return '';
 }
 
+function tcProposePreviewEdits(args, meta) {
+  if (meta && Array.isArray(meta.previewEdits) && meta.previewEdits.length) return meta.previewEdits;
+  const a = args || {};
+  return Array.isArray(a.edits) ? a.edits : (a.path ? [a] : []);
+}
+
 function tcBytes(n) {
   n = Number(n) || 0;
   if (n < 1024) return n + ' B';
@@ -3595,7 +3601,7 @@ function tcRichBody(name, args, meta, result, isError) {
   if (isError) return null; // show the raw error in the default <pre>
   if (name === 'propose_edit') {
     const wrap = document.createElement('div');
-    const edits = Array.isArray(a.edits) ? a.edits : (a.path ? [a] : []);
+    const edits = tcProposePreviewEdits(a, meta);
     if (!edits.length) return null;
     for (const e of edits) {
       const rows = tcLineDiff(e && e.oldText, e && e.newText, e && e.startLine);
@@ -3644,7 +3650,7 @@ function tcRichBody(name, args, meta, result, isError) {
       const rows = bodyLines.map((t, i) => ({ kind: 'ctx', newNo: Number(meta.start) + i, text: String(t).replace(/^\\s*\\d+\\t/, '') }));
       const code = tcCodeBlock(rows, 'plain');
       const metaText = (meta.end - meta.start + 1) + ' lines · ' + (meta.totalLines || '?') + ' total'
-        + (meta.hasPendingEdits ? ' · pending' : '');
+        + ((meta.hasReviewPendingEdits || meta.hasPendingEdits) ? ' · review pending (on disk)' : '');
       card.appendChild(tcFileCard(metaTextPath(meta), meta.start, metaText, code));
       return card;
     }
@@ -4414,10 +4420,12 @@ window.addEventListener('message', (e) => {
       break;
     }
     case 'auto-resume': {
-      // Stream was interrupted mid-turn. Discard any partial assistant /
-      // reasoning bubble so the retry's fresh stream doesn't duplicate text,
-      // then drop a visible pill explaining what's happening (the previous
-      // UX was "the chat silently stopped with no reason").
+      // Stream was interrupted mid-turn. Keep any streamed propose_edit /
+      // write_file preview visible instead of deleting it: the tool has not
+      // executed yet (partial JSON cannot be applied), but the preview is the
+      // only user-visible evidence of what the model had already written before
+      // the timeout. Mark running cards as interrupted, detach them from the
+      // live-stream routing maps, and let the retry create fresh cards.
       clearEmptyState();
       if (activeAssistantEl && activeAssistantEl.parentNode) {
         activeAssistantEl.parentNode.removeChild(activeAssistantEl);
@@ -4428,10 +4436,13 @@ window.addEventListener('message', (e) => {
       activeAssistantEl = null;
       activeReasoningEl = null;
       activeStreamingToolEl = null;
-      // Remove all running tool elements — execution never started (stream failed).
       for (const [key, det] of Array.from(toolElements.entries())) {
         if (det.dataset.running === 'true') {
-          if (det.parentNode) det.parentNode.removeChild(det);
+          det.dataset.running = 'false';
+          det.dataset.interrupted = 'true';
+          det.open = true;
+          const s = det.querySelector('summary');
+          if (s) s.textContent = '⚠ ' + (runningTools.get(key)?.name || det.dataset.toolName || '?') + ' · stream interrupted before execution';
           toolElements.delete(key);
           runningTools.delete(key);
         }

@@ -46,7 +46,7 @@ export function buildReadFileTool(applier?: HunkApplier, sessionId?: string): To
           properties: {
             path: { type: 'string', description: 'Path relative to workspace or absolute.' },
             startLine: { type: 'number', description: '1-indexed start line (inclusive). Defaults to 1.' },
-            endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200.' },
+            endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200; output is only this window, not proof that later lines are absent.' },
             full: { type: 'boolean', description: 'When true, read the ENTIRE file from startLine to the last line, ignoring the default 200-line window. Use sparingly — large files flood the shared context window. Default false.' }
           },
           required: ['path']
@@ -94,15 +94,17 @@ export function buildReadFileTool(applier?: HunkApplier, sessionId?: string): To
         lines.push(`${(i + 1).toString().padStart(5)}\t${rawLines[i] ?? ''}`);
       }
 
-      // When the file has pending edits, append an explicit map of each
-      // hunk's range in modified-content coords. Without this, the model has
-      // to guess where each pending hunk starts/ends in the post-edit view
-      // — and a wrong guess silently corrupts subsequent propose_edits.
+      // When the file has review-pending edits, append an explicit map of each
+      // hunk's range in modified-content coords. The edits are already on disk;
+      // this is only review/rollback metadata that keeps follow-up propose_edit
+      // calls from guessing hunk boundaries and accidentally corrupting ranges.
       let hunkMap = '';
       if (pendingContent !== undefined && applier) {
         const ranges = applier.getHunkRangesInModifiedCoords(uri, sessionId);
         const visible = ranges.filter((r) => {
-          // Show every hunk that intersects the visible window OR is non-empty.
+          // Show only hunks that intersect the visible window. A pure deletion
+          // occupies zero modified lines, so include it when its anchor line is
+          // inside the requested slice.
           if (r.modStart > r.modEnd) return r.modStart >= start && r.modStart <= end;
           return r.modEnd >= start && r.modStart <= end;
         });
@@ -123,14 +125,15 @@ export function buildReadFileTool(applier?: HunkApplier, sessionId?: string): To
             return `#   - ${r.status.padEnd(8)} ${range}`;
           });
           hunkMap =
-            `\n# pending hunks (modified-line coords) — use these ranges as-is when issuing follow-up propose_edit:\n` +
+            `\n# review-pending hunk coordinates (already written to disk; Accept only confirms, Reject reverts):\n` +
+            `# Use these modified-line ranges only if a follow-up propose_edit must touch the same hunk.\n` +
             lines2.join('\n');
         }
       }
 
       return {
         content: `# ${vscode.workspace.asRelativePath(uri)} (lines ${start}-${end} of ${total})${pendingNote}\n${lines.join('\n')}${hunkMap}`,
-        meta: { uri: uri.toString(), totalLines: total, start, end, hasPendingEdits: pendingContent !== undefined }
+        meta: { uri: uri.toString(), totalLines: total, start, end, hasReviewPendingEdits: pendingContent !== undefined }
       };
     }
   };
@@ -438,7 +441,8 @@ export function buildCollectContextTool(applier?: HunkApplier, sessionId?: strin
                 properties: {
                   path: { type: 'string', description: 'Workspace-relative or absolute path.' },
                   startLine: { type: 'number', description: '1-indexed start line (inclusive). Defaults to 1.' },
-                  endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200.' }
+                  endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200; collect_context returns only this slice, not the whole file.' },
+                  full: { type: 'boolean', description: 'When true, read from startLine through the file end. Use sparingly; prefer targeted windows for large files.' }
                 },
                 required: ['path']
               }

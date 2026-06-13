@@ -367,8 +367,13 @@ export class HunkApplier implements vscode.Disposable {
       files.map((f) =>
         this.withFileLock(this.resolveUri(f.path).toString(), async () => {
           try {
-            const queuedNew = await this.processFile(f, summary, sessionId, turnIndex);
-            if (queuedNew && !firstNewlyQueuedUri) firstNewlyQueuedUri = queuedNew;
+            const { newlyQueued, errors } = await this.processFile(f, summary, sessionId, turnIndex);
+            if (newlyQueued && !firstNewlyQueuedUri) firstNewlyQueuedUri = newlyQueued;
+            // Per-hunk isolation: the VALID fragments of this file are already
+            // queued + written to disk by the time we get here. `errors` only
+            // lists the individual fragments that were dropped, so we surface
+            // them WITHOUT discarding the good ones.
+            if (errors.length > 0) fileErrors.push(`${f.path}: ${errors.join('; ')}`);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             fileErrors.push(`${f.path}: ${msg}`);
@@ -469,28 +474,40 @@ export class HunkApplier implements vscode.Disposable {
   }
 
   /**
-   * Queue a single file's hunks. Returns the file's source URI when the file
-   * was NEWLY queued (i.e. did not already have a PendingFile entry) so the
-   * caller can decide whether to open a diff editor for it. Must be called
-   * under that file's lock.
+   * Queue a single file's hunks with per-hunk fragment isolation. Each fragment
+   * is validated independently: the valid ones are written to disk and keep
+   * their diff preview, while any unresolvable / overlapping / colliding
+   * fragment is dropped and reported in `errors` WITHOUT taking the good ones
+   * down with it. `newlyQueued` is set to the file's source URI when this call
+   * created a brand-new PendingFile entry (so the caller can open a diff editor
+   * for it). Must be called under that file's lock.
    */
   private async processFile(
     f: ProposedEditFile,
     summary: string,
     sessionId: string,
     turnIndex: number
-  ): Promise<vscode.Uri | undefined> {
+  ): Promise<{ newlyQueued?: vscode.Uri; errors: string[] }> {
     const uri = this.resolveUri(f.path);
     const key = uri.toString();
     const existingEntry = this.pending.get(key);
 
-    // ---- oldText anchor resolution ----
-    // For any new hunk that supplies `oldText`, locate that exact line
-    // sequence in the file's current view (modifiedContent for pending
-    // files, else disk content) and rewrite (startLine, endLine) to match.
-    // Done BEFORE the overlap classification so downstream logic stays
-    // unchanged. Resolution failures throw so the tool surfaces a clear
-    // re-target message to the model.
+    // ---- Per-hunk fragment isolation ----
+    // Each fragment in this propose_edit is validated INDEPENDENTLY so a single
+    // bad one (unresolvable oldText, overlap with a sibling, or an unsafe
+    // collision with the file's already-queued state) is dropped and reported
+    // on its own — every OTHER fragment in the same call still lands on disk
+    // and keeps its diff preview. This is the "write one fragment, land one
+    // fragment; a failure never takes the good fragments down with it"
+    // guarantee. Errors are collected (not thrown) so the surviving fragments
+    // flow through the unchanged classification + translation block below.
+    const hunkErrors: string[] = [];
+
+    // Stage 1 — resolve oldText anchors per hunk. For any hunk that supplies
+    // `oldText`, locate that exact line sequence in the file's current view
+    // (modifiedContent for pending files, else disk content) and rewrite
+    // (startLine, endLine) to match. A resolution failure drops ONLY that
+    // fragment instead of failing the whole file.
     let preloaded: { content: string; eol: string; isNewFile: boolean } | undefined;
     let viewContent: string | undefined = existingEntry?.modifiedContent;
     const needsOldText = f.hunks.some((h) => h.oldText !== undefined);
@@ -498,14 +515,85 @@ export class HunkApplier implements vscode.Disposable {
       preloaded = await this.loadOriginal(uri);
       viewContent = preloaded.content;
     }
-    const resolvedHunks: ProposedHunk[] = f.hunks.map((h) => {
-      if (h.oldText === undefined) return h;
-      if (viewContent === undefined) {
-        throw new Error(`oldText anchor on ${f.path} requires a readable file view`);
+    const resolvedHunks: ProposedHunk[] = [];
+    f.hunks.forEach((h, i) => {
+      if (h.oldText === undefined) {
+        resolvedHunks.push(h);
+        return;
       }
-      return resolveOldTextHunk(h, viewContent, f.path);
+      if (viewContent === undefined) {
+        hunkErrors.push(`hunk[${i}] (${f.path}): oldText anchor requires a readable file view`);
+        return;
+      }
+      try {
+        resolvedHunks.push(resolveOldTextHunk(h, viewContent, f.path));
+      } catch (err) {
+        hunkErrors.push(err instanceof Error ? err.message : String(err));
+      }
     });
-    f = { path: f.path, hunks: resolvedHunks };
+
+    // Stage 2 — drop fragments that overlap an EARLIER surviving fragment in
+    // this same call (keep the first writer, reject the later clashing one).
+    // Pure insertions (startLine > endLine) collapse to an empty range and
+    // never overlap.
+    const survivingHunks: ProposedHunk[] = [];
+    for (const a of resolvedHunks) {
+      if (a.startLine > a.endLine) {
+        survivingHunks.push(a);
+        continue;
+      }
+      const clash = survivingHunks.find(
+        (b) => !(b.startLine > b.endLine) && !(a.endLine < b.startLine || b.endLine < a.startLine)
+      );
+      if (clash) {
+        hunkErrors.push(
+          `two new hunks in the same propose_edit overlap: lines ${a.startLine}-${a.endLine} vs ${clash.startLine}-${clash.endLine}. Dropped the later one — make them disjoint.`
+        );
+      } else {
+        survivingHunks.push(a);
+      }
+    }
+
+    // Stage 3 — drop fragments that collide UNSAFELY with the file's existing
+    // queued state: overlap with an already-ACCEPTED hunk, or a PARTIAL
+    // (non-containing) overlap with a pending hunk. Fully containing / fully
+    // contained relationships are SAFE (handled below as last-write-wins drop
+    // or as a refinement) so those fragments survive. Uses the SAME annotated
+    // coordinates as the classification block below so the two never disagree.
+    let keptHunks = survivingHunks;
+    if (existingEntry && existingEntry.hunks.some((h) => h.status !== 'rejected')) {
+      const annotated = this.annotateExistingHunks(existingEntry);
+      keptHunks = survivingHunks.filter((nh) => {
+        for (const ann of annotated) {
+          if (ann.isEmpty) continue; // pure deletions never overlap anything
+          const overlaps = !(nh.endLine < ann.modStart || ann.modEnd < nh.startLine);
+          if (!overlaps) continue;
+          const newContainsExisting = nh.startLine <= ann.modStart && ann.modEnd <= nh.endLine;
+          const existingContainsNew = ann.modStart <= nh.startLine && nh.endLine <= ann.modEnd;
+          if (ann.h.status === 'accepted') {
+            hunkErrors.push(
+              `new hunk modLines ${nh.startLine}-${nh.endLine} overlaps already-accepted hunk at modLines ${ann.modStart}-${ann.modEnd}. Dropped — re-read the file and retarget against the post-decision view.`
+            );
+            return false;
+          }
+          if (!newContainsExisting && !existingContainsNew) {
+            hunkErrors.push(
+              `new hunk modLines ${nh.startLine}-${nh.endLine} partially overlaps pending hunk at modLines ${ann.modStart}-${ann.modEnd}. Dropped — fully contain the pending hunk's range or shrink so the ranges do not overlap.`
+            );
+            return false;
+          }
+        }
+        return true;
+      });
+    }
+
+    // Every surviving fragment is now guaranteed to pass the (unchanged)
+    // classification + translation block below, so it can only succeed. If the
+    // ENTIRE batch washed out, leave `this.pending` untouched and report.
+    if (keptHunks.length === 0) {
+      return { newlyQueued: undefined, errors: hunkErrors };
+    }
+    f = { path: f.path, hunks: keptHunks };
 
     // Translate new hunks from baseline (modifiedContent) coords into
     // originalContent coords. Rationale: read_file returns modifiedContent
@@ -514,10 +602,8 @@ export class HunkApplier implements vscode.Disposable {
     // Internally we keep every hunk in original-coord space so the existing
     // flush path (WorkspaceEdit.replace on the live disk document) keeps
     // working unchanged.
-    // Reject overlapping new hunks within THIS propose_edit call. Without
-    // this guard, two new hunks that overlap each other would be silently
-    // applied bottom-up and clobber one another. Pure insertions (startLine
-    // > endLine) collapse to an empty range and never overlap.
+    // Defensive re-check: Stage 2 already removed sibling overlaps, so this is
+    // expected to stay empty — kept as a guard against future drift.
     const newOverlapErrors: string[] = [];
     for (let i = 0; i < f.hunks.length; i++) {
       const a = f.hunks[i];
@@ -550,112 +636,27 @@ export class HunkApplier implements vscode.Disposable {
       translatedHunks = f.hunks;
     } else {
       // Annotate each existing PENDING / ACCEPTED hunk with its baseline-coord
-      // range and per-hunk line delta. REJECTED hunks are excluded entirely
-      // because they were never applied to modifiedContent — leaving them in
-      // would inflate `cum` and skew every subsequent hunk's modStart.
-      const sortedExisting = existingEntry.hunks
-        .filter((h) => h.status !== 'rejected')
-        .slice()
-        .sort((a, b) => a.hunk.startLine - b.hunk.startLine);
-      let cum = 0;
-      type Annot = {
-        h: PendingHunk;
-        modStart: number;
-        modEnd: number;
-        delta: number;
-        isEmpty: boolean; // pure deletion: occupies zero lines in modified
-      };
-      const annotated: Annot[] = sortedExisting.map((h) => {
-        const removed =
-          h.hunk.startLine > h.hunk.endLine ? 0 : h.hunk.endLine - h.hunk.startLine + 1;
-        const added = countAddedLines(h.hunk.newText);
-        const modStart = h.hunk.startLine + cum;
-        // Bug fix: pure deletions (added=0) occupy ZERO lines in modified
-        // coords, so represent them as an empty range [modStart, modStart-1].
-        // The previous `Math.max(added, 1) - 1` formula incorrectly stamped
-        // them as a 1-line range, which caused spurious overlap matches and
-        // off-by-one drift in the per-hunk delta calculation below.
-        const modEnd = added === 0 ? modStart - 1 : modStart + added - 1;
-        const delta = added - removed;
-        cum += delta;
-        return { h, modStart, modEnd, delta, isEmpty: added === 0 };
-      });
+      // range and per-hunk line delta. Shared with the Stage-3 collision
+      // pre-pass above so the two passes can never disagree on coordinates.
+      const annotated = this.annotateExistingHunks(existingEntry);
 
-      // Auto-expand new hunks that partially overlap PENDING (not accepted) hunks.
-      // A partial overlap — where the new hunk clips one end of an existing pending
-      // hunk but does not fully contain it — is the most common source of spurious
-      // "overlap rejected" errors: the model issues a large hunk that slightly
-      // bleeds into a previously-queued hunk's range. Rather than forcing the model
-      // to re-read and re-submit, we extend the new hunk to fully contain the
-      // pending one, stitching the pending hunk's uncovered "tail" or "head" lines
-      // into the new hunk's newText so no content is silently dropped.
-      //   Overlap from above (new ends inside pending): extend endLine to
-      //     pendingModEnd and append the pending hunk's tail lines.
-      //   Overlap from below (new starts inside pending): extend startLine to
-      //     pendingModStart and prepend the pending hunk's head lines.
-      // After expansion the pending hunk becomes fully contained (case 1 below)
-      // and is dropped via last-write-wins. Accepted hunks are excluded: that
-      // region is locked in for review and must not be silently overwritten.
-      {
-        const autoExpanded = f.hunks.map((nh) => {
-          if (nh.startLine > nh.endLine) return nh; // pure insertion — nothing to expand
-          let { startLine, endLine, newText } = nh;
-          for (const ann of annotated) {
-            if (ann.isEmpty || ann.h.status === 'accepted') continue;
-            const overlaps = !(endLine < ann.modStart || ann.modEnd < startLine);
-            if (!overlaps) continue;
-            const newContains = startLine <= ann.modStart && ann.modEnd <= endLine;
-            const existingContains = ann.modStart <= startLine && endLine <= ann.modEnd;
-            if (newContains || existingContains) continue; // handled by main classification
-            const pendingLines = splitLogicalLines(ann.h.hunk.newText);
-            if (startLine <= ann.modStart) {
-              // Overlap from above: new hunk ends inside pending → extend endLine forward.
-              const tail = pendingLines.slice(endLine - ann.modStart + 1);
-              if (tail.length > 0) {
-                newText = (newText.endsWith('\n') ? newText : newText + '\n') +
-                          tail.join('\n') + '\n';
-              }
-              endLine = ann.modEnd;
-            } else {
-              // Overlap from below: new hunk starts inside pending → extend startLine back.
-              const head = pendingLines.slice(0, startLine - ann.modStart);
-              if (head.length > 0) {
-                newText = head.join('\n') + '\n' + newText;
-              }
-              startLine = ann.modStart;
-            }
-          }
-          if (startLine === nh.startLine && endLine === nh.endLine) return nh;
-          return { startLine, endLine, newText };
-        });
-        // Guard: if expansion made two new hunks overlap each other (rare — only
-        // when two new hunks each straddle the same pending hunk from opposite
-        // ends), abandon the expansion and let the error path below fire instead.
-        let expansionSafe = true;
-        outer: for (let i = 0; i < autoExpanded.length; i++) {
-          const a = autoExpanded[i];
-          if (a.startLine > a.endLine) continue;
-          for (let j = i + 1; j < autoExpanded.length; j++) {
-            const b = autoExpanded[j];
-            if (b.startLine > b.endLine) continue;
-            if (!(a.endLine < b.startLine || b.endLine < a.startLine)) {
-              expansionSafe = false;
-              break outer;
-            }
-          }
-        }
-        if (expansionSafe) {
-          f = { path: f.path, hunks: autoExpanded };
-        }
-      }
+      // Do NOT auto-expand partial overlaps with existing pending hunks.
+      // Earlier versions tried to be helpful here by extending the new hunk to
+      // fully contain the pending one and stitching the pending hunk's uncovered
+      // head/tail into `newText`. That was unsafe: the tool was guessing the
+      // model's intent at a textual boundary, and when either side already
+      // carried surrounding context the stitched lines could be duplicated or
+      // joined in the wrong order. Treat partial overlap as an addressability
+      // error instead; the caller must either fully replace the pending hunk or
+      // re-read the file and submit a disjoint/contained hunk.
 
       // Classify each new hunk against existing annotated hunks. Four cases:
       //   1. New hunk fully CONTAINS a pending hunk        -> drop pending (last-write-wins).
       //   2. Pending hunk fully CONTAINS the new hunk      -> splice the new
       //      hunk's newText into the pending hunk's newText (refinement).
-      //   3. New hunk PARTIALLY overlaps a pending hunk    -> auto-expanded above;
-      //      only reaches here if expansion was unsafe (two new hunks straddle the
-      //      same pending hunk from opposite ends), in which case we reject.
+      //   3. New hunk PARTIALLY overlaps a pending hunk    -> reject; guessing
+      //      how to stitch the boundary is unsafe and caused duplicated/misordered
+      //      text in follow-up edits.
       //   4. New hunk overlaps an ACCEPTED hunk            -> reject (the
       //      accepted region is locked in for review; refining its newText
       //      via line numbers is fragile, ask the model to re-read instead).
@@ -830,7 +831,44 @@ export class HunkApplier implements vscode.Disposable {
     // back hunk-by-hunk; `acceptAll` is a no-op on disk because the
     // accepted state is what's already there.
     await this.syncDiskToModified(entry);
-    return newlyQueued;
+    return { newlyQueued, errors: hunkErrors };
+  }
+
+  /**
+   * Annotate every existing non-rejected hunk of `existingEntry` with its
+   * baseline (modifiedContent) coordinate range and per-hunk line delta.
+   * REJECTED hunks are excluded entirely because they were never applied to
+   * modifiedContent — leaving them in would inflate `cum` and skew every
+   * subsequent hunk's modStart. Used by BOTH the Stage-3 collision pre-pass
+   * (per-hunk isolation) and the classification + translation block so the two
+   * never disagree on coordinates.
+   */
+  private annotateExistingHunks(existingEntry: PendingFile): Array<{
+    h: PendingHunk;
+    modStart: number;
+    modEnd: number;
+    delta: number;
+    isEmpty: boolean; // pure deletion: occupies zero lines in modified
+  }> {
+    const sortedExisting = existingEntry.hunks
+      .filter((h) => h.status !== 'rejected')
+      .slice()
+      .sort((a, b) => a.hunk.startLine - b.hunk.startLine);
+    let cum = 0;
+    return sortedExisting.map((h) => {
+      const removed =
+        h.hunk.startLine > h.hunk.endLine ? 0 : h.hunk.endLine - h.hunk.startLine + 1;
+      const added = countAddedLines(h.hunk.newText);
+      const modStart = h.hunk.startLine + cum;
+      // Pure deletions (added=0) occupy ZERO lines in modified coords, so
+      // represent them as an empty range [modStart, modStart-1]. A 1-line
+      // range here would cause spurious overlap matches and off-by-one drift
+      // in the per-hunk delta calculation.
+      const modEnd = added === 0 ? modStart - 1 : modStart + added - 1;
+      const delta = added - removed;
+      cum += delta;
+      return { h, modStart, modEnd, delta, isEmpty: added === 0 };
+    });
   }
 
   /**

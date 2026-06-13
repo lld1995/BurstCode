@@ -281,7 +281,21 @@ FIRST MOVE — collect_context (default) OR launch_subagent (large context):
 After receiving a collect_context / read_file result, follow these rules:
   - If the result contains everything you need → move DIRECTLY to analysis
     and action (propose_edit, answer, etc.) with NO further reads.
-  - Files / patterns that returned useful content: do NOT re-read them.
+  - A read_file / collect_context file result is usually a LINE WINDOW, not the
+    complete file. Do NOT infer that code outside the reported line range is
+    absent, deleted, or safe to rewrite. The header shows "lines A-B of TOTAL";
+    if B < TOTAL, later lines still exist. Only use full:true when you truly need
+    the entire file and the context budget can afford it.
+  - When resuming after prior edits, especially on large changes, treat already
+    landed/pending hunks as the current baseline. Do NOT restart by regenerating
+    broad ranges that were already written, and NEVER append a freshly regenerated
+    replacement after landed code. Prefer targeted reads and small follow-up edits:
+    add the missing remainder, patch the smallest incorrect block, or delete
+    duplicated/trailing content introduced by overlap. If a broad rewrite seems
+    necessary, first re-read the exact current range plus a small margin, then use
+    oldText to replace the exact existing bad block or delete_lines to remove the
+    exact duplicate block.
+  - Files / patterns that returned useful content: do NOT re-read the same range.
   - Entries that returned empty / error results: DISCARD them — treat that
     content as if it never existed. Do NOT reference or repeat it.
     You MAY issue ONE corrective collect_context for the failed items only,

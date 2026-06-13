@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { Tool, ToolResult } from './types';
 import { HunkApplier, ProposedEditFile } from '../../edits/HunkApplier';
 import { repairJsonControlChars, repairJsonUnescapedQuotes } from '../../util/jsonRepair';
@@ -75,59 +76,231 @@ function pickLooseStringField(
   return undefined;
 }
 
-function pickLooseNumberField(text: string, key: string): number | undefined {
-  const m = new RegExp(`"${key}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`).exec(text);
-  if (!m) return undefined;
-  const n = Number(m[1]);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-function parseLooseStringifiedEdits(text: string): unknown[] {
-  const edits: unknown[] = [];
-  let pos = 0;
-  while (pos < text.length) {
-    const objectStart = text.indexOf('{', pos);
-    if (objectStart < 0) break;
-    const rest = text.slice(objectStart);
-    const pathPicked = pickLooseStringField(rest, [
-      'path',
-      'file',
-      'filePath',
-      'filename',
-      'fileName',
-      'target',
-      'targetFile',
-      'uri'
-    ]);
-    const newTextPicked = pickLooseStringField(rest, [
-      'newText',
-      'new_text',
-      'replacement',
-      'code',
-      'content',
-      'text'
-    ]);
-    if (!pathPicked || !newTextPicked) {
-      pos = objectStart + 1;
+function parsePartialJsonObject(raw: string): Record<string, unknown> | null {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  try {
+    const parsed = JSON.parse(s);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    /* repair below */
+  }
+  let inStr = false;
+  let esc = false;
+  const stack: string[] = [];
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    out += ch;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
       continue;
     }
-    const segment = rest.slice(0, Math.max(pathPicked.end, newTextPicked.end) + 1);
-    edits.push({
-      [pathPicked.key]: pathPicked.value,
-      newText: newTextPicked.value,
-      ...(pickLooseNumberField(segment, 'startLine') !== undefined
-        ? { startLine: pickLooseNumberField(segment, 'startLine') }
-        : {}),
-      ...(pickLooseNumberField(segment, 'endLine') !== undefined
-        ? { endLine: pickLooseNumberField(segment, 'endLine') }
-        : {}),
-      ...(pickLooseStringField(segment, ['oldText', 'old_text', 'original', 'search'])?.value !== undefined
-        ? { oldText: pickLooseStringField(segment, ['oldText', 'old_text', 'original', 'search'])?.value }
-        : {})
-    });
-    pos = objectStart + newTextPicked.end + 1;
+    if (ch === '"') inStr = true;
+    else if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') stack.pop();
   }
-  return edits;
+  if (inStr) {
+    if (esc) out += '\\';
+    out += '"';
+  }
+  out = out.replace(/,\s*$/, '');
+  if (stack[stack.length - 1] === '{') {
+    out = out.replace(/(\{)\s*$/, '$1');
+    out = out.replace(/,\s*"(?:[^"\\]|\\.)*"\s*$/, '');
+    out = out.replace(/(\{)\s*"(?:[^"\\]|\\.)*"\s*$/, '$1');
+    out = out.replace(/:\s*$/, ': null');
+    out = out.replace(/,\s*$/, '');
+  }
+  for (let i = stack.length - 1; i >= 0; i--) out += stack[i] === '{' ? '}' : ']';
+  try {
+    const parsed = JSON.parse(out);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeSalvagedEdit(
+  raw: unknown,
+  fallbackPath?: { value: string; key: string }
+): Record<string, unknown> | null {
+  const e = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {};
+  const pathPicked = pickFirstString(e, [
+    'path',
+    'file',
+    'filePath',
+    'filename',
+    'fileName',
+    'target',
+    'targetFile',
+    'uri'
+  ]) ?? fallbackPath;
+  const newTextPicked = pickFirstString(e, ['newText', 'new_text', 'replacement', 'code', 'content', 'text']);
+  const oldTextPicked = pickFirstString(e, ['oldText', 'old_text', 'original', 'search']);
+  const startLine = pickFiniteNumber(e, 'startLine');
+  const endLine = pickFiniteNumber(e, 'endLine');
+  if (!pathPicked || !newTextPicked) return null;
+  if (!oldTextPicked && (startLine === undefined || endLine === undefined)) return null;
+  return {
+    path: pathPicked.value,
+    newText: newTextPicked.value,
+    ...(oldTextPicked ? { oldText: oldTextPicked.value } : {}),
+    ...(startLine !== undefined ? { startLine } : {}),
+    ...(endLine !== undefined ? { endLine } : {})
+  };
+}
+
+function mergeSalvagedEdits(primary: unknown[], secondary: unknown[]): unknown[] {
+  const out: unknown[] = [];
+  const seen = new Set<string>();
+  for (const e of [...primary, ...secondary]) {
+    const sig = JSON.stringify(e);
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    out.push(e);
+  }
+  return out;
+}
+
+function findJsonValueEnd(text: string, start: number): number {
+  let inStr = false;
+  let esc = false;
+  const stack: string[] = [];
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      continue;
+    }
+    if (ch === '{' || ch === '[') {
+      stack.push(ch);
+      continue;
+    }
+    if (ch === '}' || ch === ']') {
+      if (stack.length === 0) return i;
+      stack.pop();
+      if (stack.length === 0) return i + 1;
+      continue;
+    }
+    if (stack.length === 0 && ch === ',') return i;
+  }
+  return -1;
+}
+
+function extractCompleteObjectsFromArrayField(text: string, field: string): unknown[] {
+  const fieldRe = new RegExp(`"${field}"\\s*:\\s*\\[`, 'g');
+  const m = fieldRe.exec(text);
+  if (!m) return [];
+  const out: unknown[] = [];
+  let pos = m.index + m[0].length;
+  while (pos < text.length) {
+    while (pos < text.length && /[\s,]/.test(text[pos])) pos++;
+    if (text[pos] === ']') break;
+    if (text[pos] !== '{') break;
+    const end = findJsonValueEnd(text, pos);
+    if (end < 0) break;
+    const rawObj = text.slice(pos, end);
+    try {
+      out.push(JSON.parse(rawObj));
+    } catch {
+      const controlRepaired = repairJsonControlChars(rawObj) ?? rawObj;
+      const quoteRepaired = repairJsonUnescapedQuotes(controlRepaired) ?? controlRepaired;
+      try { out.push(JSON.parse(quoteRepaired)); } catch { /* skip malformed fragment */ }
+    }
+    pos = end;
+  }
+  return out;
+}
+
+function parseLooseStringifiedEdits(
+  text: string,
+  fallbackPath?: { value: string; key: string }
+): unknown[] {
+  // This is the backend equivalent of the webview's live streamed preview: if a
+  // propose_edit args buffer has already streamed one or more complete edit
+  // objects inside edits:[...], salvage those objects even when the OUTER tool
+  // JSON was interrupted before it could close / execute. Do not regex individual
+  // oldText/newText fields globally — that mixes fields from different hunks and
+  // is exactly how a visible per-hunk "fragment" can be lost or corrupted.
+  return extractCompleteObjectsFromArrayField(text, 'edits')
+    .map((e) => normalizeSalvagedEdit(e, fallbackPath))
+    .filter((e): e is Record<string, unknown> => !!e);
+}
+
+/**
+ * Best-effort recovery of a TRUNCATED propose_edit tool call. When the model
+ * runs out of output budget mid-call its raw arguments are cut off and the
+ * normal JSON.parse / repair passes all fail because there is no complete
+ * object to parse. This salvages whatever WHOLE {path, newText, ...} edit
+ * fragments DID arrive — plus the same renderable per-edit objects that the
+ * webview's live preview can already show by synthetically closing the partial
+ * JSON — so a visible edit card is not lost just because the outer tool call
+ * never reached execution. The half-written tail fragment may still be skipped
+ * if it lacks path/newText plus oldText or a line range. Returns null when not a
+ * single complete/renderable fragment could be recovered.
+ */
+export function salvageProposeEditArgs(raw: string): Record<string, unknown> | null {
+  if (!raw) return null;
+  // Native OpenAI tool-call streams often use the canonical compact shape
+  // {summary, path, edits:[{oldText,newText}, ...]} while the outer JSON may be
+  // cut before it closes. The normal execute() path propagates top-level path to
+  // each edit; the interruption salvage must do the same or every fully-written
+  // edit object is skipped for "missing path" and never reaches HunkApplier.
+  const fallbackPath = pickLooseStringField(raw, [
+    'path',
+    'file',
+    'filePath',
+    'filename',
+    'fileName',
+    'target',
+    'targetFile',
+    'uri'
+  ]);
+  const looseEdits = parseLooseStringifiedEdits(raw, fallbackPath);
+  const partialParsed = parsePartialJsonObject(raw);
+  const parsedPath = partialParsed
+    ? pickFirstString(partialParsed, [
+        'path',
+        'file',
+        'filePath',
+        'filename',
+        'fileName',
+        'target',
+        'targetFile',
+        'uri'
+      ]) ?? fallbackPath
+    : fallbackPath;
+  const rawParsedEdits = partialParsed && Array.isArray(partialParsed.edits)
+    ? partialParsed.edits
+    : [];
+  const previewEdits = rawParsedEdits
+    .map((e) => normalizeSalvagedEdit(e, parsedPath))
+    .filter((e): e is Record<string, unknown> => !!e);
+  if (partialParsed && previewEdits.length === 0) {
+    const topLevelEdit = normalizeSalvagedEdit(partialParsed, parsedPath);
+    if (topLevelEdit) previewEdits.push(topLevelEdit);
+  }
+  const edits = mergeSalvagedEdits(looseEdits, previewEdits);
+  if (edits.length === 0) return null;
+  const summary =
+    pickLooseStringField(raw, ['summary'])?.value ??
+    '(recovered from a truncated propose_edit call)';
+  return { summary, edits, __bc_truncatedSalvage: true };
 }
 
 /** A single answer choice presented to the user. */
@@ -148,6 +321,47 @@ export interface AskUserSpec {
 }
 
 export type AskUserFn = (spec: AskUserSpec) => Promise<string>;
+
+function resolveToolPath(p: string): vscode.Uri {
+  if (path.isAbsolute(p)) return vscode.Uri.file(p);
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  return folder ? vscode.Uri.joinPath(folder.uri, p) : vscode.Uri.file(p);
+}
+
+function splitPreviewLines(text: string): string[] {
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  return normalized.split('\n');
+}
+
+async function buildDeletionPreviewEdits(files: ProposedEditFile[]): Promise<Array<Record<string, unknown>>> {
+  const preview: Array<Record<string, unknown>> = [];
+  for (const f of files) {
+    const deletionHunks = f.hunks.filter(
+      (h) => h.oldText === undefined && h.newText === '' && h.startLine <= h.endLine
+    );
+    if (deletionHunks.length === 0) continue;
+    try {
+      const uri = resolveToolPath(f.path);
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      const text = Buffer.from(bytes).toString('utf8');
+      const lines = splitPreviewLines(text);
+      for (const h of deletionHunks) {
+        const startIdx = Math.max(0, h.startLine - 1);
+        const endIdx = Math.max(startIdx, h.endLine);
+        preview.push({
+          path: f.path,
+          startLine: h.startLine,
+          endLine: h.endLine,
+          oldText: lines.slice(startIdx, endIdx).join('\n'),
+          newText: ''
+        });
+      }
+    } catch {
+      // Best-effort UI metadata only; the real applier still validates/applies below.
+    }
+  }
+  return preview;
+}
 
 export function buildEditTools(
   applier: HunkApplier,
@@ -173,7 +387,7 @@ export function buildEditTools(
           "RECOMMENDED FORM (anchor-based, robust to line drift): supply 'oldText' = the EXACT contiguous lines you want to replace (whitespace-exact, full lines). 'newText' is what they become. The applier locates oldText in the file's current view and rewrites the line range for you, so stale line numbers no longer corrupt edits. If oldText appears multiple times, set 'startLine' to the 1-indexed line where the intended match starts as a tie-breaker, OR add more context lines to oldText to make it unique.\n\n" +
           "FALLBACK FORM (line-range, used when oldText is omitted): supply 1-indexed inclusive [startLine, endLine] matching the on-disk content you see via read_file (propose_edit writes eagerly, so read_file already shows the live post-edit state; the `pending hunks` footnote is just metadata — not a separate layer). To INSERT without replacing in this form, set startLine = endLine + 1 and end newText with a newline.\n\n" +
           "CREATING A NEW FILE: set path to the new file path (parent dirs auto-created), startLine=1, endLine=0, omit oldText, and put the full file contents in newText. Do NOT stuff new code into an unrelated existing file just because the target doesn't exist yet — propose_edit handles file creation natively.\n\n" +
-          "You may call propose_edit multiple times within a turn (and across turns) to refine the queued change set. Later hunks that fully contain earlier pending hunks replace them (last-write-wins); partially-overlapping hunks are REJECTED with a clear error so you can retarget. The user accepts/rejects via a chat banner or per-hunk CodeLenses; Accept is a status-only flip (the on-disk bytes don't change), while Reject rewinds to the pre-edit snapshot. When you receive a [user-decision] notice, re-read the affected file — a Reject may have rolled content back.",
+          "You may call propose_edit multiple times within a turn (and across turns) to refine the queued change set. Later hunks that fully contain earlier pending hunks replace them (last-write-wins); partially-overlapping hunks are REJECTED with a clear error so you can retarget. After any fragment has landed, treat the live file as the baseline: do not append or regenerate a broad replacement for the same area. If you need to fix overlap/duplication, re-read the exact current range and use oldText to replace the concrete bad block or delete_lines to remove the duplicate block. The user accepts/rejects via a chat banner or per-hunk CodeLenses; Accept is a status-only flip (the on-disk bytes don't change), while Reject rewinds to the pre-edit snapshot. When you receive a [user-decision] notice, re-read the affected file — a Reject may have rolled content back.",
         parameters: {
           type: 'object',
           properties: {
@@ -261,6 +475,21 @@ export function buildEditTools(
       // call. Without this, a naming slip caused the LLM to loop on
       // "no edits provided" because the downstream message didn't tell it
       // which key it actually used.
+      const argsRecord = (args ?? {}) as Record<string, unknown>;
+      // Top-level path fallback: when the model emits {summary, path, edits:
+      // [{oldText, newText}, ...]} (a single-file convenience form it
+      // sometimes invents), propagate that path to every hunk that lacks
+      // its own. Cheap to support; expensive to debug when missing.
+      const topLevelPath = pickFirstString(argsRecord, [
+        'path',
+        'file',
+        'filePath',
+        'filename',
+        'fileName',
+        'target',
+        'targetFile',
+        'uri'
+      ]);
       const rawEditsCandidate =
         (args as Record<string, unknown>).edits ??
         (args as Record<string, unknown>).hunks ??
@@ -300,28 +529,13 @@ export function buildEditTools(
             rawEdits = parsedInner;
           } else {
             const quoteRepaired = repairJsonUnescapedQuotes(afterControl);
-            rawEdits = parseLooseStringifiedEdits(quoteRepaired ?? afterControl);
+            rawEdits = parseLooseStringifiedEdits(quoteRepaired ?? afterControl, topLevelPath);
             stringifiedEditsParseFailed = rawEdits.length === 0;
           }
         }
       } else {
         rawEdits = [];
       }
-      // Top-level path fallback: when the model emits {summary, path, edits:
-      // [{oldText, newText}, ...]} (a single-file convenience form it
-      // sometimes invents), propagate that path to every hunk that lacks
-      // its own. Cheap to support; expensive to debug when missing.
-      const argsRecord = (args ?? {}) as Record<string, unknown>;
-      const topLevelPath = pickFirstString(argsRecord, [
-        'path',
-        'file',
-        'filePath',
-        'filename',
-        'fileName',
-        'target',
-        'targetFile',
-        'uri'
-      ]);
       // Delete-lines convenience mode: keep a single public write tool, but let
       // the caller explicitly choose a safe line-deletion shape that never
       // carries oldText. This avoids adding another tool while preventing the
@@ -462,6 +676,7 @@ export function buildEditTools(
             : `all ${editsField.length} edit(s) were skipped: ${skipReasons.join('; ')}`;
         return { content: `no edits provided: ${diagnosis}. Re-emit propose_edit with a valid 'edits' array.`, isError: true };
       }
+      const deletionPreviewEdits = await buildDeletionPreviewEdits(files);
       try {
         await applier.proposeEdits(files, summary, sessionId, turnIndex);
       } catch (err) {
@@ -474,12 +689,17 @@ export function buildEditTools(
         const message = err instanceof Error ? err.message : String(err);
         return {
           content:
-            `propose_edit error(s): ${message}\n` +
-            `ACTION REQUIRED for the files named in the error above ONLY: re-read each with read_file ` +
-            `(line numbers may be stale) and re-issue propose_edit with corrected oldText / non-overlapping ranges. ` +
-            `Prefer the oldText form so line drift no longer matters.\n` +
-            `Any files NOT named in the error were queued successfully — do NOT re-submit those; they are already staged and do not need further action from you.`,
-          isError: true
+            `propose_edit applied every VALID fragment and staged it on disk; only the ` +
+            `fragment(s) below failed and were skipped (the rest of the same call still landed):\n${message}\n` +
+            `ACTION REQUIRED — re-issue ONLY the failed fragment(s) above: re-read the file with read_file ` +
+            `(the fragments that DID land may have shifted the line numbers) and re-submit them with ` +
+            `corrected oldText / non-overlapping ranges, or use delete_lines for exact duplicate blocks. ` +
+            `Do NOT regenerate or append a broad replacement for code that already landed; that creates duplicate code and file bloat. ` +
+            `Prefer the oldText form so line drift no longer matters.
+` +
+            `Do NOT re-submit any fragment or file that was not named above — those are already staged and need no further action from you.`,
+          isError: true,
+          meta: deletionPreviewEdits.length ? { previewEdits: deletionPreviewEdits } : undefined
         };
       }
       const aliasNotes: string[] = [];
@@ -503,9 +723,16 @@ export function buildEditTools(
         ? `\nNote: ${aliasNotes.join('; ')}. Accepted this time — please use the canonical field names ('edits', 'path') on subsequent calls.`
         : '';
       const filePaths = files.map((f) => f.path).join(', ');
+      const truncationNote = argsRecord.__bc_truncatedSalvage
+        ? `\nIMPORTANT: your propose_edit call was TRUNCATED mid-stream (output token budget). Only the ${rawEdits.length} fully-received fragment(s) above were recovered and applied; any edits after the cut-off point were lost. Re-issue the REMAINING edits in a new, smaller propose_edit call.`
+        : '';
       return {
-        content: `Queued edits for ${files.length} file(s): ${filePaths} — pending user review (non-blocking). You may call propose_edit again to add or replace hunks, or move on to the next step.${aliasNote}`,
-        meta: { files: files.map((f) => f.path), summary }
+        content: `Queued edits for ${files.length} file(s): ${filePaths} — pending user review (non-blocking). You may call propose_edit again to add or replace hunks, or move on to the next step.${aliasNote}${truncationNote}`,
+        meta: {
+          files: files.map((f) => f.path),
+          summary,
+          ...(deletionPreviewEdits.length ? { previewEdits: deletionPreviewEdits } : {})
+        }
       };
     }
   };
