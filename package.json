@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.102",
+  "version": "0.1.103",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -142,6 +142,10 @@
       {
         "command": "burstcode.background.menu",
         "title": "BurstCode: Background Explorer Menu"
+      },
+      {
+        "command": "burstcode.web.testBrave",
+        "title": "BurstCode: Test Brave Search API Key"
       }
     ],
     "menus": {

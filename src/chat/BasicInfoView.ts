@@ -226,6 +226,15 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
           title: 'Configure Brave Search API Key',
           arguments: ['burstcode.web.braveApiKey']
         }
+      }),
+      new BasicNode('leaf', t('web.braveTest'), {
+        description: braveKey ? t('web.braveTest.ready') : t('web.braveTest.needKey'),
+        icon: 'beaker',
+        tooltip: t('web.braveTest.tip'),
+        command: {
+          command: 'burstcode.web.testBrave',
+          title: 'Test Brave Search'
+        }
       })
     ];
 

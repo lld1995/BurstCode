@@ -344,8 +344,44 @@ interface SearchResult {
 
 async function fetchSearchPage(url: string, headers: Record<string, string> = {}): Promise<string> {
   const res = await fetchUrl(url, MAX_REDIRECTS, headers);
-  if (res.statusCode >= 400) throw new Error(`search provider returned HTTP ${res.statusCode}`);
+  if (res.statusCode >= 400) {
+    const detail = summarizeResponseBody(res.body.toString('utf-8'));
+    throw new Error(`search provider returned HTTP ${res.statusCode}${detail ? ` — ${detail}` : ''}`);
+  }
   return res.body.toString('utf-8');
+}
+
+function summarizeResponseBody(body: string, maxChars = 500): string {
+  const raw = body.trim();
+  if (!raw) return '';
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const json = JSON.stringify(parsed);
+    return json.length > maxChars ? `${json.slice(0, maxChars)}…` : json;
+  } catch {
+    const text = raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+  }
+}
+
+function describeBraveStatus(statusCode: number): string {
+  switch (statusCode) {
+    case 400:
+    case 422:
+      return 'bad request / invalid query parameters';
+    case 401:
+      return 'API key is invalid or missing';
+    case 403:
+      return 'API key is not allowed to access Brave Search, or the subscription is inactive';
+    case 408:
+      return 'request timed out';
+    case 429:
+      return 'rate limit or monthly quota exhausted';
+    default:
+      if (statusCode >= 500) return 'Brave Search server error';
+      return 'unexpected Brave Search response';
+  }
 }
 
 function parseDuckDuckGoResults(html: string, maxResults: number): SearchResult[] {
@@ -466,6 +502,47 @@ async function duckduckgoSearch(query: string, maxResults: number): Promise<Sear
   }
 
   throw new Error(failures.join('; '));
+}
+
+export async function testBraveSearchApi(query = 'BurstCode'): Promise<SearchResult[]> {
+  const braveKey = getBraveApiKey();
+  if (!braveKey) {
+    throw new Error('burstcode.web.braveApiKey is not configured');
+  }
+
+  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}`;
+  let response: FetchResult;
+  try {
+    response = await fetchUrl(url, MAX_REDIRECTS, {
+      'Accept': 'application/json',
+      'X-Subscription-Token': braveKey,
+    });
+  } catch (err) {
+    const msg = String((err as Error).message ?? err).trim();
+    throw new Error(`network/proxy request failed${msg ? `: ${msg}` : ''}`);
+  }
+
+  const body = response.body.toString('utf-8');
+  if (response.statusCode >= 400) {
+    const reason = describeBraveStatus(response.statusCode);
+    const detail = summarizeResponseBody(body);
+    throw new Error(`HTTP ${response.statusCode} (${reason})${detail ? ` — ${detail}` : ''}`);
+  }
+
+  let results: SearchResult[];
+  try {
+    results = parseBraveResults(body, 3);
+  } catch (err) {
+    const msg = String((err as Error).message ?? err).trim();
+    const detail = summarizeResponseBody(body);
+    throw new Error(`Brave Search returned invalid JSON${msg ? `: ${msg}` : ''}${detail ? ` — ${detail}` : ''}`);
+  }
+
+  if (results.length === 0) {
+    const detail = summarizeResponseBody(body);
+    throw new Error(`Brave Search returned no parseable results${detail ? ` — ${detail}` : ''}`);
+  }
+  return results;
 }
 
 export const webSearchTool: Tool = {

@@ -67,6 +67,10 @@ const EN: Dict = {
   'web.brave.off': 'Brave not configured',
   'web.braveKey': 'Brave Search API key',
   'web.braveKey.tip': 'Set a Brave Search API key. web_search tries Brave before DuckDuckGo/Bing when configured.',
+  'web.braveTest': 'Test Brave Search',
+  'web.braveTest.ready': 'ready',
+  'web.braveTest.needKey': 'set API key first',
+  'web.braveTest.tip': 'Send a small Brave Search request to verify the API key and proxy settings.',
   'web.configured': 'configured',
   'web.notConfigured': 'not configured',
 
@@ -164,6 +168,10 @@ const ZH: Dict = {
   'web.brave.off': 'Brave 未配置',
   'web.braveKey': 'Brave 搜索 API Key',
   'web.braveKey.tip': '设置 Brave Search API Key。配置后 web_search 会优先使用 Brave，再回退到 DuckDuckGo/Bing。',
+  'web.braveTest': '测试 Brave 搜索',
+  'web.braveTest.ready': '可测试',
+  'web.braveTest.needKey': '请先设置 API Key',
+  'web.braveTest.tip': '发送一次小的 Brave Search 请求，验证 API Key 和代理设置是否可用。',
   'web.configured': '已配置',
   'web.notConfigured': '未配置',
 

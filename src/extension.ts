@@ -6,6 +6,7 @@ import { HunkApplier } from './edits/HunkApplier';
 import { DiffPreview } from './edits/DiffPreview';
 import { GitCheckpoint } from './git/GitCheckpoint';
 import { Logger } from './util/Logger';
+import { testBraveSearchApi } from './agent/tools/web';
 import {
   readChatProfile,
   readBackgroundProfile,
@@ -162,6 +163,44 @@ export function activate(context: vscode.ExtensionContext): void {
           await rootCfg.update(UI_LANGUAGE_CONFIG_KEY, picked.value, vscode.ConfigurationTarget.Global);
         } else {
           throw err;
+        }
+      }
+    }),
+    vscode.commands.registerCommand('burstcode.web.testBrave', async () => {
+      const key = (vscode.workspace.getConfiguration('burstcode.web').get<string>('braveApiKey') ?? '').trim();
+      if (!key) {
+        const action = await vscode.window.showWarningMessage(
+          'BurstCode: Brave Search API key is not configured.',
+          'Open Settings'
+        );
+        if (action === 'Open Settings') {
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'burstcode.web.braveApiKey');
+        }
+        return;
+      }
+
+      try {
+        const results = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'BurstCode: testing Brave Search…' },
+          () => testBraveSearchApi('BurstCode')
+        );
+        const first = results[0];
+        vscode.window.showInformationMessage(
+          `BurstCode: Brave Search OK — ${results.length} result(s). First: ${first.title}`
+        );
+      } catch (err) {
+        const detail = String((err as Error).message ?? err).trim() || 'unknown error';
+        const message = `BurstCode: Brave Search test failed — ${detail}`;
+        const action = await vscode.window.showErrorMessage(
+          message,
+          { modal: true },
+          'Open Settings',
+          'Copy Details'
+        );
+        if (action === 'Open Settings') {
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'burstcode.web.braveApiKey');
+        } else if (action === 'Copy Details') {
+          await vscode.env.clipboard.writeText(message);
         }
       }
     }),
