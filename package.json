@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.106",
+  "version": "0.1.107",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -327,7 +327,7 @@
           "type": "boolean",
           "default": true,
           "order": 50,
-          "description": "Play a repeating notification sound when an agent task completes. The sound stops on the first detected user activity, such as clicking, typing, focusing the window, or interacting with the BurstCode view."
+          "description": "Play a repeating notification sound when an agent task completes. The sound stops on the first detected user activity, such as clicking, typing, focusing the window, or interacting with the BurstCode view. If VS Code is not focused on Windows, BurstCode finds the VS Code main window and invokes the native taskbar flash/highlight API, then posts a generic VS Code attention notification."
         },
         "burstcode.ui.taskDoneSoundIntervalMs": {
           "type": "number",
@@ -340,7 +340,7 @@
           "type": "boolean",
           "default": true,
           "order": 52,
-          "description": "Play a repeating prompt sound while BurstCode is waiting for your answer to an ask_user prompt. This uses a softer attention tone that is distinct from the task-completion sound."
+          "description": "Play a repeating prompt sound while BurstCode is waiting for your answer to an ask_user prompt. This uses a softer attention tone that is distinct from the task-completion sound. If VS Code is not focused on Windows, BurstCode finds the VS Code main window and invokes the native taskbar flash/highlight API, then posts a VS Code attention notification."
         },
         "burstcode.ui.askUserSoundIntervalMs": {
           "type": "number",

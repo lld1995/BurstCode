@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as cp from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
 import { Logger } from '../util/Logger';
 import { DependencyGuard } from '../deps/DependencyGuard';
 import { HunkApplier, PendingState } from '../edits/HunkApplier';
@@ -199,6 +201,105 @@ function startTaskDoneAlert(): SoundAlertHandle | undefined {
 
 function startAskUserAlert(): SoundAlertHandle | undefined {
   return startRepeatingAlertSound('askUser', 'askUserSound', 'askUserSoundIntervalMs', 1200);
+}
+
+function flashWindowsTaskbarUntilForeground(): void {
+  if (process.platform !== 'win32' || vscode.window.state.focused) return;
+
+  try {
+    const scriptPath = path.join(os.tmpdir(), 'burstcode-flash-taskbar.ps1');
+    const script = `
+param([int]$TargetPid)
+Add-Type @"
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+public static class BurstCodeTaskbarFlash {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FLASHWINFO {
+        public UInt32 cbSize;
+        public IntPtr hwnd;
+        public UInt32 dwFlags;
+        public UInt32 uCount;
+        public UInt32 dwTimeout;
+    }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
+
+    public const UInt32 FLASHW_TRAY = 2;
+    public const UInt32 FLASHW_TIMERNOFG = 12;
+
+    public static bool Flash(IntPtr hwnd) {
+        if (hwnd == IntPtr.Zero) return false;
+        FLASHWINFO info = new FLASHWINFO();
+        info.cbSize = Convert.ToUInt32(Marshal.SizeOf(typeof(FLASHWINFO)));
+        info.hwnd = hwnd;
+        info.dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG;
+        info.uCount = UInt32.MaxValue;
+        info.dwTimeout = 0;
+        return FlashWindowEx(ref info);
+    }
+}
+"@
+
+function Get-ParentPid([int]$Pid) {
+  try {
+    $p = Get-CimInstance Win32_Process -Filter "ProcessId = $Pid" -ErrorAction Stop
+    if ($null -eq $p) { return 0 }
+    return [int]$p.ParentProcessId
+  } catch { return 0 }
+}
+
+$handles = New-Object 'System.Collections.Generic.List[IntPtr]'
+$pidCursor = $TargetPid
+for ($i = 0; $i -lt 16 -and $pidCursor -gt 0; $i++) {
+  try {
+    $proc = Get-Process -Id $pidCursor -ErrorAction Stop
+    if ($proc.MainWindowHandle -ne 0) { $handles.Add([IntPtr]$proc.MainWindowHandle) }
+  } catch {}
+  $pidCursor = Get-ParentPid $pidCursor
+}
+
+if ($handles.Count -eq 0) {
+  Get-Process Code, 'Code - Insiders', VSCodium -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowHandle -ne 0 } |
+    ForEach-Object { $handles.Add([IntPtr]$_.MainWindowHandle) }
+}
+
+foreach ($hwnd in $handles) { [void][BurstCodeTaskbarFlash]::Flash($hwnd) }
+`;
+    fs.writeFileSync(scriptPath, script, 'utf8');
+    cp.execFile('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+      scriptPath,
+      '-TargetPid',
+      String(process.pid)
+    ], { windowsHide: true }, () => {
+      fs.rm(scriptPath, { force: true }, () => undefined);
+    });
+  } catch {
+    // Best effort only. Some locked-down Windows environments may block Win32 calls.
+  }
+}
+
+function notifyIfWindowInactive(message: string): void {
+  if (vscode.window.state.focused) return;
+  flashWindowsTaskbarUntilForeground();
+  // Secondary best-effort attention path for platforms/settings where native
+  // taskbar flashing is unavailable or suppressed. This is intentionally a
+  // generic attention notification, not a task-complete popup.
+  void vscode.window.showInformationMessage(message);
+}
+
+function makeDisposable(dispose: () => void): vscode.Disposable {
+  return { dispose };
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -820,9 +921,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await vscode.commands.executeCommand('workbench.action.openSettings', 'burstcode');
         }
         break;
-      case 'user-activity':
-        this.stopTaskDoneAlert();
+      case 'user-activity': {
+        const active = vscode.window.state.focused;
+        this.post({ type: 'window-focus-state', payload: { focused: active } });
+        if (active) this.stopTaskDoneAlert();
         break;
+      }
       case 'select-model': {
         const p = (msg.payload ?? {}) as { model?: string };
         const model = String(p.model ?? '').trim();
@@ -999,20 +1103,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.view?.webview.postMessage(msg);
   }
 
-  private startTaskDoneAlertUntilActivity(message: string): void {
+  private startTaskDoneAlertUntilActivity(): void {
     this.stopTaskDoneAlert();
     const alert = startTaskDoneAlert();
     if (!alert) return;
 
+    notifyIfWindowInactive('BurstCode needs your attention.');
     this.taskDoneAlert = alert;
+
+    const activityEvents = ['pointermove', 'pointerdown', 'mousedown', 'click', 'keydown', 'input', 'focus', 'wheel', 'touchstart'];
+    const activitySub = makeDisposable(() => {
+      this.post({ type: 'stop-user-activity-listener' });
+    });
     this.taskDoneAlertActivitySubs.push(
       vscode.window.onDidChangeWindowState((state) => {
+        this.post({ type: 'window-focus-state', payload: { focused: state.focused } });
         if (state.focused) this.stopTaskDoneAlert();
       }),
-      vscode.window.onDidChangeActiveTextEditor(() => this.stopTaskDoneAlert()),
-      vscode.workspace.onDidChangeTextDocument(() => this.stopTaskDoneAlert())
+      vscode.window.onDidChangeActiveTextEditor(() => {
+        if (vscode.window.state.focused) this.stopTaskDoneAlert();
+      }),
+      vscode.workspace.onDidChangeTextDocument(() => {
+        if (vscode.window.state.focused) this.stopTaskDoneAlert();
+      }),
+      activitySub
     );
-    void vscode.window.showInformationMessage(message);
+    this.post({
+      type: 'start-user-activity-listener',
+      payload: { events: activityEvents, focused: vscode.window.state.focused }
+    });
   }
 
   private stopTaskDoneAlert(): void {
@@ -1024,9 +1143,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private startAskUserAlertUntilAnswered(): void {
+  private startAskUserAlertUntilAnswered(message: string): void {
     this.stopAskUserAlert();
     const alert = startAskUserAlert();
+    notifyIfWindowInactive(message);
     if (!alert) return;
     this.askUserAlert = alert;
   }
@@ -1493,7 +1613,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           type: 'ask-user',
           payload: { sessionId: session.id, ...askSpec }
         });
-        this.startAskUserAlertUntilAnswered();
+        this.startAskUserAlertUntilAnswered('BurstCode: waiting for your answer.');
         // If the run is cancelled before the user answers, unblock the agent
         // loop so it can wind down cleanly instead of hanging on this promise.
         const cancelSub = cts.token.onCancellationRequested(() => {
@@ -1671,7 +1791,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             : 'completed';
       this.foregroundActivityEmitter.fire('chat-end');
       if (session.status === 'completed') {
-        this.startTaskDoneAlertUntilActivity('BurstCode: task completed.');
+        this.startTaskDoneAlertUntilActivity();
       }
       if (isActive()) this.broadcastContextUsage();
       // Persist the set of files THIS run wrote onto its checkpoint so a later
@@ -2578,15 +2698,45 @@ function isLogAtBottom() {
 function markManualScrollIntent() {
   lastManualScrollAt = Date.now();
 }
-function reportUserActivity() {
+let taskDoneUserActivityListening = false;
+let taskDoneUserActivityWindowFocused = true;
+const taskDoneUserActivityEvents = new Set();
+function reportUserActivity(force) {
   const now = Date.now();
-  if (now - lastUserActivityPostAt < 500) return;
+  if (!force && now - lastUserActivityPostAt < 500) return;
   lastUserActivityPostAt = now;
   vscode.postMessage({ type: 'user-activity' });
 }
-['pointerdown', 'keydown', 'input', 'focus'].forEach((eventName) => {
-  document.addEventListener(eventName, reportUserActivity, true);
-});
+function reportTaskDoneUserActivity() {
+  if (!taskDoneUserActivityListening || !taskDoneUserActivityWindowFocused) return;
+  taskDoneUserActivityListening = false;
+  vscode.postMessage({ type: 'user-activity' });
+}
+function stopTaskDoneUserActivityListener() {
+  if (!taskDoneUserActivityEvents.size) return;
+  for (const eventName of Array.from(taskDoneUserActivityEvents)) {
+    window.removeEventListener(eventName, reportTaskDoneUserActivity, true);
+    document.removeEventListener(eventName, reportTaskDoneUserActivity, true);
+  }
+  taskDoneUserActivityEvents.clear();
+  taskDoneUserActivityListening = false;
+}
+function startTaskDoneUserActivityListener(events, focused) {
+  stopTaskDoneUserActivityListener();
+  const names = Array.isArray(events) && events.length
+    ? events.map(String)
+    : ['pointermove', 'pointerdown', 'mousedown', 'click', 'keydown', 'input', 'focus', 'wheel', 'touchstart'];
+  taskDoneUserActivityWindowFocused = focused !== false;
+  taskDoneUserActivityListening = true;
+  for (const eventName of names) {
+    taskDoneUserActivityEvents.add(eventName);
+    window.addEventListener(eventName, reportTaskDoneUserActivity, true);
+    document.addEventListener(eventName, reportTaskDoneUserActivity, true);
+  }
+}
+	['pointerdown', 'keydown', 'input', 'focus'].forEach((eventName) => {
+	  document.addEventListener(eventName, () => reportUserActivity(false), true);
+	});
 // File-path and symbol link click delegation
 document.addEventListener('click', (ev) => {
   const a = ev.target.closest && ev.target.closest('a[data-file-path], a[data-symbol-name]');
@@ -4398,6 +4548,18 @@ function setBusy(v) {
 window.addEventListener('message', (e) => {
   const msg = e.data;
   switch (msg.type) {
+    case 'start-user-activity-listener':
+      startTaskDoneUserActivityListener(
+        msg.payload && msg.payload.events,
+        !(msg.payload && msg.payload.focused === false)
+      );
+      break;
+    case 'stop-user-activity-listener':
+      stopTaskDoneUserActivityListener();
+      break;
+    case 'window-focus-state':
+      taskDoneUserActivityWindowFocused = !!(msg.payload && msg.payload.focused);
+      break;
     case 'rollback-start':
       rollbackOverlay.classList.add('active');
       break;
