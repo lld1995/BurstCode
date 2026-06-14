@@ -11,3 +11,4 @@ tsconfig.json
 scripts/**
 *.vsix
 .burstcode/**
+out/**

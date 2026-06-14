@@ -27,7 +27,7 @@ function getBraveApiKey(): string {
 }
 
 /** Read proxy URL from BurstCode/VS Code settings or process environment variables. */
-function getProxyUrl(): URL | null {
+export function getProxyUrl(): URL | null {
   // BurstCode setting takes highest priority for agent web tools.
   const burstProxy = getConfiguredProxyUrl();
   if (burstProxy) {
@@ -50,56 +50,84 @@ function getProxyUrl(): URL | null {
 }
 
 /**
- * Open a raw socket to the proxy and issue a CONNECT tunnel to target.
- * Returns a TLS socket (for HTTPS targets) or plain socket (for HTTP targets).
+ * Open a TCP connection to the proxy, issue HTTP CONNECT, then wrap the
+ * resulting tunnel in TLS (for HTTPS targets).  Returns a ready-to-use
+ * tls.TLSSocket so the caller can send plain HTTP/1.1 over it.
  */
-function openTunnel(
+export function openTunnel(
   proxy: URL,
   targetHost: string,
   targetPort: number,
   useTls: boolean
-): Promise<net.Socket | tls.TLSSocket> {
+): Promise<tls.TLSSocket | net.Socket> {
   return new Promise((resolve, reject) => {
-    const proxyPort = parseInt(proxy.port || '8080', 10);
+    const proxyPort = parseInt(proxy.port || (proxy.protocol === 'https:' ? '443' : '80'), 10);
     const proxyHost = proxy.hostname;
+    const proxyAuth = proxy.username || proxy.password
+      ? `Basic ${Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString('base64')}`
+      : undefined;
 
+    let settled = false;
     const socket = net.connect(proxyPort, proxyHost, () => {
-      const connectReq = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`;
-      socket.write(connectReq);
+      const lines = [
+        `CONNECT ${targetHost}:${targetPort} HTTP/1.1`,
+        `Host: ${targetHost}:${targetPort}`,
+        'Proxy-Connection: keep-alive',
+      ];
+      if (proxyAuth) lines.push(`Proxy-Authorization: ${proxyAuth}`);
+      socket.write(`${lines.join('\r\n')}\r\n\r\n`);
+    });
 
-      let response = '';
-      socket.once('data', (chunk) => {
-        response += chunk.toString('ascii');
-        // 200 Connection established → tunnel is open
-        if (/^HTTP\/1\.[01] 200/i.test(response)) {
-          if (useTls) {
-            const tlsSocket = tls.connect({
-              socket,
-              servername: targetHost,
-              rejectUnauthorized: false,
-            });
-            tlsSocket.once('secureConnect', () => resolve(tlsSocket));
-            tlsSocket.once('error', reject);
-          } else {
-            resolve(socket);
-          }
-        } else {
-          socket.destroy();
-          const status = response.split('\r\n')[0];
-          reject(new Error(`Proxy CONNECT rejected: ${status}`));
-        }
-      });
-      socket.once('error', reject);
-    });
-    socket.setTimeout(TIMEOUT_MS, () => {
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
       socket.destroy();
-      reject(new Error('Proxy connection timed out'));
+      reject(err);
+    };
+
+    const chunks: Buffer[] = [];
+    socket.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+      const buffered = Buffer.concat(chunks);
+      const headerEnd = buffered.indexOf('\r\n\r\n');
+      if (headerEnd < 0) return;
+
+      const header = buffered.slice(0, headerEnd).toString('ascii');
+      const leftover = buffered.slice(headerEnd + 4);
+      socket.removeAllListeners('data');
+      socket.removeAllListeners('error');
+      socket.setTimeout(0);
+
+      if (!/^HTTP\/1\.[01] 200/i.test(header)) {
+        fail(new Error(`Proxy CONNECT rejected: ${header.split('\r\n')[0]}`));
+        return;
+      }
+
+      if (settled) return;
+      settled = true;
+
+      if (!useTls) {
+        if (leftover.length > 0) socket.unshift(leftover);
+        resolve(socket);
+        return;
+      }
+
+      // Do the TLS handshake over the raw CONNECT tunnel.
+      const tlsSocket = tls.connect({
+        socket,
+        servername: targetHost,
+        rejectUnauthorized: false,
+      });
+      if (leftover.length > 0) tlsSocket.unshift(leftover);
+      tlsSocket.once('secureConnect', () => resolve(tlsSocket));
+      tlsSocket.once('error', (e) => reject(e));
     });
-    socket.once('error', reject);
+
+    socket.once('error', fail);
+    socket.setTimeout(TIMEOUT_MS, () => fail(new Error('Proxy connection timed out')));
   });
 }
-
-function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}): Promise<FetchResult> {
+export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}): Promise<FetchResult> {
   return new Promise((resolve, reject) => {
     let parsed: URL;
     try {
@@ -152,28 +180,58 @@ function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Rec
     const proxy = getProxyUrl();
 
     if (proxy) {
-      // Route through proxy tunnel; inject the pre-connected socket via createConnection
+      // openTunnel handles CONNECT + TLS; send plain HTTP/1.1 directly over the socket
+      // instead of using http.request (which ignores createConnection and re-connects).
       openTunnel(proxy, parsed.hostname, targetPort, isHttps)
         .then((socket) => {
-          const requester: typeof https | typeof http = isHttps ? https : http;
-          // createConnection signature: (opts, oncreate) => net.Socket
-          // We ignore opts/oncreate and return our existing socket synchronously.
-          const createConnection = () => socket as net.Socket;
-          const req = requester.request(
-            Object.assign({
-              hostname: parsed.hostname,
-              port: targetPort,
-              path,
-              method: 'GET',
-              headers: reqHeaders,
-              rejectUnauthorized: false,
-              timeout: TIMEOUT_MS,
-            }, { createConnection }) as https.RequestOptions,
-            handleResponse
-          );
-          req.on('error', reject);
-          req.on('timeout', () => { req.destroy(); reject(new Error(`Request timed out after ${TIMEOUT_MS}ms`)); });
-          req.end();
+          const timer = setTimeout(() => {
+            socket.destroy();
+            reject(new Error(`Request timed out after ${TIMEOUT_MS}ms`));
+          }, TIMEOUT_MS);
+
+          // Build raw HTTP/1.1 request
+          const headerLines = Object.entries(reqHeaders)
+            .map(([k, v]) => `${k}: ${v}`)
+            .join('\r\n');
+          const rawRequest = `GET ${path} HTTP/1.1\r\nHost: ${parsed.hostname}\r\n${headerLines}\r\nConnection: close\r\n\r\n`;
+
+          const chunks: Buffer[] = [];
+          socket.on('data', (chunk: Buffer) => chunks.push(chunk));
+          socket.once('error', (e) => { clearTimeout(timer); console.error('[BurstCode proxy req error]', e); reject(e); });
+          socket.once('end', () => {
+            clearTimeout(timer);
+            const raw = Buffer.concat(chunks);
+            const rawStr = raw.toString('binary');
+            const headerEnd = rawStr.indexOf('\r\n\r\n');
+            if (headerEnd < 0) { reject(new Error('Invalid HTTP response (no header end)')); return; }
+            const headerSection = rawStr.slice(0, headerEnd);
+            const bodyBuf = raw.slice(headerEnd + 4);
+            const [statusLine, ...headerEntries] = headerSection.split('\r\n');
+            const statusMatch = statusLine.match(/^HTTP\/[\d.]+ (\d+)/);
+            if (!statusMatch) { reject(new Error(`Invalid HTTP status line: ${statusLine}`)); return; }
+            const statusCode = parseInt(statusMatch[1], 10);
+            const resHeaders: Record<string, string> = {};
+            for (const line of headerEntries) {
+              const idx = line.indexOf(':');
+              if (idx > 0) resHeaders[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
+            }
+            if (statusCode >= 300 && statusCode < 400 && resHeaders['location']) {
+              if (redirectsLeft <= 0) { reject(new Error('Too many redirects')); return; }
+              let next: string;
+              try { next = new URL(resHeaders['location'], targetUrl).href; }
+              catch { reject(new Error(`Redirect to invalid URL: ${resHeaders['location']}`)); return; }
+              fetchUrl(next, redirectsLeft - 1, headers).then(resolve).catch(reject);
+              return;
+            }
+            resolve({
+              body: bodyBuf,
+              mimeType: resHeaders['content-type'] ?? '',
+              finalUrl: targetUrl,
+              statusCode,
+            });
+          });
+
+          socket.write(rawRequest);
         })
         .catch(reject);
     } else {
@@ -199,7 +257,7 @@ function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Rec
 // HTML → plain text + link extraction
 // ---------------------------------------------------------------------------
 
-function htmlToText(
+export function htmlToText(
   html: string,
   baseUrl: string
 ): { text: string; links: Array<{ text: string; url: string }> } {
@@ -518,8 +576,11 @@ export async function testBraveSearchApi(query = 'BurstCode'): Promise<SearchRes
       'X-Subscription-Token': braveKey,
     });
   } catch (err) {
-    const msg = String((err as Error).message ?? err).trim();
-    throw new Error(`network/proxy request failed${msg ? `: ${msg}` : ''}`);
+    console.error('[BurstCode Brave] fetchUrl error:', err);
+    const msg = err instanceof Error
+      ? `${err.message}${err.cause ? ` (cause: ${String(err.cause)})` : ''}`
+      : String(err);
+    throw new Error(`transport/proxy request failed: ${msg}`);
   }
 
   const body = response.body.toString('utf-8');

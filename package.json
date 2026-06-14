@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.103",
+  "version": "0.1.105",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -550,7 +550,7 @@
     "pack": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/pack.ps1",
     "compile-tests": "tsc -p ./",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js"
+    "test": "npm run compile-tests && node --test out/test/runTest.js"
   },
   "dependencies": {
     "diff": "^5.2.0",
