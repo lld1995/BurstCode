@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.105",
+  "version": "0.1.106",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -322,6 +322,32 @@
           ],
           "default": "zh",
           "description": "Language for the BurstCode side panel (Models / Permissions / Background Explorer / Actions). The chat window stays English. 侧边面板的显示语言；聊天窗口始终为英文。"
+        },
+        "burstcode.ui.taskDoneSound": {
+          "type": "boolean",
+          "default": true,
+          "order": 50,
+          "description": "Play a repeating notification sound when an agent task completes. The sound stops on the first detected user activity, such as clicking, typing, focusing the window, or interacting with the BurstCode view."
+        },
+        "burstcode.ui.taskDoneSoundIntervalMs": {
+          "type": "number",
+          "default": 800,
+          "minimum": 250,
+          "order": 51,
+          "description": "Interval in milliseconds between repeated task-completion notification sounds. The completion sound is a bright ascending chime, distinct from the ask-user prompt sound."
+        },
+        "burstcode.ui.askUserSound": {
+          "type": "boolean",
+          "default": true,
+          "order": 52,
+          "description": "Play a repeating prompt sound while BurstCode is waiting for your answer to an ask_user prompt. This uses a softer attention tone that is distinct from the task-completion sound."
+        },
+        "burstcode.ui.askUserSoundIntervalMs": {
+          "type": "number",
+          "default": 1200,
+          "minimum": 250,
+          "order": 53,
+          "description": "Interval in milliseconds between repeated ask-user prompt notification sounds."
         },
         "burstcode.git.autoCheckpoint": {
           "type": "boolean",

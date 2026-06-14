@@ -102,6 +102,7 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     const bg = vscode.workspace.getConfiguration('burstcode.background');
     const shell = vscode.workspace.getConfiguration('burstcode.shell');
     const web = vscode.workspace.getConfiguration('burstcode.web');
+    const ui = vscode.workspace.getConfiguration('burstcode.ui');
 
     const bgEnabled = bg.get<boolean>('enabled') ?? false;
     const bgRunTests = bg.get<boolean>('runGeneratedTests') ?? false;
@@ -109,6 +110,8 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
 
     const shellEnabled = shell.get<boolean>('enabled') ?? true;
     const shellAuto = shell.get<boolean>('autoApprove') ?? false;
+    const taskDoneSound = ui.get<boolean>('taskDoneSound') ?? true;
+    const askUserSound = ui.get<boolean>('askUserSound') ?? true;
     const proxyUrl = (web.get<string>('proxyUrl') ?? '').trim();
     const braveKey = (web.get<string>('braveApiKey') ?? '').trim();
     const proxyDesc = proxyUrl ? t('web.proxy.configured') : t('web.proxy.fallback');
@@ -328,28 +331,50 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
       }
     });
 
-    // ---------- Language quick switch ----------
-    const uiLangSetting = vscode.workspace
-      .getConfiguration('burstcode.ui')
-      .get<string>('language', 'zh');
+    // ---------- Interface ----------
+    const uiLangSetting = ui.get<string>('language', 'zh');
     const langValueLabel =
       uiLangSetting === 'en'
         ? t('lang.en')
         : uiLangSetting === 'auto'
           ? t('lang.auto')
           : t('lang.zh');
-    const language = new BasicNode('leaf', t('lang.label'), {
-      description: langValueLabel,
-      icon: 'globe',
-      tooltip: t('lang.tip', langValueLabel),
-      command: { command: 'burstcode.selectLanguage', title: 'Select Language' }
+    const uiGroup = new BasicNode('group', t('ui.group'), {
+      description: [
+        taskDoneSound ? t('ui.taskDoneSound.on') : t('ui.taskDoneSound.off'),
+        askUserSound ? t('ui.askUserSound.on') : t('ui.askUserSound.off')
+      ].join(' · '),
+      icon: 'bell',
+      expanded: true
     });
+    uiGroup.children = [
+      this.toggleNode(
+        t('ui.taskDoneSound'),
+        taskDoneSound,
+        'burstcode.ui.taskDoneSound',
+        t('ui.taskDoneSound.tip'),
+        taskDoneSound ? 'bell' : 'bell-slash'
+      ),
+      this.toggleNode(
+        t('ui.askUserSound'),
+        askUserSound,
+        'burstcode.ui.askUserSound',
+        t('ui.askUserSound.tip'),
+        askUserSound ? 'question' : 'bell-slash'
+      ),
+      new BasicNode('leaf', t('lang.label'), {
+        description: langValueLabel,
+        icon: 'globe',
+        tooltip: t('lang.tip', langValueLabel),
+        command: { command: 'burstcode.selectLanguage', title: 'Select Language' }
+      })
+    ];
     const about = new BasicNode('leaf', `BurstCode v${version}`, {
       description: t('footer.about'),
       icon: 'info'
     });
 
-    return [modelsGroup, permissions, webGroup, bgGroup, actions, language, advanced, about];
+    return [modelsGroup, permissions, webGroup, bgGroup, actions, uiGroup, advanced, about];
   }
 
   private toggleNode(

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as cp from 'child_process';
 import { Logger } from '../util/Logger';
 import { DependencyGuard } from '../deps/DependencyGuard';
 import { HunkApplier, PendingState } from '../edits/HunkApplier';
@@ -143,6 +144,63 @@ const KEY_OPEN_TABS = 'burstcode.chat.openTabs';
 /** Virtual scheme backing the LEFT side of a rollback-preview diff (pre-prompt snapshot). */
 const ROLLBACK_SNAPSHOT_SCHEME = 'burstcode-rollback';
 
+
+interface SoundAlertHandle {
+  stop(): void;
+}
+
+type AlertSoundKind = 'taskDone' | 'askUser';
+
+function playAlertSoundOnce(kind: AlertSoundKind): void {
+  const platform = process.platform;
+  try {
+    if (platform === 'win32') {
+      const command =
+        kind === 'taskDone'
+          // Bright ascending chime: "finished successfully".
+          ? '[console]::beep(880,160); Start-Sleep -Milliseconds 70; [console]::beep(1175,220)'
+          // Softer attention prompt: "input needed" without sounding like completion.
+          : '[console]::beep(659,140); Start-Sleep -Milliseconds 90; [console]::beep(659,140)';
+      cp.execFile('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        command
+      ], { windowsHide: true }, () => undefined);
+      return;
+    }
+    if (platform === 'darwin') {
+      const sound = kind === 'taskDone' ? '/System/Library/Sounds/Glass.aiff' : '/System/Library/Sounds/Ping.aiff';
+      cp.execFile('afplay', [sound], () => undefined);
+      return;
+    }
+    const bellCount = kind === 'taskDone' ? 2 : 1;
+    cp.execFile('sh', ['-c', `for i in $(seq 1 ${bellCount}); do printf "\\a"; sleep 0.12; done`], () => undefined);
+  } catch {
+    // Best effort only: completing or pausing a task should never fail because audio is unavailable.
+  }
+}
+
+function startRepeatingAlertSound(kind: AlertSoundKind, enabledKey: string, intervalKey: string, fallbackIntervalMs: number): SoundAlertHandle | undefined {
+  const cfg = vscode.workspace.getConfiguration('burstcode.ui');
+  if (!(cfg.get<boolean>(enabledKey) ?? true)) return undefined;
+
+  const intervalMs = Math.max(250, cfg.get<number>(intervalKey) ?? fallbackIntervalMs);
+  playAlertSoundOnce(kind);
+  const timer = setInterval(() => playAlertSoundOnce(kind), intervalMs);
+  return {
+    stop: () => clearInterval(timer)
+  };
+}
+
+function startTaskDoneAlert(): SoundAlertHandle | undefined {
+  return startRepeatingAlertSound('taskDone', 'taskDoneSound', 'taskDoneSoundIntervalMs', 800);
+}
+
+function startAskUserAlert(): SoundAlertHandle | undefined {
+  return startRepeatingAlertSound('askUser', 'askUserSound', 'askUserSoundIntervalMs', 1200);
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'burstcode.chatView';
 
@@ -184,6 +242,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly lessons: LessonStore;
   private readonly foregroundActivityEmitter = new vscode.EventEmitter<string>();
   readonly onDidForegroundActivity: vscode.Event<string> = this.foregroundActivityEmitter.event;
+  private taskDoneAlert?: SoundAlertHandle;
+  private askUserAlert?: SoundAlertHandle;
+  private readonly taskDoneAlertActivitySubs: vscode.Disposable[] = [];
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -206,6 +267,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (e.affectsConfiguration('burstcode.llm')) {
         this.broadcastModels();
         this.broadcastContextUsage();
+      }
+      if (e.affectsConfiguration('burstcode.ui.taskDoneSound')) {
+        const enabled = vscode.workspace.getConfiguration('burstcode.ui').get<boolean>('taskDoneSound') ?? true;
+        if (!enabled) this.stopTaskDoneAlert();
+      }
+      if (e.affectsConfiguration('burstcode.ui.askUserSound')) {
+        const enabled = vscode.workspace.getConfiguration('burstcode.ui').get<boolean>('askUserSound') ?? true;
+        if (!enabled) this.stopAskUserAlert();
       }
     });
     this.pendingEditsSub = this.applier.onPendingStateChange((state) => {
@@ -231,6 +300,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     this.context.subscriptions.push({
       dispose: () => {
+        this.stopTaskDoneAlert();
+        this.stopAskUserAlert();
         this.configSub?.dispose();
         this.pendingEditsSub?.dispose();
         this.foregroundActivityEmitter.dispose();
@@ -720,6 +791,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           target.pendingAsk.resolve(answer);
           target.pendingAsk = undefined;
           target.live.pendingAsk = undefined;
+          this.stopAskUserAlert();
         }
         break;
       }
@@ -747,6 +819,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           // last-resort fallback: open the raw settings page
           await vscode.commands.executeCommand('workbench.action.openSettings', 'burstcode');
         }
+        break;
+      case 'user-activity':
+        this.stopTaskDoneAlert();
         break;
       case 'select-model': {
         const p = (msg.payload ?? {}) as { model?: string };
@@ -922,6 +997,44 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private post(msg: OutboundMessage): void {
     this.view?.webview.postMessage(msg);
+  }
+
+  private startTaskDoneAlertUntilActivity(message: string): void {
+    this.stopTaskDoneAlert();
+    const alert = startTaskDoneAlert();
+    if (!alert) return;
+
+    this.taskDoneAlert = alert;
+    this.taskDoneAlertActivitySubs.push(
+      vscode.window.onDidChangeWindowState((state) => {
+        if (state.focused) this.stopTaskDoneAlert();
+      }),
+      vscode.window.onDidChangeActiveTextEditor(() => this.stopTaskDoneAlert()),
+      vscode.workspace.onDidChangeTextDocument(() => this.stopTaskDoneAlert())
+    );
+    void vscode.window.showInformationMessage(message);
+  }
+
+  private stopTaskDoneAlert(): void {
+    if (!this.taskDoneAlert) return;
+    this.taskDoneAlert.stop();
+    this.taskDoneAlert = undefined;
+    for (const sub of this.taskDoneAlertActivitySubs.splice(0)) {
+      sub.dispose();
+    }
+  }
+
+  private startAskUserAlertUntilAnswered(): void {
+    this.stopAskUserAlert();
+    const alert = startAskUserAlert();
+    if (!alert) return;
+    this.askUserAlert = alert;
+  }
+
+  private stopAskUserAlert(): void {
+    if (!this.askUserAlert) return;
+    this.askUserAlert.stop();
+    this.askUserAlert = undefined;
   }
 
   /**
@@ -1380,6 +1493,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           type: 'ask-user',
           payload: { sessionId: session.id, ...askSpec }
         });
+        this.startAskUserAlertUntilAnswered();
         // If the run is cancelled before the user answers, unblock the agent
         // loop so it can wind down cleanly instead of hanging on this promise.
         const cancelSub = cts.token.onCancellationRequested(() => {
@@ -1387,6 +1501,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             ctx.pendingAsk = undefined;
             ctx.live.pendingAsk = undefined;
             postLive({ type: 'ask-user-cancel', payload: { id } });
+            this.stopAskUserAlert();
             resolve('(cancelled by user)');
           }
           cancelSub.dispose();
@@ -1555,6 +1670,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             ? 'stopped'
             : 'completed';
       this.foregroundActivityEmitter.fire('chat-end');
+      if (session.status === 'completed') {
+        this.startTaskDoneAlertUntilActivity('BurstCode: task completed.');
+      }
       if (isActive()) this.broadcastContextUsage();
       // Persist the set of files THIS run wrote onto its checkpoint so a later
       // rollback stays session-scoped even after an extension reload (the
@@ -2443,6 +2561,7 @@ let lessonsAdding = false;
 let runStartedAt = 0;
 let elapsedTimer = null;
 let currentIter = 0;
+let lastUserActivityPostAt = 0;
 
 // Auto-follow scrolling. We only push the log to the bottom when the user
 // is already (close to) at the bottom. As soon as the user scrolls up, we
@@ -2459,6 +2578,15 @@ function isLogAtBottom() {
 function markManualScrollIntent() {
   lastManualScrollAt = Date.now();
 }
+function reportUserActivity() {
+  const now = Date.now();
+  if (now - lastUserActivityPostAt < 500) return;
+  lastUserActivityPostAt = now;
+  vscode.postMessage({ type: 'user-activity' });
+}
+['pointerdown', 'keydown', 'input', 'focus'].forEach((eventName) => {
+  document.addEventListener(eventName, reportUserActivity, true);
+});
 // File-path and symbol link click delegation
 document.addEventListener('click', (ev) => {
   const a = ev.target.closest && ev.target.closest('a[data-file-path], a[data-symbol-name]');

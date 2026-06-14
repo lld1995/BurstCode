@@ -104,6 +104,17 @@ const EN: Dict = {
   'footer.allSettings.desc': 'Full BurstCode configuration',
   'footer.about': 'About',
 
+  // Interface
+  'ui.group': 'Interface',
+  'ui.taskDoneSound': 'Task completion sound',
+  'ui.taskDoneSound.on': 'completion sound on',
+  'ui.taskDoneSound.off': 'completion sound off',
+  'ui.taskDoneSound.tip': 'Play a bright ascending chime when an agent task completes. It repeats until you click, type, focus the window, or otherwise interact with BurstCode/VS Code.',
+  'ui.askUserSound': 'Ask-user prompt sound',
+  'ui.askUserSound.on': 'ask prompt sound on',
+  'ui.askUserSound.off': 'ask prompt sound off',
+  'ui.askUserSound.tip': 'Play a softer repeated attention tone while BurstCode is waiting for your answer to an ask_user prompt.',
+
   // Language
   'lang.label': 'Language',
   'lang.desc': 'Side panel language',
@@ -204,6 +215,17 @@ const ZH: Dict = {
   'footer.allSettings': '全部设置…',
   'footer.allSettings.desc': '完整的 BurstCode 配置',
   'footer.about': '关于',
+
+  // Interface
+  'ui.group': '界面',
+  'ui.taskDoneSound': '任务完成声音提醒',
+  'ui.taskDoneSound.on': '完成声音已开启',
+  'ui.taskDoneSound.off': '完成声音已关闭',
+  'ui.taskDoneSound.tip': 'Agent 任务完成后播放明亮的上行提示音。只要你点击、输入、聚焦窗口，或在 BurstCode/VS Code 中有交互，就会停止提醒。',
+  'ui.askUserSound': '询问用户声音提醒',
+  'ui.askUserSound.on': '询问提示音已开启',
+  'ui.askUserSound.off': '询问提示音已关闭',
+  'ui.askUserSound.tip': 'BurstCode 等待你回答 ask_user 提问时，播放较柔和的重复注意提示音。',
 
   // Language
   'lang.label': '语言',
