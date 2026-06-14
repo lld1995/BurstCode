@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.101",
+  "version": "0.1.102",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -291,6 +291,18 @@
           "default": false,
           "order": 34,
           "description": "Image profile · skip TLS certificate verification for the image baseURL."
+        },
+        "burstcode.web.proxyUrl": {
+          "type": "string",
+          "default": "",
+          "order": 40,
+          "description": "Web tools · HTTP/HTTPS proxy URL used by web_search and read_webpage. Leave empty to fall back to VS Code http.proxy, then HTTPS_PROXY/HTTP_PROXY."
+        },
+        "burstcode.web.braveApiKey": {
+          "type": "string",
+          "default": "",
+          "order": 41,
+          "markdownDescription": "**Web tools** · Brave Search API key. When configured, `web_search` tries Brave before DuckDuckGo/Bing."
         },
         "burstcode.ui.language": {
           "type": "string",
