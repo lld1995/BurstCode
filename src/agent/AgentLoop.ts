@@ -387,14 +387,12 @@ function buildInterruptedProgressNote(
     parts.push(
       `${salvage.fragmentCount} complete propose_edit fragment(s) were recovered and applied to disk / pending-edits before resuming. Treat them as committed base work, not draft text.\n` +
       `These landed edits are already part of the live workspace; DO NOT rewrite, re-emit, or replace the same broad ranges again. Continue only the unfinished remainder.\n` +
-      `For large changes, resume incrementally: first identify which files/ranges are already landed, then patch only the next missing/incorrect range. If later work depends on landed code, edit around it or make small follow-up corrections instead of regenerating the earlier solution. If you believe a broad rewrite is necessary, STOP and instead read the exact current range plus a small margin, then use oldText or delete_lines to replace/delete only the concrete duplicate/incorrect block.
-` +
-      `Before any next edit, inspect/read the current live file contents around the remaining target lines and base the change on what is already on disk. Tool reads may be line-windowed/truncated unless they explicitly cover the needed range, so do NOT infer that missing lines from a read result were deleted from the file.
-` +
-      `Prefer minimal surgical follow-up edits: add missing tail content, modify a small existing block, or delete only duplicated/trailing content. Avoid whole-file or large-range rewrites that overlap the landed fragments; NEVER append a regenerated replacement after already-landed code. If overlap produced duplicates, use delete_lines for the duplicate block or oldText for the exact bad block.
-` +
-      `If a landed fragment needs adjustment, edit only the smallest affected lines in the current file state; do not regenerate the entire earlier fragment. Large pasted replacement blocks are likely to create duplicate code and file bloat.
-` +
+      `If a prior propose_edit failed or appears to have corrupted/garbled a file, switch to recovery mode before making more edits: inspect the whole affected file with read_file when it is reasonably sized; if the file is too large or clearly broken, restore it from git/checkpoint first, then write a new short plan. Do not loop on the same failing edit shape.\n` +
+      `If the suspected corruption is a syntax-structure problem such as missing/wrong braces, brackets, parentheses, tags, or quotes, do NOT rewrite the surrounding implementation. First read a bounded range that includes the broken block plus neighboring function/class boundaries, identify the smallest unmatched/extra delimiter, and patch only that delimiter or tiny enclosing block; run the relevant compiler/parser check before any broader edit.\n` +
+      `For large changes, resume incrementally: first identify which files/ranges are already landed, then patch only the next missing/incorrect range. If later work depends on landed code, edit around it or make small follow-up corrections instead of regenerating the earlier solution. If you believe a broad rewrite is necessary, STOP and instead read the exact current range plus a small margin, then use oldText or delete_lines to replace/delete only the concrete duplicate/incorrect block.\n` +
+      `Before any next edit, inspect/read the current live file contents around the remaining target lines and base the change on what is already on disk. Tool reads may be line-windowed/truncated unless they explicitly cover the needed range, so do NOT infer that missing lines from a read result were deleted from the file.\n` +
+      `Prefer minimal surgical follow-up edits: add missing tail content, modify a small existing block, or delete only duplicated/trailing content. Avoid whole-file or large-range rewrites that overlap the landed fragments; NEVER append a regenerated replacement after already-landed code. If overlap produced duplicates, use delete_lines for the duplicate block or oldText for the exact bad block.\n` +
+      `If a landed fragment needs adjustment, edit only the smallest affected lines in the current file state; do not regenerate the entire earlier fragment. Large pasted replacement blocks are likely to create duplicate code and file bloat.\n` +
       `Landed fragments:\n${landed}`
     );
   }
@@ -429,6 +427,8 @@ function buildInterruptedProgressNote(
     ? `Use the captured progress below to continue from the last coherent point instead of starting over. ` +
       `The listed propose_edit fragments are already on disk/pending review; treat them as the baseline and do not re-emit them or replace the same broad ranges. ` +
       `For large tasks, do not restart the implementation plan from scratch: inspect the current live file contents, decide the smallest next missing/incorrect range, then issue a narrow follow-up edit. ` +
+      `If propose_edit failed or may have garbled a file, enter recovery mode first: read the whole file when feasible, or restore from git/checkpoint if it is too large or clearly corrupted; then make a short revised plan and use a safer edit strategy such as smaller hunks, precise oldText, delete_lines, or a temporary scripted replacement. ` +
+      `For missing/wrong braces, brackets, parentheses, tags, or quotes, handle it as a syntax-structure repair: read the broken block with neighboring boundaries, patch only the unmatched/extra delimiter or tiny enclosing block, then run the relevant compiler/parser check before broadening scope. ` +
       `If you are tempted to rewrite a large region, do not append/regenerate it; use oldText to replace the exact existing bad block or delete_lines to remove the exact duplicate block. ` +
       `If the landed work made later intended text obsolete or duplicated, delete/adjust only that duplicate tail rather than rewriting the landed block. ` +
       `Remember read results may be partial windows rather than whole files. `

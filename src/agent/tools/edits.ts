@@ -363,6 +363,50 @@ async function buildDeletionPreviewEdits(files: ProposedEditFile[]): Promise<Arr
   return preview;
 }
 
+function diagnosticSeverityName(severity: vscode.DiagnosticSeverity): string {
+  switch (severity) {
+    case vscode.DiagnosticSeverity.Error: return 'error';
+    case vscode.DiagnosticSeverity.Warning: return 'warning';
+    case vscode.DiagnosticSeverity.Information: return 'info';
+    case vscode.DiagnosticSeverity.Hint: return 'hint';
+    default: return 'diagnostic';
+  }
+}
+
+async function buildPostEditDiagnosticsNote(files: ProposedEditFile[]): Promise<string> {
+  // Diagnostics are refreshed asynchronously by language extensions after the
+  // eager disk write. A short yield catches most syntax/parser updates without
+  // turning propose_edit into a build/test runner.
+  await new Promise((resolve) => setTimeout(resolve, 250));
+
+  const rows: string[] = [];
+  let totalErrors = 0;
+  let totalWarnings = 0;
+  for (const f of files) {
+    const uri = resolveToolPath(f.path);
+    const diagnostics = vscode.languages.getDiagnostics(uri)
+      .filter((d) => d.severity === vscode.DiagnosticSeverity.Error || d.severity === vscode.DiagnosticSeverity.Warning)
+      .sort((a, b) => a.severity - b.severity || a.range.start.line - b.range.start.line || a.range.start.character - b.range.start.character);
+    for (const d of diagnostics) {
+      if (d.severity === vscode.DiagnosticSeverity.Error) totalErrors++;
+      if (d.severity === vscode.DiagnosticSeverity.Warning) totalWarnings++;
+      if (rows.length >= 12) continue;
+      const line = d.range.start.line + 1;
+      const col = d.range.start.character + 1;
+      const source = d.source ? ` [${d.source}]` : '';
+      rows.push(`- ${f.path}:${line}:${col} ${diagnosticSeverityName(d.severity)}${source}: ${String(d.message).replace(/\s+/g, ' ')}`);
+    }
+  }
+
+  if (totalErrors === 0 && totalWarnings === 0) return '';
+  const omitted = totalErrors + totalWarnings - rows.length;
+  const omittedNote = omitted > 0 ? `\n- ... ${omitted} more diagnostic(s) omitted` : '';
+  const repairMode = totalErrors > 0
+    ? `\nACTION REQUIRED — VS Code now reports error diagnostics in the file(s) you just edited. Treat this as evidence the edit may have broken syntax/types or garbled the file. Before continuing feature work, read the reported line(s) with a small surrounding range and repair the smallest concrete issue. For missing/wrong braces, brackets, parentheses, tags, or quotes, patch only the unmatched/extra delimiter or tiny enclosing block, then run the relevant compiler/parser check. If diagnostics are widespread/cascading or the file looks corrupted, switch to recovery mode: inspect the whole file when feasible, otherwise restore from git/checkpoint and reapply smaller hunks.`
+    : `\nNOTE — VS Code reports warning diagnostics in the file(s) you just edited. Consider checking the reported ranges before moving on.`;
+  return `\nPOST-EDIT DIAGNOSTICS (${totalErrors} error(s), ${totalWarnings} warning(s)):\n${rows.join('\n')}${omittedNote}${repairMode}`;
+}
+
 export function buildEditTools(
   applier: HunkApplier,
   askUser: AskUserFn,
@@ -687,21 +731,23 @@ export function buildEditTools(
         // already queued and visible in the chat banner — only the named
         // files need re-targeting.
         const message = err instanceof Error ? err.message : String(err);
+        const diagnosticsNote = await buildPostEditDiagnosticsNote(files);
         return {
           content:
             `propose_edit applied every VALID fragment and staged it on disk; only the ` +
             `fragment(s) below failed and were skipped (the rest of the same call still landed):\n${message}\n` +
-            `ACTION REQUIRED — re-issue ONLY the failed fragment(s) above: re-read the file with read_file ` +
-            `(the fragments that DID land may have shifted the line numbers) and re-submit them with ` +
-            `corrected oldText / non-overlapping ranges, or use delete_lines for exact duplicate blocks. ` +
+            `RECOVERY REQUIRED — before making another edit, inspect the current file state: read the whole affected file with read_file when it is reasonably sized; if it is too large or appears corrupted/garbled, restore it from git/checkpoint first. Then write a short revised plan and switch strategy instead of repeating the same failing edit shape. ` +
+            `If the failure looks like missing/wrong braces, brackets, parentheses, tags, or quotes, treat it as a syntax-structure repair: read the smallest block that includes the broken delimiter plus neighboring function/class boundaries, patch only the unmatched/extra delimiter or tiny enclosing block, and run the relevant compiler/parser check before any broader rewrite. ` +
+            `Re-issue ONLY the failed fragment(s) above: re-read the relevant current range because landed fragments may have shifted line numbers, then submit smaller hunks with precise oldText / non-overlapping ranges, use delete_lines for exact duplicate blocks, or use a temporary scripted replacement for controlled broad changes. ` +
             `Do NOT regenerate or append a broad replacement for code that already landed; that creates duplicate code and file bloat. ` +
-            `Prefer the oldText form so line drift no longer matters.
-` +
-            `Do NOT re-submit any fragment or file that was not named above — those are already staged and need no further action from you.`,
+            `Prefer the oldText form so line drift no longer matters.\n` +
+            `Do NOT re-submit any fragment or file that was not named above — those are already staged and need no further action from you.` +
+            diagnosticsNote,
           isError: true,
           meta: deletionPreviewEdits.length ? { previewEdits: deletionPreviewEdits } : undefined
         };
       }
+      const diagnosticsNote = await buildPostEditDiagnosticsNote(files);
       const aliasNotes: string[] = [];
       if (synthesizedFromTopLevel) {
         aliasNotes.push(
@@ -727,7 +773,7 @@ export function buildEditTools(
         ? `\nIMPORTANT: your propose_edit call was TRUNCATED mid-stream (output token budget). Only the ${rawEdits.length} fully-received fragment(s) above were recovered and applied; any edits after the cut-off point were lost. Re-issue the REMAINING edits in a new, smaller propose_edit call.`
         : '';
       return {
-        content: `Queued edits for ${files.length} file(s): ${filePaths} — pending user review (non-blocking). You may call propose_edit again to add or replace hunks, or move on to the next step.${aliasNote}${truncationNote}`,
+        content: `Queued edits for ${files.length} file(s): ${filePaths} — pending user review (non-blocking). You may call propose_edit again to add or replace hunks, or move on to the next step.${aliasNote}${truncationNote}${diagnosticsNote}`,
         meta: {
           files: files.map((f) => f.path),
           summary,
