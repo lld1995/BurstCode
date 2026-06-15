@@ -298,6 +298,30 @@ function notifyIfWindowInactive(message: string): void {
   void vscode.window.showInformationMessage(message);
 }
 
+function shouldUseRemoteAlertCompanion(): boolean {
+  // In Remote SSH/WSL/containers the main BurstCode extension host runs on the
+  // remote machine, so child_process-based beeps and Win32 taskbar flashing happen
+  // remotely (or not at all). A separate UI extension can run in the local VS Code
+  // extension host and perform the local attention work reliably.
+  return !!vscode.env.remoteName;
+}
+
+async function invokeRemoteAlertCompanion(command: string, payload?: unknown): Promise<boolean> {
+  if (!shouldUseRemoteAlertCompanion()) return false;
+  try {
+    await vscode.commands.executeCommand(command, payload);
+    return true;
+  } catch {
+    // The companion extension is optional. If it is not installed locally, callers
+    // fall back to the webview-based best-effort path below.
+    return false;
+  }
+}
+
+function shouldUseClientSideAlerts(): boolean {
+  return !!vscode.env.remoteName;
+}
+
 function makeDisposable(dispose: () => void): vscode.Disposable {
   return { dispose };
 }
@@ -1103,13 +1127,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.view?.webview.postMessage(msg);
   }
 
+  private startClientAlertSound(kind: AlertSoundKind, intervalMs: number): void {
+    void invokeRemoteAlertCompanion('burstcode.alert.start', {
+      kind,
+      intervalMs,
+      message: 'BurstCode needs your attention.'
+    }).then((handled) => {
+      if (!handled) this.post({ type: 'start-client-alert-sound', payload: { kind, intervalMs } });
+    });
+  }
+
+  private stopClientAlertSound(kind: AlertSoundKind): void {
+    void invokeRemoteAlertCompanion('burstcode.alert.stop', { kind }).then((handled) => {
+      if (!handled) this.post({ type: 'stop-client-alert-sound', payload: { kind } });
+    });
+  }
+
+  private showClientAttentionNotification(message: string): void {
+    if (!shouldUseClientSideAlerts()) return;
+    void invokeRemoteAlertCompanion('burstcode.alert.notify', { message }).then((handled) => {
+      if (!handled) this.post({ type: 'show-client-attention-notification', payload: { message } });
+    });
+  }
+
   private startTaskDoneAlertUntilActivity(): void {
     this.stopTaskDoneAlert();
-    const alert = startTaskDoneAlert();
-    if (!alert) return;
+    const cfg = vscode.workspace.getConfiguration('burstcode.ui');
+    const enabled = cfg.get<boolean>('taskDoneSound') ?? true;
+    if (!enabled) return;
+
+    const intervalMs = Math.max(250, cfg.get<number>('taskDoneSoundIntervalMs') ?? 800);
+    const alert = shouldUseClientSideAlerts() ? undefined : startTaskDoneAlert();
 
     notifyIfWindowInactive('BurstCode needs your attention.');
-    this.taskDoneAlert = alert;
+    if (shouldUseClientSideAlerts()) this.startClientAlertSound('taskDone', intervalMs);
+    if (alert) this.taskDoneAlert = alert;
 
     const activityEvents = ['pointermove', 'pointerdown', 'mousedown', 'click', 'keydown', 'input', 'focus', 'wheel', 'touchstart'];
     const activitySub = makeDisposable(() => {
@@ -1135,9 +1187,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private stopTaskDoneAlert(): void {
-    if (!this.taskDoneAlert) return;
-    this.taskDoneAlert.stop();
-    this.taskDoneAlert = undefined;
+    if (this.taskDoneAlert) {
+      this.taskDoneAlert.stop();
+      this.taskDoneAlert = undefined;
+    }
+    this.stopClientAlertSound('taskDone');
     for (const sub of this.taskDoneAlertActivitySubs.splice(0)) {
       sub.dispose();
     }
@@ -1145,16 +1199,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private startAskUserAlertUntilAnswered(message: string): void {
     this.stopAskUserAlert();
-    const alert = startAskUserAlert();
+    const cfg = vscode.workspace.getConfiguration('burstcode.ui');
+    const enabled = cfg.get<boolean>('askUserSound') ?? true;
+    const intervalMs = Math.max(250, cfg.get<number>('askUserSoundIntervalMs') ?? 1200);
+    const alert = enabled && !shouldUseClientSideAlerts() ? startAskUserAlert() : undefined;
     notifyIfWindowInactive(message);
+    this.showClientAttentionNotification(message);
+    if (enabled && shouldUseClientSideAlerts()) this.startClientAlertSound('askUser', intervalMs);
     if (!alert) return;
     this.askUserAlert = alert;
   }
 
   private stopAskUserAlert(): void {
-    if (!this.askUserAlert) return;
-    this.askUserAlert.stop();
-    this.askUserAlert = undefined;
+    if (this.askUserAlert) {
+      this.askUserAlert.stop();
+      this.askUserAlert = undefined;
+    }
+    this.stopClientAlertSound('askUser');
   }
 
   /**
@@ -2721,19 +2782,107 @@ function stopTaskDoneUserActivityListener() {
   taskDoneUserActivityEvents.clear();
   taskDoneUserActivityListening = false;
 }
-function startTaskDoneUserActivityListener(events, focused) {
-  stopTaskDoneUserActivityListener();
-  const names = Array.isArray(events) && events.length
-    ? events.map(String)
-    : ['pointermove', 'pointerdown', 'mousedown', 'click', 'keydown', 'input', 'focus', 'wheel', 'touchstart'];
-  taskDoneUserActivityWindowFocused = focused !== false;
-  taskDoneUserActivityListening = true;
-  for (const eventName of names) {
-    taskDoneUserActivityEvents.add(eventName);
-    window.addEventListener(eventName, reportTaskDoneUserActivity, true);
-    document.addEventListener(eventName, reportTaskDoneUserActivity, true);
-  }
-}
+	function startTaskDoneUserActivityListener(events, focused) {
+	  stopTaskDoneUserActivityListener();
+	  const names = Array.isArray(events) && events.length
+	    ? events.map(String)
+	    : ['pointermove', 'pointerdown', 'mousedown', 'click', 'keydown', 'input', 'focus', 'wheel', 'touchstart'];
+	  taskDoneUserActivityWindowFocused = focused !== false;
+	  taskDoneUserActivityListening = true;
+	  for (const eventName of names) {
+	    taskDoneUserActivityEvents.add(eventName);
+	    window.addEventListener(eventName, reportTaskDoneUserActivity, true);
+	    document.addEventListener(eventName, reportTaskDoneUserActivity, true);
+	  }
+	}
+		const clientAlertTimers = new Map();
+		let clientAlertAudioContext = null;
+		let clientAlertUnlocked = false;
+		function getClientAlertAudioContext() {
+		  try {
+		    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+		    if (!AudioContextCtor) return null;
+		    if (!clientAlertAudioContext || clientAlertAudioContext.state === 'closed') {
+		      clientAlertAudioContext = new AudioContextCtor();
+		    }
+		    return clientAlertAudioContext;
+		  } catch (_) {
+		    return null;
+		  }
+		}
+		function unlockClientAlertAudio() {
+		  const ctx = getClientAlertAudioContext();
+		  if (!ctx) return;
+		  try {
+		    const p = ctx.resume && ctx.resume();
+		    if (p && typeof p.then === 'function') {
+		      p.then(() => { clientAlertUnlocked = ctx.state === 'running'; }, () => undefined);
+		    } else {
+		      clientAlertUnlocked = ctx.state === 'running';
+		    }
+		  } catch (_) {}
+		}
+		function playClientAlertSoundOnce(kind) {
+		  try {
+		    const ctx = getClientAlertAudioContext();
+		    if (!ctx) return;
+		    if (ctx.state === 'suspended') {
+		      try { const p = ctx.resume && ctx.resume(); if (p && typeof p.catch === 'function') p.catch(() => undefined); } catch (_) {}
+		    }
+		    const now = ctx.currentTime + 0.03;
+		    const freqs = kind === 'taskDone' ? [880, 1175] : [659, 659];
+		    freqs.forEach((freq, idx) => {
+		      const start = now + idx * 0.22;
+		      const osc = ctx.createOscillator();
+		      const gain = ctx.createGain();
+		      osc.type = 'sine';
+		      osc.frequency.value = freq;
+		      gain.gain.setValueAtTime(0.0001, start);
+		      gain.gain.exponentialRampToValueAtTime(kind === 'taskDone' ? 0.12 : 0.08, start + 0.02);
+		      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.18);
+		      osc.connect(gain).connect(ctx.destination);
+		      osc.start(start);
+		      osc.stop(start + 0.2);
+		    });
+		  } catch (_) {
+		    // Best effort: webview audio may be blocked until the user has interacted.
+		  }
+		}
+		function startClientAlertSound(kind, intervalMs) {
+		  stopClientAlertSound(kind);
+		  unlockClientAlertAudio();
+		  playClientAlertSoundOnce(kind);
+		  const timer = setInterval(() => playClientAlertSoundOnce(kind), Math.max(250, Number(intervalMs) || 1000));
+		  clientAlertTimers.set(kind, timer);
+		}
+		function stopClientAlertSound(kind) {
+		  const timer = clientAlertTimers.get(kind);
+		  if (timer) clearInterval(timer);
+		  clientAlertTimers.delete(kind);
+		}
+		function showClientAttentionNotification(message) {
+		  try {
+		    if (!('Notification' in window)) return;
+		    const title = 'BurstCode';
+		    const body = String(message || 'BurstCode needs your attention.');
+		    if (Notification.permission === 'granted') {
+		      const n = new Notification(title, { body, silent: false });
+		      n.onclick = () => { try { window.focus(); } catch (_) {} };
+		    } else if (Notification.permission === 'default') {
+		      Notification.requestPermission().then((permission) => {
+		        if (permission !== 'granted') return;
+		        const n = new Notification(title, { body, silent: false });
+		        n.onclick = () => { try { window.focus(); } catch (_) {} };
+		      }, () => undefined);
+		    }
+		  } catch (_) {
+		    // Some VS Code webview hosts do not expose browser notifications.
+		  }
+		}
+		['pointerdown', 'keydown', 'input', 'focus', 'click'].forEach((eventName) => {
+		  window.addEventListener(eventName, unlockClientAlertAudio, true);
+		  document.addEventListener(eventName, unlockClientAlertAudio, true);
+		});
 	['pointerdown', 'keydown', 'input', 'focus'].forEach((eventName) => {
 	  document.addEventListener(eventName, () => reportUserActivity(false), true);
 	});
@@ -4548,18 +4697,30 @@ function setBusy(v) {
 window.addEventListener('message', (e) => {
   const msg = e.data;
   switch (msg.type) {
-    case 'start-user-activity-listener':
-      startTaskDoneUserActivityListener(
-        msg.payload && msg.payload.events,
-        !(msg.payload && msg.payload.focused === false)
-      );
-      break;
-    case 'stop-user-activity-listener':
-      stopTaskDoneUserActivityListener();
-      break;
-    case 'window-focus-state':
-      taskDoneUserActivityWindowFocused = !!(msg.payload && msg.payload.focused);
-      break;
+	    case 'start-user-activity-listener':
+	      startTaskDoneUserActivityListener(
+	        msg.payload && msg.payload.events,
+	        !(msg.payload && msg.payload.focused === false)
+	      );
+	      break;
+	    case 'stop-user-activity-listener':
+	      stopTaskDoneUserActivityListener();
+	      break;
+	    case 'window-focus-state':
+	      taskDoneUserActivityWindowFocused = !!(msg.payload && msg.payload.focused);
+	      break;
+	    case 'start-client-alert-sound':
+	      startClientAlertSound(
+	        msg.payload && msg.payload.kind,
+	        msg.payload && msg.payload.intervalMs
+	      );
+	      break;
+	    case 'stop-client-alert-sound':
+	      stopClientAlertSound(msg.payload && msg.payload.kind);
+	      break;
+	    case 'show-client-attention-notification':
+	      showClientAttentionNotification(msg.payload && msg.payload.message);
+	      break;
     case 'rollback-start':
       rollbackOverlay.classList.add('active');
       break;

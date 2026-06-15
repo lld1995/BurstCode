@@ -1,6 +1,7 @@
 .vscode/**
 .vscode-test/**
 src/**
+companion/**
 .gitignore
 .eslintrc*
 **/*.map
