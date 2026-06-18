@@ -4,6 +4,7 @@ import * as cp from 'child_process';
 import { Tool, ToolContext, ToolResult } from './types';
 import { HunkApplier } from '../../edits/HunkApplier';
 import { buildWorkspaceOutline } from '../../context/WorkspaceOutline';
+import { repairJsonControlChars, repairJsonUnescapedQuotes } from '../../util/jsonRepair';
 
 function workspaceRoot(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -344,6 +345,134 @@ export const grepSearchTool: Tool = {
   }
 };
 
+function findLooseJsonStringEnd(text: string, start: number): number {
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escape = true;
+      continue;
+    }
+    if (ch !== '"') continue;
+    let j = i + 1;
+    while (j < text.length && /\s/.test(text[j])) j++;
+    const next = j < text.length ? text[j] : '';
+    if (next === ',' || next === '}' || next === ']' || next === '') return i;
+  }
+  return -1;
+}
+
+function decodeLooseJsonString(raw: string): string {
+  return raw
+    .replace(/\\r/g, '\r')
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\');
+}
+
+function pickLooseStringField(
+  text: string,
+  keys: string[]
+): { value: string; key: string; end: number } | undefined {
+  for (const key of keys) {
+    const re = new RegExp(`"${key}"\\s*:\\s*"`, 'g');
+    const m = re.exec(text);
+    if (!m) continue;
+    const start = m.index + m[0].length;
+    const end = findLooseJsonStringEnd(text, start);
+    if (end < 0) return undefined;
+    return { key, value: decodeLooseJsonString(text.slice(start, end)), end };
+  }
+  return undefined;
+}
+
+function parsePartialJsonObject(raw: string): Record<string, unknown> | null {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  try {
+    const parsed = JSON.parse(s);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    /* repair below */
+  }
+  let inStr = false;
+  let esc = false;
+  const stack: string[] = [];
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    out += ch;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  if (inStr) {
+    if (esc) out += '\\';
+    out += '"';
+  }
+  out = out.replace(/,\s*$/, '');
+  if (stack[stack.length - 1] === '{') {
+    out = out.replace(/(\{)\s*$/, '$1');
+    out = out.replace(/,\s*"(?:[^"\\]|\\.)*"\s*$/, '');
+    out = out.replace(/(\{)\s*"(?:[^"\\]|\\.)*"\s*$/, '$1');
+    out = out.replace(/:\s*$/, ': null');
+    out = out.replace(/,\s*$/, '');
+  }
+  for (let i = stack.length - 1; i >= 0; i--) out += stack[i] === '{' ? '}' : ']';
+  try {
+    const controlRepaired = repairJsonControlChars(out) ?? out;
+    const quoteRepaired = repairJsonUnescapedQuotes(controlRepaired) ?? controlRepaired;
+    const parsed = JSON.parse(quoteRepaired);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Best-effort recovery of a TRUNCATED write_file tool call. Unlike normal
+ * JSON.parse, this intentionally accepts an unterminated trailing content string
+ * and returns the bytes that already streamed so they can be written to disk; the
+ * next model turn can read the partial file and append/repair only the missing tail.
+ */
+export function salvageWriteFileArgs(raw: string): Record<string, unknown> | null {
+  if (!raw) return null;
+  const partialParsed = parsePartialJsonObject(raw);
+  const pathValue = partialParsed && typeof partialParsed.path === 'string'
+    ? partialParsed.path
+    : pickLooseStringField(raw, ['path', 'file', 'filePath', 'filename', 'fileName', 'target', 'targetFile', 'uri'])?.value;
+  if (!pathValue || !String(pathValue).trim()) return null;
+  let contentValue: string | undefined;
+  if (partialParsed && typeof partialParsed.content === 'string') {
+    contentValue = partialParsed.content;
+  } else {
+    const contentStart = /"content"\s*:\s*"/g.exec(raw);
+    if (contentStart) {
+      const start = contentStart.index + contentStart[0].length;
+      const end = findLooseJsonStringEnd(raw, start);
+      const rawContent = end >= 0 ? raw.slice(start, end) : raw.slice(start);
+      contentValue = decodeLooseJsonString(rawContent);
+    }
+  }
+  if (contentValue === undefined) return null;
+  return { path: pathValue, content: contentValue, __bc_truncatedSalvage: true };
+}
+
 /**
  * Direct-write tool: writes content to disk immediately without queueing for
  * user review. Use for agent-generated scripts, temp files, and any file that
@@ -387,8 +516,11 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string): T
         // reverts/deletes files THIS session actually wrote.
         try { applier?.recordTouchedFile(uri, sessionId); } catch { /* non-fatal */ }
         const relPath = vscode.workspace.asRelativePath(uri);
+        const truncationNote = args.__bc_truncatedSalvage
+          ? ' IMPORTANT: this write_file call was TRUNCATED mid-stream; the partial content that arrived was written to disk. Read the file back and append/repair only the missing tail in a smaller follow-up call.'
+          : '';
         return {
-          content: `Written ${content.split(/\r?\n/).length} line(s) to ${relPath}`,
+          content: `Written ${content.split(/\r?\n/).length} line(s) to ${relPath}.${truncationNote}`,
           meta: { uri: uri.toString(), bytes: Buffer.byteLength(content, 'utf8'), created: !existed }
         };
       } catch (err) {

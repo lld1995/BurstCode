@@ -7,6 +7,7 @@ import { estimateMessagesTokens } from '../llm/tokenizer';
 import { Logger } from '../util/Logger';
 import { extractFirstJsonObject, repairJsonControlChars, repairJsonUnescapedQuotes } from '../util/jsonRepair';
 import { HunkApplier } from '../edits/HunkApplier';
+import { salvageWriteFileArgs } from './tools/core';
 import { AskUserFn, salvageProposeEditArgs } from './tools/edits';
 
 export interface AgentEvent {
@@ -365,11 +366,11 @@ function buildInterruptedProgressNote(
   assistantText: string,
   reasoningText: string,
   toolCalls: Array<{ index: number; name: string; arguments: string }>,
-  salvage: InterruptedProposeEditSalvage = { fragmentCount: 0, fragments: [] }
+  salvage: SalvageSummary = combineSalvage()
 ): string | null {
   const parts: string[] = [];
-  if (salvage.fragmentCount > 0) {
-    const landed = salvage.fragments
+  if (salvage.proposeEdit.fragmentCount > 0) {
+    const landed = salvage.proposeEdit.fragments
       .map((fragment, i) => {
         const summary = fragment.summary ? ` summary=${JSON.stringify(fragment.summary)}` : '';
         const edits = fragment.edits
@@ -385,7 +386,7 @@ function buildInterruptedProgressNote(
       })
       .join('\n');
     parts.push(
-      `${salvage.fragmentCount} complete propose_edit fragment(s) were recovered and applied to disk / pending-edits before resuming. Treat them as committed base work, not draft text.\n` +
+      `${salvage.proposeEdit.fragmentCount} complete propose_edit fragment(s) were recovered and applied to disk / pending-edits before resuming. Treat them as committed base work, not draft text.\n` +
       `These landed edits are already part of the live workspace; DO NOT rewrite, re-emit, or replace the same broad ranges again. Continue only the unfinished remainder.\n` +
       `If a prior propose_edit failed or appears to have corrupted/garbled a file, switch to recovery mode before making more edits: inspect the whole affected file with read_file when it is reasonably sized; if the file is too large or clearly broken, restore it from git/checkpoint first, then write a new short plan. Do not loop on the same failing edit shape.\n` +
       `If the suspected corruption is a syntax-structure problem such as missing/wrong braces, brackets, parentheses, tags, or quotes, do NOT rewrite the surrounding implementation. First read a bounded range that includes the broken block plus neighboring function/class boundaries, identify the smallest unmatched/extra delimiter, and patch only that delimiter or tiny enclosing block; run the relevant compiler/parser check before any broader edit.\n` +
@@ -394,6 +395,19 @@ function buildInterruptedProgressNote(
       `Prefer minimal surgical follow-up edits: add missing tail content, modify a small existing block, or delete only duplicated/trailing content. Avoid whole-file or large-range rewrites that overlap the landed fragments; NEVER append a regenerated replacement after already-landed code. If overlap produced duplicates, use delete_lines for the duplicate block or oldText for the exact bad block.\n` +
       `If a landed fragment needs adjustment, edit only the smallest affected lines in the current file state; do not regenerate the entire earlier fragment. Large pasted replacement blocks are likely to create duplicate code and file bloat.\n` +
       `Landed fragments:\n${landed}`
+    );
+  }
+  if (salvage.writeFile.fragmentCount > 0) {
+    const landed = salvage.writeFile.fragments
+      .map((fragment, i) => {
+        const loc = fragment.path ?? '(unknown path)';
+        return `  ${i + 1}. fragment #${fragment.index} ${loc} (contentChars=${fragment.contentChars}, bytes=${fragment.bytes})`;
+      })
+      .join('\n');
+    parts.push(
+      `${salvage.writeFile.fragmentCount} write_file call(s) were recovered and written to disk before resuming. Treat the written file content as committed base work, not draft text.\n` +
+      `If the write_file call was truncated, the file may contain only the streamed prefix. Before retrying, read the current file, then append or repair only the missing tail in a smaller write_file/propose_edit call; do not regenerate the whole file blindly.\n` +
+      `Recovered write_file outputs:\n${landed}`
     );
   }
   const visible = assistantText.trim();
@@ -413,7 +427,7 @@ function buildInterruptedProgressNote(
     if (!tc.name && !args.trim()) continue;
     parts.push(
       `Partial tool call #${tc.index}${tc.name ? ` (${tc.name})` : ''} captured before ${reason} ` +
-      `(${args.length} arg chars; likely incomplete${salvage.fragmentCount > 0 && tc.name === 'propose_edit' ? ', complete fragments already applied' : ''}, DO NOT execute as-is):\n` +
+      `(${args.length} arg chars; likely incomplete${salvage.proposeEdit.fragmentCount > 0 && tc.name === 'propose_edit' ? ', complete fragments already applied' : ''}${salvage.writeFile.fragmentCount > 0 && tc.name === 'write_file' ? ', partial/complete content already written' : ''}, DO NOT execute as-is):\n` +
       clipMiddle(args, CANCELLED_PROGRESS_ARG_LIMIT)
     );
   }
@@ -423,11 +437,12 @@ function buildInterruptedProgressNote(
     : reason === 'stream error'
       ? 'hit a stream error AFTER partial output had already streamed'
       : 'was cancelled/interrupted AFTER partial output had already streamed';
-  const continuation = salvage.fragmentCount > 0
+  const continuation = salvage.count > 0
     ? `Use the captured progress below to continue from the last coherent point instead of starting over. ` +
-      `The listed propose_edit fragments are already on disk/pending review; treat them as the baseline and do not re-emit them or replace the same broad ranges. ` +
-      `For large tasks, do not restart the implementation plan from scratch: inspect the current live file contents, decide the smallest next missing/incorrect range, then issue a narrow follow-up edit. ` +
+      `The listed propose_edit fragments / write_file outputs are already on disk; treat them as the baseline and do not re-emit them or replace the same broad ranges. ` +
+      `For large tasks, do not restart the implementation plan from scratch: inspect the current live file contents, decide the smallest next missing/incorrect range, then issue a narrow follow-up edit/write. ` +
       `If propose_edit failed or may have garbled a file, enter recovery mode first: read the whole file when feasible, or restore from git/checkpoint if it is too large or clearly corrupted; then make a short revised plan and use a safer edit strategy such as smaller hunks, precise oldText, delete_lines, or a temporary scripted replacement. ` +
+      `For write_file truncation, read the partially-written file first and continue from the actual tail instead of rewriting the whole content. ` +
       `For missing/wrong braces, brackets, parentheses, tags, or quotes, handle it as a syntax-structure repair: read the broken block with neighboring boundaries, patch only the unmatched/extra delimiter or tiny enclosing block, then run the relevant compiler/parser check before broadening scope. ` +
       `If you are tempted to rewrite a large region, do not append/regenerate it; use oldText to replace the exact existing bad block or delete_lines to remove the exact duplicate block. ` +
       `If the landed work made later intended text obsolete or duplicated, delete/adjust only that duplicate tail rather than rewriting the landed block. ` +
@@ -454,10 +469,44 @@ type SalvagedEditFragment = {
   }>;
 };
 
+type SalvageSummary =
+  | { kind: 'none'; count: 0; proposeEdit: InterruptedProposeEditSalvage; writeFile: InterruptedWriteFileSalvage }
+  | { kind: 'mixed'; count: number; proposeEdit: InterruptedProposeEditSalvage; writeFile: InterruptedWriteFileSalvage };
+
+type SalvagedWriteFileFragment = {
+  index: string;
+  path?: string;
+  contentChars: number;
+  bytes: number;
+};
+
 type InterruptedProposeEditSalvage = {
   fragmentCount: number;
   fragments: SalvagedEditFragment[];
 };
+
+type InterruptedWriteFileSalvage = {
+  fragmentCount: number;
+  fragments: SalvagedWriteFileFragment[];
+};
+
+function emptyProposeEditSalvage(): InterruptedProposeEditSalvage {
+  return { fragmentCount: 0, fragments: [] };
+}
+
+function emptyWriteFileSalvage(): InterruptedWriteFileSalvage {
+  return { fragmentCount: 0, fragments: [] };
+}
+
+function combineSalvage(
+  proposeEdit: InterruptedProposeEditSalvage = emptyProposeEditSalvage(),
+  writeFile: InterruptedWriteFileSalvage = emptyWriteFileSalvage()
+): SalvageSummary {
+  const count = proposeEdit.fragmentCount + writeFile.fragmentCount;
+  return count > 0
+    ? { kind: 'mixed', count, proposeEdit, writeFile }
+    : { kind: 'none', count: 0, proposeEdit, writeFile };
+}
 
 function describeSalvagedEditFragment(
   index: string,
@@ -483,6 +532,19 @@ function describeSalvagedEditFragment(
         newTextChars: newText.length
       };
     })
+  };
+}
+
+function describeSalvagedWriteFileFragment(
+  index: string,
+  args: Record<string, unknown>
+): SalvagedWriteFileFragment {
+  const content = typeof args.content === 'string' ? args.content : '';
+  return {
+    index,
+    path: typeof args.path === 'string' ? args.path : undefined,
+    contentChars: content.length,
+    bytes: Buffer.byteLength(content, 'utf8')
   };
 }
 
@@ -571,6 +633,92 @@ async function salvageInterruptedProposeEdits(
     }
   }
   return result;
+}
+
+async function salvageInterruptedWriteFiles(
+  toolCallAccumulator: Map<number, { id?: string; name: string; arguments: string }>,
+  writeFileTool: Tool | undefined,
+  logger: Logger,
+  cancellation: vscode.CancellationToken | undefined,
+  alreadySalvaged: Set<string>,
+  assistantText = ''
+): Promise<InterruptedWriteFileSalvage> {
+  const result: InterruptedWriteFileSalvage = { fragmentCount: 0, fragments: [] };
+  if (!writeFileTool) return result;
+  const candidates: Array<{ idx: string; id?: string; name: string; arguments: string }> = Array.from(toolCallAccumulator.entries())
+    .map(([idx, v]) => ({ idx: String(idx), ...v }));
+  extractDsmlInvokesFromText(assistantText).forEach((call, i) => candidates.push({ idx: `dsml:${i}`, ...call }));
+
+  for (const v of candidates) {
+    if (v.name !== 'write_file' || !v.arguments) continue;
+    let args: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(v.arguments);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        args = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* fall through to loose salvage */
+    }
+    if (!args) args = salvageWriteFileArgs(v.arguments);
+    if (!args || typeof args.path !== 'string' || typeof args.content !== 'string') continue;
+    const sig = `${v.idx}:${args.path}:${Buffer.byteLength(args.content, 'utf8')}:${String(args.content).slice(-200)}`;
+    if (alreadySalvaged.has(sig)) continue;
+    alreadySalvaged.add(sig);
+    try {
+      const salvageTokenSource = cancellation?.isCancellationRequested
+        ? new vscode.CancellationTokenSource()
+        : undefined;
+      try {
+        const res = await writeFileTool.execute(args, {
+          cancellation: salvageTokenSource?.token ?? cancellation ?? new vscode.CancellationTokenSource().token,
+          emitProgress: () => undefined,
+          callId: v.id
+        });
+        if (!res.isError) {
+          result.fragmentCount += 1;
+          result.fragments.push(describeSalvagedWriteFileFragment(v.idx, args));
+        }
+        logger.warn(
+          `Salvaged interrupted write_file (call #${v.idx}): wrote ${Buffer.byteLength(args.content, 'utf8')} byte(s) before resume`
+        );
+      } finally {
+        salvageTokenSource?.dispose();
+      }
+    } catch (err) {
+      logger.warn('Interrupted write_file salvage failed', String(err));
+    }
+  }
+  return result;
+}
+
+async function salvageInterruptedWrites(
+  toolCallAccumulator: Map<number, { id?: string; name: string; arguments: string }>,
+  runToolMap: Map<string, Tool>,
+  logger: Logger,
+  cancellation: vscode.CancellationToken | undefined,
+  alreadySalvaged: Set<string>,
+  assistantText = ''
+): Promise<SalvageSummary> {
+  const [proposeEdit, writeFile] = await Promise.all([
+    salvageInterruptedProposeEdits(
+      toolCallAccumulator,
+      runToolMap.get('propose_edit'),
+      logger,
+      cancellation,
+      alreadySalvaged,
+      assistantText
+    ),
+    salvageInterruptedWriteFiles(
+      toolCallAccumulator,
+      runToolMap.get('write_file'),
+      logger,
+      cancellation,
+      alreadySalvaged,
+      assistantText
+    )
+  ]);
+  return combineSalvage(proposeEdit, writeFile);
 }
 
 export interface AgentOptions {
@@ -934,9 +1082,9 @@ export class AgentLoop {
             const interruptedToolCalls = Array.from(toolCallAccumulator.entries())
               .sort((a, b) => a[0] - b[0])
               .map(([index, v]) => ({ index, name: v.name, arguments: v.arguments }));
-            const salvage = await salvageInterruptedProposeEdits(
+            const salvage = await salvageInterruptedWrites(
               toolCallAccumulator,
-              runToolMap.get('propose_edit'),
+              runToolMap,
               this.logger,
               cancellation,
               salvagedInterruptedEdits,
@@ -1025,9 +1173,9 @@ export class AgentLoop {
             const interruptedToolCalls = Array.from(toolCallAccumulator.entries())
               .sort((a, b) => a[0] - b[0])
               .map(([index, v]) => ({ index, name: v.name, arguments: v.arguments }));
-            const salvage = await salvageInterruptedProposeEdits(
+            const salvage = await salvageInterruptedWrites(
               toolCallAccumulator,
-              runToolMap.get('propose_edit'),
+              runToolMap,
               this.logger,
               cancellation,
               salvagedInterruptedEdits,
@@ -1050,23 +1198,23 @@ export class AgentLoop {
           // on the next resume attempt — so a fully-written first segment is no
           // longer lost just because a later segment's stream was cut. Idempotent
           // across resume attempts via `salvagedInterruptedEdits`.
-          let salvage: InterruptedProposeEditSalvage = { fragmentCount: 0, fragments: [] };
+          let salvage: SalvageSummary = combineSalvage();
           try {
-            salvage = await salvageInterruptedProposeEdits(
+            salvage = await salvageInterruptedWrites(
               toolCallAccumulator,
-              runToolMap.get('propose_edit'),
+              runToolMap,
               this.logger,
               cancellation,
               salvagedInterruptedEdits,
               assistantText
             );
-            if (salvage.fragmentCount > 0) {
+            if (salvage.count > 0) {
               this.logger.warn(
-                `Stream interrupted mid-propose_edit: salvaged ${salvage.fragmentCount} complete fragment(s) onto disk before resume`
+                `Stream interrupted mid-write: salvaged ${salvage.proposeEdit.fragmentCount} propose_edit fragment(s) and ${salvage.writeFile.fragmentCount} write_file output(s) onto disk before resume`
               );
             }
           } catch (salvageErr) {
-            this.logger.warn('Interrupted propose_edit salvage pass failed', String(salvageErr));
+            this.logger.warn('Interrupted write salvage pass failed', String(salvageErr));
           }
           const interruptedToolCalls = Array.from(toolCallAccumulator.entries())
             .sort((a, b) => a[0] - b[0])
@@ -1392,14 +1540,13 @@ export class AgentLoop {
                   } catch { /* keep the original parseError */ }
                 }
               }
-              // propose_edit-specific salvage: when the args are TRUNCATED
-              // mid-stream (model ran out of output budget), the generic
-              // repairs above cannot help because there is no complete object
-              // to parse. Recover whatever WHOLE edit fragments DID arrive so
-              // they still land on disk and keep their diff preview — the
-              // "write one fragment, land one fragment" guarantee survives even
-              // a cut-off tool call. The half-written tail fragment is dropped
-              // and the tool tells the model to re-issue the remaining edits.
+              // propose_edit / write_file-specific salvage: when the args are
+              // TRUNCATED mid-stream (model ran out of output budget), the
+              // generic repairs above cannot help because there is no complete
+              // object to parse. For propose_edit, recover whatever WHOLE edit
+              // fragments DID arrive. For write_file, write the streamed content
+              // prefix so the next turn can read/repair the partial file instead
+              // of retrying and failing at the same output length.
               if (parseError && tc.name === 'propose_edit') {
                 const salvaged = salvageProposeEditArgs(afterControl);
                 if (salvaged) {
@@ -1407,6 +1554,16 @@ export class AgentLoop {
                   parseError = undefined;
                   this.logger.warn(
                     `Tool args propose_edit: salvaged ${(salvaged.edits as unknown[]).length} complete edit fragment(s) from truncated args`
+                  );
+                }
+              }
+              if (parseError && tc.name === 'write_file') {
+                const salvaged = salvageWriteFileArgs(afterControl);
+                if (salvaged) {
+                  parsed = salvaged;
+                  parseError = undefined;
+                  this.logger.warn(
+                    `Tool args write_file: salvaged ${Buffer.byteLength(String(salvaged.content ?? ''), 'utf8')} byte(s) of content from truncated args`
                   );
                 }
               }
@@ -1471,7 +1628,9 @@ export class AgentLoop {
               `(oldText / newText / file contents), make sure all backslashes (\\\\), ` +
               `double-quotes (\\"), and newlines (\\n) are properly escaped, and that ` +
               `the JSON wasn't truncated by your output token budget — split the work ` +
-              `into multiple smaller propose_edit calls if needed.\n` +
+              `into multiple smaller propose_edit/write_file calls if needed. For write_file, ` +
+              `prefer writing smaller chunks/files; if a partial write already landed, read it back ` +
+              `and continue from the actual file tail instead of retrying the same full content.\n` +
               `Received args (length=${raw.length}):\n${snippet}`,
             isError: true
           };
