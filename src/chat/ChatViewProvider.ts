@@ -61,6 +61,45 @@ interface OutboundMessage {
   payload?: unknown;
 }
 
+interface ChatImageAttachment {
+  dataUrl: string;
+  mimeType: string;
+  name?: string;
+}
+
+interface RunOptions {
+  images?: ChatImageAttachment[];
+  useRules?: boolean;
+  useSkills?: boolean;
+}
+
+function modelSupportsVision(model: string): boolean {
+  const m = model.toLowerCase();
+  if (!m.trim()) return false;
+  return /(^|[-_/:.])(vl|vision|visual|multimodal|omni)([-_/:.]|$)/.test(m)
+    || /(^|[-_/:.])v(ision)?\d*($|[-_/:.])/.test(m)
+    || m.includes('gpt-4o')
+    || m.includes('gpt-4.1')
+    || m.includes('o3')
+    || m.includes('o4')
+    || m.includes('qwen-vl')
+    || m.includes('qwen2-vl')
+    || m.includes('qwen2.5-vl')
+    || m.includes('qwen3-vl')
+    || m.includes('gemini')
+    || m.includes('claude-3')
+    || m.includes('claude-4')
+    || m.includes('llava')
+    || m.includes('minicpm-v')
+    || m.includes('glm-4v')
+    || m.includes('glm-4.1v')
+    || m.includes('pixtral')
+    // Newer OpenAI GPT-5 family models are multimodal even when gateway IDs
+    // such as "openai/gpt-5.5" do not include "vl"/"vision" markers.
+    || /(^|[/:-])gpt-5(?:[.-]\d+)?($|[/:-])/.test(m);
+}
+// NOTE: keep the JS version below in sync with the TS version above.
+
 /**
  * Snapshot of an in-flight agent run for a single session. Kept in memory so
  * the webview can replay the streaming UI when the user switches AWAY and
@@ -674,10 +713,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const defaultModel = chat.model || chat.models[0] || '';
     const activeModel = this.activeChatModel() || defaultModel;
     const cached = getCachedFetchedModels(this.context.globalState, chat.baseURL);
+    // Determine vision support: prefer the capability flag from /v1/models cache,
+    // then fall back to the name-pattern heuristic.
+    const cachedEntry = cached?.models.find((m) => m.id === activeModel);
+    const supportsVision =
+      cachedEntry !== undefined
+        ? cachedEntry.supportsVision
+        : modelSupportsVision(activeModel);
     this.post({
       type: 'models',
       payload: {
-        active: { model: activeModel },
+        active: {
+          model: activeModel,
+          supportsVision
+        },
         chat: {
           baseURL: chat.baseURL,
           model: defaultModel,
@@ -836,9 +885,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async handleMessage(msg: InboundMessage): Promise<void> {
     switch (msg.type) {
-      case 'send':
-        await this.runAgent(String((msg.payload as { text: string })?.text ?? ''));
+      case 'send': {
+        const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttachment[]; useRules?: boolean; useSkills?: boolean };
+        const images = Array.isArray(payload.images)
+          ? payload.images
+              .filter((img): img is ChatImageAttachment => {
+                if (!img || typeof img !== 'object') return false;
+                const dataUrl = String((img as ChatImageAttachment).dataUrl ?? '');
+                const mimeType = String((img as ChatImageAttachment).mimeType ?? '');
+                return /^data:image\//i.test(dataUrl) && /^image\//i.test(mimeType);
+              })
+              .slice(0, 8)
+          : [];
+        await this.runAgent(String(payload.text ?? ''), {
+          images,
+          useRules: payload.useRules !== false,
+          useSkills: payload.useSkills !== false
+        });
         break;
+      }
       case 'cancel':
         this.currentRun()?.cts.cancel();
         break;
@@ -1223,17 +1288,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * protocol with a freshly-walked workspace outline. Falls back gracefully if
    * no folder is open or the walk fails.
    */
-  private async buildSystemPromptForRun(taskText = ''): Promise<string> {
+  private async buildSystemPromptForRun(taskText = '', opts: { useRules?: boolean; useSkills?: boolean } = {}): Promise<string> {
     const lessonsRender = renderLessonsBlock(this.lessons.list());
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const currentPlan = this.currentSession?.plan;
-    const globalRules = root
+    const useRules = opts.useRules !== false;
+    const useSkills = opts.useSkills !== false;
+    const globalRules = root && useRules
       ? await readGlobalRules(root).catch((err) => {
         this.logger.warn('Failed to read global rules', String(err));
         return undefined;
       })
       : undefined;
-    const globalSkills = root
+    const globalSkills = root && useSkills
       ? await readGlobalSkills(root, taskText).catch((err) => {
         this.logger.warn('Failed to read global skills', String(err));
         return undefined;
@@ -1548,14 +1615,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async runAgent(userText: string): Promise<void> {
-    if (!userText.trim()) return;
+  private async runAgent(userText: string, opts: RunOptions = {}): Promise<void> {
+    const images = (opts.images ?? []).slice(0, 8);
+    if (!userText.trim() && images.length === 0) return;
     // Only block when THIS session is already running. Other sessions can
     // run concurrently in the background.
-    const session = this.ensureSessionForUserText(userText);
+    const session = this.ensureSessionForUserText(userText || (images.length ? '[image]' : ''));
     if (this.runs.has(session.id)) {
       vscode.window.showWarningMessage('BurstCode: this session already has a request running.');
       return;
+    }
+
+    const activeModel = this.llmConfigForSession(session).model;
+    if (images.length > 0 && !modelSupportsVision(activeModel)) {
+      // Do NOT block here. Many OpenAI-compatible gateways expose multimodal
+      // models with generic IDs (for example "openai/gpt-5.5") and either omit
+      // or delay capability metadata from /v1/models. Let the provider validate
+      // the actual multimodal request instead of silently discarding user images.
+      vscode.window.showInformationMessage(`BurstCode: current model "${activeModel}" is not explicitly marked as vision-capable; sending images anyway.`);
+      this.broadcastModels();
     }
 
     this.foregroundActivityEmitter.fire('chat-start');
@@ -1584,7 +1662,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this.ensureSystemMessageSlot(session);
     const messageIndex = session.messages.length;
-    session.messages.push({ role: 'user', content: userText });
+    const userContent: Extract<ChatMessage, { role: 'user' }>['content'] = images.length > 0
+      ? [
+          ...(userText.trim() ? [{ type: 'text' as const, text: userText }] : []),
+          ...images.map((img) => ({
+            type: 'image_url' as const,
+            image_url: { url: img.dataUrl }
+          }))
+        ]
+      : userText;
+    session.messages.push({ role: 'user', content: userContent });
     // Tag any edits this run queues with the turn that produced them, so a
     // later rollback to an EARLIER turn only discards this turn's edits and
     // leaves still-unreviewed edits from previous turns in the banner.
@@ -1592,6 +1679,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Tag this run's edits with the owning session so the banner / accept /
     // reject stay scoped to this tab when the user switches between sessions.
     this.applier.setCurrentSession(session.id);
+
+    const displayText = userText;
+    const imageUrls = images.map((img) => img.dataUrl).filter((url) => !!url);
 
     // Kick off the two slow setup tasks in PARALLEL: creating a git
     // checkpoint (spawns `git`, can be hundreds of ms on big repos) and
@@ -1609,7 +1699,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // The checkpoint is created in the background without waiting for it.
     postLive({
       type: 'user-message',
-      payload: { text: userText, messageIndex, checkpointRef: undefined, checkpointError: undefined }
+      payload: { text: displayText, imageCount: images.length, imageUrls, messageIndex, checkpointRef: undefined, checkpointError: undefined }
     });
 
     // Create checkpoint in background - don't block the UI
@@ -1647,7 +1737,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     })();
 
-    const systemPromptPromise = this.buildSystemPromptForRun(userText);
+    const systemPromptPromise = this.buildSystemPromptForRun(userText, {
+      useRules: opts.useRules !== false,
+      useSkills: opts.useSkills !== false
+    });
     if (isActive()) this.broadcastContextUsage();
     void this.persistSession(session);
 
@@ -2152,9 +2245,9 @@ setTimeout(() => {
   #modelPickerBtn .label .model { font-weight: 500; }
   #modelPickerBtn .chev { width: 10px; height: 10px; opacity: 0.6; flex-shrink: 0; }
 
-  /* Popover anchored to the composer-wrap bottom; #composer-wrap is set to
-     position:relative below so this opens upward immediately above the pill. */
-  #modelPicker { position: absolute; bottom: calc(100% - 4px); left: 12px; right: 12px; max-height: 60vh; overflow-y: auto; background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-editorWidget-border); border-radius: 8px; box-shadow: 0 -8px 24px rgba(0,0,0,0.35); z-index: 20; display: none; }
+  /* Popover: position:fixed so it is never clipped by overflow:hidden parents.
+     Top/left/width are set dynamically by setModelPickerOpen() via getBoundingClientRect. */
+  #modelPicker { position: fixed; max-height: 60vh; overflow-y: auto; background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-editorWidget-border); border-radius: 8px; box-shadow: 0 -8px 24px rgba(0,0,0,0.35); z-index: 9999; display: none; min-width: 220px; }
   #modelPicker.open { display: block; }
   #modelPicker .ep-group { border-bottom: 1px solid var(--vscode-panel-border); }
   #modelPicker .ep-group:last-child { border-bottom: none; }
@@ -2420,8 +2513,29 @@ setTimeout(() => {
   #composer-wrap { padding: 6px 12px 12px; background: var(--vscode-sideBar-background); flex-shrink: 0; position: relative; }
   #composer { display: flex; align-items: flex-end; gap: 8px; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: 10px; padding: 8px 8px 8px 12px; transition: border-color 0.15s, box-shadow 0.15s; }
   #composer:focus-within { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 1px var(--vscode-focusBorder); }
-  #input { flex: 1; min-height: 22px; max-height: 220px; resize: none; background: transparent; color: var(--vscode-input-foreground); border: none; outline: none; padding: 3px 0; font-family: inherit; font-size: inherit; line-height: 1.5; overflow-y: auto; }
+  #input { flex: 1; min-height: 22px; max-height: 220px; resize: none; background: transparent; color: var(--vscode-input-foreground); border: none; outline: none; padding: 3px 0; font-family: inherit; font-size: inherit; line-height: 1.5; overflow-y: auto; scrollbar-width: none; }
+  #input::-webkit-scrollbar { display: none; }
   #input::placeholder { color: var(--vscode-input-placeholderForeground); opacity: 0.6; }
+  .attachments { display: none; gap: 6px; flex-wrap: wrap; padding: 0 2px 6px; }
+  .attachments.visible { display: flex; }
+  .image-chip { position: relative; width: 58px; height: 58px; border: 1px solid var(--vscode-panel-border); border-radius: 7px; overflow: hidden; background: var(--vscode-editorWidget-background); cursor: zoom-in; }
+  .image-chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .image-chip button { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border: none; border-radius: 50%; background: rgba(0,0,0,0.72); color: #fff; cursor: pointer; line-height: 20px; padding: 0; font-size: 14px; z-index: 2; }
+  .image-chip button:hover { background: rgba(209,52,56,0.92); }
+  .msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 0 20px; }
+  .msg-image-thumb { width: 96px; height: 72px; border: 1px solid var(--vscode-panel-border); border-radius: 8px; object-fit: cover; background: var(--vscode-editorWidget-background); cursor: zoom-in; }
+  #imagePreviewOverlay { display: none; position: fixed; inset: 0; z-index: 120; background: rgba(0,0,0,0.72); align-items: center; justify-content: center; padding: 20px; }
+  #imagePreviewOverlay.active { display: flex; }
+  #imagePreviewOverlay img { max-width: 96vw; max-height: 86vh; border-radius: 8px; box-shadow: 0 12px 36px rgba(0,0,0,0.55); background: var(--vscode-editor-background); }
+  #imagePreviewOverlay button { position: absolute; top: 12px; right: 12px; width: 30px; height: 30px; border: 1px solid rgba(255,255,255,0.28); border-radius: 50%; background: rgba(0,0,0,0.55); color: #fff; cursor: pointer; font-size: 18px; line-height: 28px; }
+  .composer-toggles { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+  .toggle input { display: none; }
+  .toggle .track { width: 24px; height: 14px; border-radius: 999px; background: var(--vscode-input-border); position: relative; transition: background 0.15s; }
+  .toggle .track::after { content: ''; position: absolute; width: 10px; height: 10px; left: 2px; top: 2px; border-radius: 50%; background: var(--vscode-sideBar-background); transition: transform 0.15s; }
+  .toggle input:checked + .track { background: var(--vscode-button-background); }
+  .toggle input:checked + .track::after { transform: translateX(10px); }
+  .toggle .txt { font-size: 0.95em; }
 
   #sendBtn { width: 28px; height: 28px; padding: 0; border: none; border-radius: 7px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: background 0.15s, transform 0.1s; }
   #sendBtn:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
@@ -2594,7 +2708,10 @@ setTimeout(() => {
       </div>
     </div>
     <div id="composer">
-      <textarea id="input" rows="1" placeholder="Ask BurstCode anything..."></textarea>
+      <div style="flex:1; min-width:0;">
+        <div id="attachments" class="attachments" aria-label="Image attachments"></div>
+        <textarea id="input" rows="1" placeholder="Ask BurstCode..."></textarea>
+      </div>
       <button id="sendBtn" title="Send (Enter)" aria-label="Send" data-mode="send">
         <svg class="icon-send" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg>
         <svg class="icon-stop" viewBox="0 0 16 16" fill="currentColor"><rect x="4.5" y="4.5" width="7" height="7" rx="1.2"/></svg>
@@ -2602,22 +2719,42 @@ setTimeout(() => {
     </div>
     <div class="composer-hint">
       <span><kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> newline</span>
+      <div class="composer-toggles" title="Only enabled items are injected into the next run">
+        <label class="toggle" title="Use .burstcode/rules.md for this run">
+          <input id="rulesToggle" type="checkbox" checked>
+          <span class="track"></span><span class="txt">Rules</span>
+        </label>
+        <label class="toggle" title="Select and use .burstcode/skills for this run">
+          <input id="skillsToggle" type="checkbox" checked>
+          <span class="track"></span><span class="txt">Skill</span>
+        </label>
+      </div>
       <button id="bgStatus" type="button" data-phase="disabled" title="Background explorer disabled — click to open activity log">
         <span class="dot" aria-hidden="true"></span>
         <span class="label">BG off</span>
       </button>
     </div>
   </div>
-  <div id="rollbackOverlay" aria-live="assertive" aria-label="Rolling back...">
-    <div class="rb-spinner"></div>
-    <div class="rb-label">Rolling back...</div>
-  </div>
+	  <div id="rollbackOverlay" aria-live="assertive" aria-label="Rolling back...">
+	    <div class="rb-spinner"></div>
+	    <div class="rb-label">Rolling back...</div>
+	  </div>
+	  <div id="imagePreviewOverlay" aria-label="Image preview">
+	    <button id="imagePreviewClose" type="button" title="Close preview" aria-label="Close preview">×</button>
+	    <img id="imagePreviewImg" alt="Image preview">
+	  </div>
 <script nonce="${nonce}">
 ${diagScript}
 const vscode = acquireVsCodeApi();
 const WORKSPACE_ROOT = ${JSON.stringify(workspaceRoot)};
 const log = document.getElementById('log');
 const input = document.getElementById('input');
+const attachmentsEl = document.getElementById('attachments');
+const imagePreviewOverlay = document.getElementById('imagePreviewOverlay');
+const imagePreviewImg = document.getElementById('imagePreviewImg');
+const imagePreviewClose = document.getElementById('imagePreviewClose');
+const rulesToggle = document.getElementById('rulesToggle');
+const skillsToggle = document.getElementById('skillsToggle');
 const sendBtn = document.getElementById('sendBtn');
 const newBtn = document.getElementById('newBtn');
 const cfgBtn = document.getElementById('cfgBtn');
@@ -3718,7 +3855,7 @@ function renderTranscript(entries) {
     return;
   }
   entries.forEach((e) => {
-    if (e.kind === 'user') addUserMsg(e.text, e.messageIndex, e.checkpointRef);
+    if (e.kind === 'user') addUserMsg(e.text, e.messageIndex, e.checkpointRef, undefined, e.imageCount, e.imageUrls);
     else if (e.kind === 'assistant') addAssistantMsg(e.text);
     else if (e.kind === 'reasoning') addReasoningMsg(e.text, { open: false, streaming: false });
     else if (e.kind === 'tool') {
@@ -4517,7 +4654,7 @@ function showEmptyState() {
   log.appendChild(wrap);
 }
 
-function addUserMsg(text, messageIndex, checkpointRef, checkpointError) {
+function addUserMsg(text, messageIndex, checkpointRef, checkpointError, imageCount, imageUrls) {
   clearEmptyState();
   const el = document.createElement('div');
   el.className = 'msg user';
@@ -4529,9 +4666,31 @@ function addUserMsg(text, messageIndex, checkpointRef, checkpointError) {
   gutter.textContent = '>';
   const body = document.createElement('span');
   body.className = 'body';
-  body.textContent = text;
+  body.textContent = text || '';
   el.appendChild(gutter);
-  el.appendChild(body);
+  if (text) el.appendChild(body);
+  const urls = Array.isArray(imageUrls) ? imageUrls.filter((u) => typeof u === 'string' && u) : [];
+  const count = Number(imageCount || urls.length || 0) || 0;
+  if (urls.length > 0) {
+    const grid = document.createElement('div');
+    grid.className = 'msg-images';
+    urls.forEach((url, idx) => {
+      const img = document.createElement('img');
+      img.className = 'msg-image-thumb';
+      img.src = url;
+      img.alt = 'attached image ' + (idx + 1);
+      img.title = 'Click to preview image';
+      img.addEventListener('click', () => openImagePreview(url));
+      grid.appendChild(img);
+    });
+    el.appendChild(grid);
+  } else if (count > 0) {
+    const imgBadge = document.createElement('span');
+    imgBadge.className = 'pill';
+    imgBadge.textContent = count + ' image' + (count === 1 ? '' : 's');
+    imgBadge.style.marginLeft = '8px';
+    el.appendChild(imgBadge);
+  }
 
   // Always surface a rollback affordance on user messages — earlier
   // versions only rendered the button when a git checkpointRef was
@@ -4813,7 +4972,9 @@ window.addEventListener('message', (e) => {
         msg.payload.text,
         msg.payload.messageIndex,
         msg.payload.checkpointRef,
-        msg.payload.checkpointError
+        msg.payload.checkpointError,
+        msg.payload.imageCount,
+        msg.payload.imageUrls
       );
       break;
     case 'update-checkpoint-ref': {
@@ -5474,13 +5635,173 @@ window.addEventListener('message', (e) => {
   }
 });
 
-function autosizeInput() {
-  input.style.height = 'auto';
-  const max = 220;
-  input.style.height = Math.min(input.scrollHeight, max) + 'px';
+	function autosizeInput() {
+	  input.style.height = 'auto';
+	  const max = 220;
+	  const next = Math.min(input.scrollHeight, max);
+	  input.style.height = next + 'px';
+	  input.classList.toggle('scroll', input.scrollHeight > max + 1);
+	}
+	
+	input.addEventListener('input', autosizeInput);
+	autosizeInput();
+	
+	let pastedImages = [];
+	let currentModelSupportsVision = false;
+		function updateInputPlaceholder() {
+		  input.placeholder = pastedImages.length > 0 ? 'Add a message (optional)...' : 'Ask BurstCode...';
+		}
+	function openImagePreview(src) {
+	  imagePreviewImg.src = src;
+	  imagePreviewOverlay.classList.add('active');
+	}
+	function closeImagePreview() {
+	  imagePreviewOverlay.classList.remove('active');
+	  imagePreviewImg.removeAttribute('src');
+	}
+	imagePreviewClose.addEventListener('click', closeImagePreview);
+	imagePreviewOverlay.addEventListener('click', (e) => {
+	  if (e.target === imagePreviewOverlay) closeImagePreview();
+	});
+	function renderAttachments() {
+	  attachmentsEl.innerHTML = '';
+	  attachmentsEl.classList.toggle('visible', pastedImages.length > 0);
+	  updateInputPlaceholder();
+	  pastedImages.forEach((img, idx) => {
+	    const chip = document.createElement('div');
+	    chip.className = 'image-chip';
+	    chip.title = 'Click to preview ' + (img.name || img.mimeType || 'pasted image');
+	    chip.addEventListener('click', () => openImagePreview(img.dataUrl));
+	    const preview = document.createElement('img');
+	    preview.src = img.dataUrl;
+	    preview.alt = img.name || 'pasted image';
+	    const remove = document.createElement('button');
+	    remove.type = 'button';
+	    remove.title = 'Remove image';
+	    remove.setAttribute('aria-label', 'Remove image');
+	    remove.textContent = '×';
+	    remove.addEventListener('click', (e) => {
+	      e.preventDefault();
+	      e.stopPropagation();
+	      pastedImages.splice(idx, 1);
+	      renderAttachments();
+	      input.focus();
+	    });
+	    chip.appendChild(preview);
+	    chip.appendChild(remove);
+	    attachmentsEl.appendChild(chip);
+	  });
+	}
+// Vision-model detection: keep in sync with modelSupportsVision() in extension TS.
+function modelSupportsVisionJS(model) {
+  const m = String(model || '').toLowerCase();
+  if (!m.trim()) return false;
+  return /(^|[-_/:.])(vl|vision|visual|multimodal|omni)([-_/:.]|$)/.test(m)
+    || /(^|[-_/:.])v(ision)?\\d*($|[-_/.])/.test(m)
+    || m.includes('gpt-4o')
+    || m.includes('gpt-4.1')
+    || m.includes('o3')
+    || m.includes('o4')
+    || m.includes('qwen-vl')
+    || m.includes('qwen2-vl')
+    || m.includes('qwen2.5-vl')
+    || m.includes('qwen3-vl')
+    || m.includes('gemini')
+    || m.includes('claude-3')
+    || m.includes('claude-4')
+    || m.includes('llava')
+    || m.includes('minicpm-v')
+    || m.includes('glm-4v')
+    || m.includes('glm-4.1v')
+    || m.includes('pixtral')
+    || /(^|[/:-])gpt-5(?:[.-]\\d+)?($|[/:-])/.test(m);
 }
+function modelEntryId(entry) {
+  if (typeof entry === 'string') return entry;
+  if (entry && typeof entry.id === 'string') return entry.id;
+  return '';
+}
+function modelEntrySupportsVision(entry) {
+  if (entry && typeof entry === 'object' && typeof entry.supportsVision === 'boolean') return entry.supportsVision;
+  return modelSupportsVisionJS(modelEntryId(entry));
+}
+function readImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({ dataUrl: String(reader.result || ''), mimeType: file.type || 'image/png', name: file.name || 'pasted image' });
+    reader.onerror = () => reject(reader.error || new Error('Failed to read image'));
+    reader.readAsDataURL(file);
+  });
+}
+input.addEventListener('paste', (e) => {
+  const dt = e.clipboardData;
+  if (!dt) return;
 
-input.addEventListener('input', autosizeInput);
+  // ------- SYNCHRONOUS phase: capture clipboard handles NOW -------
+  // clipboardData may be cleared by the browser after an await/yield.
+  const rawFiles = [];
+  const htmlItems = [];
+  const plainItems = [];
+  const seenKeys = new Set();
+  const tryAddFile = (file) => {
+    if (!file || !/^image\\//i.test(file.type || '')) return;
+    const key = [file.name || '', file.type || '', file.size || 0].join(':');
+    if (!seenKeys.has(key)) { seenKeys.add(key); rawFiles.push(file); }
+  };
+  Array.from(dt.files || []).forEach(tryAddFile);
+  Array.from(dt.items || []).forEach((it) => {
+    if (it.kind === 'file' && /^image\\//i.test(it.type || '')) {
+      tryAddFile(it.getAsFile());
+    } else if (it.kind === 'string' && it.type === 'text/html') {
+      htmlItems.push(it);
+    } else if (it.kind === 'string' && it.type === 'text/plain') {
+      plainItems.push(it);
+    }
+  });
+
+  const readStringItem = (it) => new Promise((resolve) => {
+    try { it.getAsString((s) => resolve(String(s || ''))); } catch (_) { resolve(''); }
+  });
+  const imageFromDataUrl = (dataUrl, name) => {
+    const m = /^data:(image\\/[a-z0-9.+-]+);base64,/i.exec(dataUrl || '');
+    if (!m) return null;
+    return { dataUrl, mimeType: m[1], name: name || 'pasted image' };
+  };
+  const extractDataUrlImages = (text) => {
+    const out = [];
+    const re = new RegExp('data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=\\r\\n]+', 'ig');
+    let m;
+    while ((m = re.exec(String(text || '')))) {
+      const img = imageFromDataUrl(m[0].replace(/[\\r\\n]/g, ''), 'pasted image');
+      if (img) out.push(img);
+    }
+    return out;
+  };
+
+  // Intercept only if image file handles are present, or if HTML may contain an
+  // embedded data:image URL. Plain text paste remains browser-native.
+  if (rawFiles.length === 0 && htmlItems.length === 0) return;
+  e.preventDefault();
+
+  // ------- ASYNC phase: read file/data URLs -------
+  (async () => {
+    const images = [];
+    for (const f of rawFiles) {
+      try { images.push(await readImageFile(f)); } catch (_) { /* skip */ }
+    }
+    if (images.length === 0) {
+      for (const it of htmlItems) images.push(...extractDataUrlImages(await readStringItem(it)));
+      if (images.length === 0) {
+        for (const it of plainItems) images.push(...extractDataUrlImages(await readStringItem(it)));
+      }
+    }
+    if (!images.length) return;
+    const slots = Math.max(0, 8 - pastedImages.length);
+    if (slots <= 0) { addErrorMsg('⚠ 最多只能附加 8 张图片。'); return; }
+    pastedImages.push(...images.slice(0, slots));
+    renderAttachments();
+  })();
+});
 
 sendBtn.addEventListener('click', () => {
   if (busy) {
@@ -5489,8 +5810,16 @@ sendBtn.addEventListener('click', () => {
     return;
   }
   const text = input.value.trim();
-  if (!text) return;
-  vscode.postMessage({ type: 'send', payload: { text } });
+  if (!text && pastedImages.length === 0) return;
+  if (pastedImages.length > 0 && !currentModelSupportsVision) {
+    // Soft warning only — the user may be on a gateway that supports vision
+    // but whose model name doesn't match our heuristic. Allow sending and let
+    // the server respond with an appropriate error if needed.
+    console.warn('[burstcode] current model not flagged as vision-capable; sending anyway');
+  }
+  vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked } });
+  pastedImages = [];
+  renderAttachments();
   input.value = '';
   autosizeInput();
 });
@@ -5523,7 +5852,7 @@ input.addEventListener('keydown', (e) => {
 // (or via the 'BurstCode: Background Explorer Model' command).
 const modelsState = {
   chat: { baseURL: '', model: '', models: [] },
-  active: { model: '' },
+  active: { model: '', supportsVision: false },
   fetched: { loading: false, models: null, error: null, fetchedAt: 0 }
 };
 
@@ -5532,6 +5861,21 @@ function setModelPickerOpen(open) {
     renderModelPicker();
     modelPicker.classList.add('open');
     modelPickerBtn.setAttribute('aria-expanded', 'true');
+    // Position the popover above the button using fixed coordinates.
+    const br = modelPickerBtn.getBoundingClientRect();
+    // Estimate height (will relayout after display:block, so use scrollHeight)
+    requestAnimationFrame(() => {
+      const ph = modelPicker.scrollHeight;
+      const gap = 4;
+      let top = br.top - ph - gap;
+      if (top < 4) top = br.bottom + gap; // flip below if not enough room
+      const left = Math.max(4, br.left);
+      const maxRight = window.innerWidth - 4;
+      const width = Math.min(320, maxRight - left);
+      modelPicker.style.top = top + 'px';
+      modelPicker.style.left = left + 'px';
+      modelPicker.style.width = width + 'px';
+    });
   } else {
     modelPicker.classList.remove('open');
     modelPickerBtn.setAttribute('aria-expanded', 'false');
@@ -5541,7 +5885,18 @@ function setModelPickerOpen(open) {
 function renderModelPickerLabel() {
   const labelEl = modelPickerBtn.querySelector('.label');
   if (!labelEl) return;
-  const a = modelsState.active || { model: '' };
+  const a = modelsState.active || { model: '', supportsVision: false };
+  // Prefer the capability flag from /v1/models cache (more reliable than name heuristics).
+  const fetchedModels = (modelsState.fetched && modelsState.fetched.models) || [];
+  const fetchedEntry = fetchedModels.find(function(m) { return modelEntryId(m) === a.model; });
+  currentModelSupportsVision =
+    fetchedEntry !== undefined
+      ? modelEntrySupportsVision(fetchedEntry)
+      : (!!a.supportsVision || modelSupportsVisionJS(String(a.model || '')));
+  // Always allow image paste — tooltip shows support status only.
+  input.title = currentModelSupportsVision
+    ? '支持粘贴图片（模型已标记为视觉/VL）'
+    : '可尝试粘贴图片（模型未标记为视觉/VL，如网关支持也可发送）';
   if (!a.model) {
     labelEl.innerHTML = '<span class="ep">No model selected</span>';
     return;
@@ -5591,13 +5946,26 @@ function renderModelPicker() {
     group.appendChild(err);
   }
 
-  // Compose the row list: manual models first, then any fetched-only IDs.
-  const manual = (chat.models || []).slice();
+  // Compose the row list: manual model IDs first, then any fetched-only IDs.
+  // Fetched entries are objects ({ id, supportsVision }); never render/pass the
+  // object itself or VS Code will show "[object Object]" and selection breaks.
+  const manual = (chat.models || []).map(modelEntryId).filter(Boolean);
   const fetched = Array.isArray(cache.models) ? cache.models : [];
   const seen = new Set();
   const rows = [];
-  manual.forEach((m) => { if (!seen.has(m)) { seen.add(m); rows.push({ id: m, source: 'manual' }); } });
-  fetched.forEach((m) => { if (!seen.has(m)) { seen.add(m); rows.push({ id: m, source: 'fetched' }); } });
+  manual.forEach((id) => {
+    if (!seen.has(id)) {
+      seen.add(id);
+      rows.push({ id, source: 'manual', supportsVision: modelSupportsVisionJS(id) });
+    }
+  });
+  fetched.forEach((entry) => {
+    const id = modelEntryId(entry);
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      rows.push({ id, source: 'fetched', supportsVision: modelEntrySupportsVision(entry) });
+    }
+  });
 
   if (rows.length === 0) {
     const empty = document.createElement('div');
@@ -5619,7 +5987,7 @@ function renderModelPicker() {
       name.title = r.id;
       const badge = document.createElement('span');
       badge.className = 'badge';
-      badge.textContent = r.source === 'manual' ? 'manual' : 'fetched';
+      badge.textContent = r.supportsVision ? (r.source === 'manual' ? 'manual · VL' : 'fetched · VL') : (r.source === 'manual' ? 'manual' : 'fetched');
       row.appendChild(check);
       row.appendChild(name);
       row.appendChild(badge);

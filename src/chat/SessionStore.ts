@@ -147,8 +147,30 @@ export interface TranscriptEntry {
   args?: unknown;
   /** For user entries: index in the original messages array. */
   messageIndex?: number;
+  /** Number of image attachments on a multimodal user message. */
+  imageCount?: number;
+  /** Data URLs for user image attachments so history can render thumbnails. */
+  imageUrls?: string[];
   /** For user entries: rollback ref captured before this prompt was processed. */
   checkpointRef?: string;
+}
+
+function userContentSummary(content: unknown): { text: string; imageCount: number; imageUrls: string[] } {
+  if (typeof content === 'string') return { text: content, imageCount: 0, imageUrls: [] };
+  if (!Array.isArray(content)) return { text: '', imageCount: 0, imageUrls: [] };
+  const textParts: string[] = [];
+  const imageUrls: string[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    const p = part as { type?: unknown; text?: unknown; image_url?: { url?: unknown } };
+    if (p.type === 'text' && typeof p.text === 'string') textParts.push(p.text);
+    if (p.type === 'image_url') {
+      const url = p.image_url && typeof p.image_url.url === 'string' ? p.image_url.url : '';
+      if (url) imageUrls.push(url);
+    }
+  }
+  const imageCount = imageUrls.length;
+  return { text: textParts.join('\n').trim(), imageCount, imageUrls };
 }
 
 export function buildTranscript(
@@ -168,13 +190,14 @@ export function buildTranscript(
     const m = messages[i];
     if (m.role === 'system') continue;
     if (m.role === 'user') {
-      const text = typeof m.content === 'string' ? m.content : '';
+      const summary = userContentSummary(m.content);
+      const text = summary.text;
       // Skip internal messages injected by the agent loop that were never
       // shown to the user as real input: system notes, auto-continue nudges,
       // stuck-detector corrections, length-truncation continue prompts,
       // decision-buffer feedback, and context-offload hints.
       const isInternal =
-        !text ||
+        (summary.imageCount === 0 && !text) ||
         text.startsWith('(System note)') ||
         text.startsWith('[auto-continue]') ||
         text.startsWith('[stuck-detector]') ||
@@ -186,7 +209,9 @@ export function buildTranscript(
           kind: 'user',
           text,
           messageIndex: i,
-          checkpointRef: refByIndex.get(i)
+          checkpointRef: refByIndex.get(i),
+          imageCount: summary.imageCount,
+          imageUrls: summary.imageUrls
         });
       }
     } else if (m.role === 'assistant') {
@@ -249,7 +274,8 @@ export function rebaseCheckpointsAfterMessageCompaction(
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m.role !== 'user') continue;
-    const text = typeof m.content === 'string' ? m.content : '';
+    const summary = userContentSummary(m.content);
+    const text = summary.text;
     const arr = userOccurrences.get(text) ?? [];
     arr.push(i);
     userOccurrences.set(text, arr);
@@ -259,11 +285,11 @@ export function rebaseCheckpointsAfterMessageCompaction(
   const rebased: SessionCheckpoint[] = [];
   for (const cp of checkpoints.slice().sort((a, b) => a.createdAt - b.createdAt)) {
     const oldMessage = messages[cp.messageIndex];
-    const oldText = cp.messageText ?? (
-      oldMessage?.role === 'user' && typeof oldMessage.content === 'string'
-        ? oldMessage.content
-        : undefined
-    );
+      const oldText = cp.messageText ?? (
+        oldMessage?.role === 'user'
+          ? userContentSummary(oldMessage.content).text
+          : undefined
+      );
     if (!oldText) continue;
 
     const candidates = userOccurrences.get(oldText) ?? [];

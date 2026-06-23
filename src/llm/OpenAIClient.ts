@@ -373,7 +373,7 @@ export async function fetchProfileModels(profile: {
   baseURL: string;
   apiKey?: string;
   allowSelfSignedCerts?: boolean;
-}): Promise<string[]> {
+}): Promise<FetchedModelEntry[]> {
   const opts: ConstructorParameters<typeof OpenAI>[0] = {
     baseURL: profile.baseURL,
     apiKey: profile.apiKey || 'no-key',
@@ -386,11 +386,22 @@ export async function fetchProfileModels(profile: {
   }
   const client = new OpenAI(opts);
   const res = await client.models.list();
-  const ids = res.data
-    .map((m) => (typeof m.id === 'string' ? m.id : ''))
-    .filter((id) => !!id);
-  ids.sort((a, b) => a.localeCompare(b));
-  return ids;
+  const entries: FetchedModelEntry[] = res.data
+    .filter((m) => typeof m.id === 'string' && !!m.id)
+    .map((m) => {
+      // Some gateways (e.g. OpenRouter, LiteLLM, One-API) expose a
+      // `capabilities` object on the model record with boolean vision flags.
+      const cap = (m as unknown as Record<string, unknown>).capabilities as
+        | Record<string, unknown>
+        | undefined;
+      const supportsVision =
+        !!cap?.vision ||
+        !!cap?.images ||
+        !!(cap?.input_modalities as string[] | undefined)?.includes('image');
+      return { id: m.id, supportsVision };
+    });
+  entries.sort((a, b) => a.id.localeCompare(b.id));
+  return entries;
 }
 
 /**
@@ -401,8 +412,13 @@ export async function fetchProfileModels(profile: {
  */
 const FETCHED_MODELS_CACHE_KEY = 'burstcode.llm.fetchedModelsCache.v1';
 
+export interface FetchedModelEntry {
+  id: string;
+  supportsVision: boolean;
+}
+
 export interface FetchedModelsCacheEntry {
-  models: string[];
+  models: FetchedModelEntry[];
   fetchedAt: number;
 }
 
@@ -424,9 +440,15 @@ export function getCachedFetchedModels(
   const cache = readFetchedModelsCache(memento);
   const entry = cache[url];
   if (!entry || !Array.isArray(entry.models)) return null;
-  const models = entry.models.filter(
-    (m): m is string => typeof m === 'string' && !!m
-  );
+  // Normalise: entries might be bare strings from an older cache version.
+  const models: FetchedModelEntry[] = entry.models
+    .map((m: unknown): FetchedModelEntry | null => {
+      if (typeof m === 'string' && m) return { id: m, supportsVision: false };
+      if (m && typeof (m as FetchedModelEntry).id === 'string' && (m as FetchedModelEntry).id)
+        return m as FetchedModelEntry;
+      return null;
+    })
+    .filter((m): m is FetchedModelEntry => m !== null);
   const fetchedAt = typeof entry.fetchedAt === 'number' ? entry.fetchedAt : 0;
   return { models, fetchedAt };
 }
@@ -435,7 +457,7 @@ export function getCachedFetchedModels(
 export async function writeCachedFetchedModels(
   memento: vscode.Memento,
   baseURL: string,
-  models: string[]
+  models: FetchedModelEntry[]
 ): Promise<void> {
   const url = (baseURL || '').trim();
   if (!url) return;

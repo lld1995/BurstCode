@@ -259,7 +259,8 @@ export function activate(context: vscode.ExtensionContext): void {
             vscode.window.showWarningMessage(`BurstCode: ${chat.baseURL} returned no models.`);
             return;
           }
-          const sub = await vscode.window.showQuickPick(ids, {
+          const idStrings = ids.map((e) => e.id);
+          const sub = await vscode.window.showQuickPick(idStrings, {
             title: 'BurstCode: Models on chat baseURL',
             placeHolder: 'Pick a model to activate'
           });
@@ -517,7 +518,8 @@ export function activate(context: vscode.ExtensionContext): void {
             vscode.window.showWarningMessage(`BurstCode: ${probeBaseURL} returned no models.`);
             return;
           }
-          const sub = await vscode.window.showQuickPick(ids, {
+          const idStrings = ids.map((e) => e.id);
+          const sub = await vscode.window.showQuickPick(idStrings, {
             title: 'BurstCode: Models on background baseURL',
             placeHolder: 'Pick a model for the background explorer'
           });
