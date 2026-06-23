@@ -2513,7 +2513,7 @@ setTimeout(() => {
   #composer-wrap { padding: 6px 12px 12px; background: var(--vscode-sideBar-background); flex-shrink: 0; position: relative; }
   #composer { display: flex; align-items: flex-end; gap: 8px; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: 10px; padding: 8px 8px 8px 12px; transition: border-color 0.15s, box-shadow 0.15s; }
   #composer:focus-within { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 1px var(--vscode-focusBorder); }
-  #input { flex: 1; min-height: 22px; max-height: 220px; resize: none; background: transparent; color: var(--vscode-input-foreground); border: none; outline: none; padding: 3px 0; font-family: inherit; font-size: inherit; line-height: 1.5; overflow-y: auto; scrollbar-width: none; }
+  #input { display: block; width: 100%; flex: 1; min-height: 22px; max-height: 220px; resize: none; background: transparent; color: var(--vscode-input-foreground); border: none; outline: none; padding: 3px 0; font-family: inherit; font-size: inherit; line-height: 1.5; overflow-y: auto; scrollbar-width: none; }
   #input::-webkit-scrollbar { display: none; }
   #input::placeholder { color: var(--vscode-input-placeholderForeground); opacity: 0.6; }
   .attachments { display: none; gap: 6px; flex-wrap: wrap; padding: 0 2px 6px; }
