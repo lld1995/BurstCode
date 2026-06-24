@@ -162,10 +162,12 @@ export class HunkApplier implements vscode.Disposable {
    */
   private readonly sessionTouched = new Map<string, Set<string>>();
   /**
-   * True once the diff editor for the first newly-queued file in the current
-   * cycle has been opened. Reset together with `cycleInitPromise`.
+   * Sessions that have already had an automatic diff editor opened while they
+   * still have pending edits. This must be per-session (not one global boolean):
+   * multiple chat tabs can run concurrently, and each tab's first propose_edit
+   * should surface its own review UI even if another tab still has pending hunks.
    */
-  private diffOpenedThisCycle = false;
+  private readonly diffOpenedForSessions = new Set<string>();
   private readonly stateEmitter = new vscode.EventEmitter<PendingState>();
   /** Fires whenever pending edits are added, accepted, or rejected. */
   readonly onPendingStateChange = this.stateEmitter.event;
@@ -383,12 +385,13 @@ export class HunkApplier implements vscode.Disposable {
     );
 
     this.codeLensProvider.refresh();
-    // Open a diff editor for the first newly-queued file in this CYCLE (not
-    // just this call). Subsequent files quietly accumulate in the banner —
-    // users can click into them from there. `diffOpenedThisCycle` makes this
-    // safe under concurrency.
-    if (firstNewlyQueuedUri && !this.diffOpenedThisCycle) {
-      this.diffOpenedThisCycle = true;
+    // Open a diff editor for the first newly-queued file for THIS session while
+    // it has pending edits. The guard is per-session: concurrent chat tabs must
+    // each get one automatic review surface, while follow-up edits from the same
+    // tab quietly accumulate in that tab's banner.
+    const diffOpenSessionKey = sessionId ?? '';
+    if (firstNewlyQueuedUri && !this.diffOpenedForSessions.has(diffOpenSessionKey)) {
+      this.diffOpenedForSessions.add(diffOpenSessionKey);
       const entry = this.pending.get(firstNewlyQueuedUri.toString());
       if (entry) {
         try {
@@ -1295,11 +1298,12 @@ export class HunkApplier implements vscode.Disposable {
     this.diffPreview.unregister(file.proposedUri);
     this.pending.delete(file.uri.toString());
     this.codeLensProvider.refresh();
-    // Cycle ended — clear the per-cycle guards so the NEXT propose_edit run
-    // creates a fresh checkpoint and is allowed to open one diff editor.
+    // This session's review cycle ended — allow its NEXT propose_edit run to
+    // open a fresh diff editor even if other sessions still have pending edits.
+    this.diffOpenedForSessions.delete(file.sessionId ?? '');
+    // All pending edits drained globally — clear the shared cycle-init promise.
     if (this.pending.size === 0) {
       this.cycleInitPromise = null;
-      this.diffOpenedThisCycle = false;
     }
     for (const l of this.listeners) {
       try {

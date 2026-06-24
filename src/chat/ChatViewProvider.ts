@@ -35,6 +35,7 @@ import { buildPlanTool, PlanStep } from '../agent/tools/plan';
 import { buildLessonTools } from '../agent/tools/lessons';
 import { buildShellTools } from '../agent/tools/shell';
 import { buildContextTools } from '../agent/tools/context';
+import { buildMcpTools } from '../agent/tools/mcp';
 import { buildSubagentTool } from '../agent/tools/subagent';
 import { LessonStore, renderLessonsBlock } from '../memory/LessonStore';
 import { readGlobalRules, readGlobalSkills } from '../memory/GlobalRules';
@@ -71,6 +72,7 @@ interface RunOptions {
   images?: ChatImageAttachment[];
   useRules?: boolean;
   useSkills?: boolean;
+  useMcp?: boolean;
 }
 
 function modelSupportsVision(model: string): boolean {
@@ -432,6 +434,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.broadcastModels();
         this.broadcastContextUsage();
       }
+      if (e.affectsConfiguration('burstcode.mcp.servers')) {
+        this.broadcastMcpConfig();
+      }
       if (e.affectsConfiguration('burstcode.ui.taskDoneSound')) {
         const enabled = vscode.workspace.getConfiguration('burstcode.ui').get<boolean>('taskDoneSound') ?? true;
         if (!enabled) this.stopTaskDoneAlert();
@@ -599,6 +604,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.broadcastModels();
     this.broadcastSessions();
     this.broadcastLessons();
+    this.broadcastMcpConfig();
     this.broadcastContextUsage();
     this.broadcastBackgroundStatus();
     // Re-broadcast any pending-edit queue so a reopened panel shows the banner.
@@ -647,6 +653,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: 'lessons',
       payload: { lessons: this.lessons.list() }
     });
+  }
+
+  private readRawMcpServers(): unknown[] {
+    const raw = vscode.workspace.getConfiguration('burstcode.mcp').get<unknown>('servers');
+    return Array.isArray(raw) ? raw : [];
+  }
+
+  private broadcastMcpConfig(): void {
+    if (!this.view) return;
+    this.post({
+      type: 'mcp-config',
+      payload: { servers: this.readRawMcpServers() }
+    });
+  }
+
+  private async saveMcpConfig(servers: unknown): Promise<void> {
+    if (!Array.isArray(servers)) {
+      throw new Error('MCP config must be a JSON array.');
+    }
+    await vscode.workspace.getConfiguration('burstcode.mcp').update('servers', servers, vscode.ConfigurationTarget.Workspace);
+    this.broadcastMcpConfig();
+    vscode.window.showInformationMessage('BurstCode: MCP configuration saved. New runs will use the updated servers.');
   }
 
   /**
@@ -741,6 +769,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.currentSession = undefined;
     this.post({ type: 'reset' });
     this.broadcastSessions();
+    // Refresh the model-picker label for the fresh chat. With no current
+    // session, activeChatModel() falls back to the global default — which is
+    // exactly the model ensureSessionForUserText() will snapshot onto the new
+    // session. Without this, the label keeps showing the PREVIOUS session's
+    // (sticky) model while the new session actually runs on the global default,
+    // so the displayed model and the model used disagree — most visibly after
+    // the default was changed in another VS Code window.
+    this.broadcastModels();
     this.broadcastContextUsage();
     // A fresh chat has no pending edits of its own; clear the banner.
     this.broadcastPendingEdits();
@@ -886,7 +922,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async handleMessage(msg: InboundMessage): Promise<void> {
     switch (msg.type) {
       case 'send': {
-        const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttachment[]; useRules?: boolean; useSkills?: boolean };
+        const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttachment[]; useRules?: boolean; useSkills?: boolean; useMcp?: boolean };
         const images = Array.isArray(payload.images)
           ? payload.images
               .filter((img): img is ChatImageAttachment => {
@@ -900,7 +936,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.runAgent(String(payload.text ?? ''), {
           images,
           useRules: payload.useRules !== false,
-          useSkills: payload.useSkills !== false
+          useSkills: payload.useSkills !== false,
+          useMcp: payload.useMcp !== false
         });
         break;
       }
@@ -1083,6 +1120,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'request-lessons':
         this.broadcastLessons();
+        break;
+      case 'request-mcp-config':
+        this.broadcastMcpConfig();
+        break;
+      case 'save-mcp-config': {
+        const p = (msg.payload ?? {}) as { servers?: unknown };
+        await this.saveMcpConfig(p.servers);
+        break;
+      }
+      case 'open-mcp-settings':
+        await vscode.commands.executeCommand('workbench.action.openSettings', 'burstcode.mcp.servers');
         break;
       case 'update-lesson': {
         const p = (msg.payload ?? {}) as {
@@ -1799,11 +1847,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const writeFileTool = buildWriteFileTool(this.applier, session.id);
     const lspTools = buildLspTools(bridge, this.depGuard);
     const editTools = buildEditTools(this.applier, askUser, session.id, messageIndex);
+    const mcpTools = opts.useMcp === false ? [] : await buildMcpTools(this.logger);
     const subagentTool = buildSubagentTool({
       clientFactory: () => new OpenAIClient(llmCfg, this.logger),
       logger: this.logger,
       applier: this.applier,
-      readTools: [...coreReadTools, ...lspTools],
+      readTools: [...coreReadTools, ...lspTools, ...mcpTools],
       writeTools: editTools.filter((t) => t.name === 'propose_edit'),
       systemPrompt,
       contextWindow: llmCfg.contextWindow,
@@ -1816,6 +1865,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const tools: Tool[] = [
       ...coreReadTools,
       ...lspTools,
+      ...mcpTools,
       subagentTool,
       ...buildLangTools(),
       ...editTools,
@@ -2728,6 +2778,10 @@ setTimeout(() => {
           <input id="skillsToggle" type="checkbox" checked>
           <span class="track"></span><span class="txt">Skill</span>
         </label>
+        <label class="toggle" title="Expose configured MCP server tools for this run">
+          <input id="mcpToggle" type="checkbox" checked>
+          <span class="track"></span><span class="txt">MCP</span>
+        </label>
       </div>
       <button id="bgStatus" type="button" data-phase="disabled" title="Background explorer disabled — click to open activity log">
         <span class="dot" aria-hidden="true"></span>
@@ -2755,6 +2809,7 @@ const imagePreviewImg = document.getElementById('imagePreviewImg');
 const imagePreviewClose = document.getElementById('imagePreviewClose');
 const rulesToggle = document.getElementById('rulesToggle');
 const skillsToggle = document.getElementById('skillsToggle');
+const mcpToggle = document.getElementById('mcpToggle');
 const sendBtn = document.getElementById('sendBtn');
 const newBtn = document.getElementById('newBtn');
 const cfgBtn = document.getElementById('cfgBtn');
@@ -5733,75 +5788,83 @@ function readImageFile(file) {
     reader.readAsDataURL(file);
   });
 }
-input.addEventListener('paste', (e) => {
-  const dt = e.clipboardData;
-  if (!dt) return;
+	input.addEventListener('paste', (e) => {
+	  const dt = e.clipboardData;
+	  if (!dt) return;
 
-  // ------- SYNCHRONOUS phase: capture clipboard handles NOW -------
-  // clipboardData may be cleared by the browser after an await/yield.
-  const rawFiles = [];
-  const htmlItems = [];
-  const plainItems = [];
-  const seenKeys = new Set();
-  const tryAddFile = (file) => {
-    if (!file || !/^image\\//i.test(file.type || '')) return;
-    const key = [file.name || '', file.type || '', file.size || 0].join(':');
-    if (!seenKeys.has(key)) { seenKeys.add(key); rawFiles.push(file); }
-  };
-  Array.from(dt.files || []).forEach(tryAddFile);
-  Array.from(dt.items || []).forEach((it) => {
-    if (it.kind === 'file' && /^image\\//i.test(it.type || '')) {
-      tryAddFile(it.getAsFile());
-    } else if (it.kind === 'string' && it.type === 'text/html') {
-      htmlItems.push(it);
-    } else if (it.kind === 'string' && it.type === 'text/plain') {
-      plainItems.push(it);
-    }
-  });
+	  // Read string clipboard data synchronously during the paste event. In VS Code
+	  // webviews, DataTransferItem.getAsString() can become unreliable once the
+	  // event has returned, which made normal text paste disappear after we called
+	  // preventDefault() to inspect possible HTML images.
+	  const plainText = String(dt.getData('text/plain') || '');
+	  const htmlText = String(dt.getData('text/html') || '');
 
-  const readStringItem = (it) => new Promise((resolve) => {
-    try { it.getAsString((s) => resolve(String(s || ''))); } catch (_) { resolve(''); }
-  });
-  const imageFromDataUrl = (dataUrl, name) => {
-    const m = /^data:(image\\/[a-z0-9.+-]+);base64,/i.exec(dataUrl || '');
-    if (!m) return null;
-    return { dataUrl, mimeType: m[1], name: name || 'pasted image' };
-  };
-  const extractDataUrlImages = (text) => {
-    const out = [];
-    const re = new RegExp('data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=\\r\\n]+', 'ig');
-    let m;
-    while ((m = re.exec(String(text || '')))) {
-      const img = imageFromDataUrl(m[0].replace(/[\\r\\n]/g, ''), 'pasted image');
-      if (img) out.push(img);
-    }
-    return out;
-  };
+	  const rawFiles = [];
+	  const seenKeys = new Set();
+	  const tryAddFile = (file) => {
+	    if (!file || !/^image\\//i.test(file.type || '')) return;
+	    const key = [file.name || '', file.type || '', file.size || 0].join(':');
+	    if (!seenKeys.has(key)) { seenKeys.add(key); rawFiles.push(file); }
+	  };
+	  Array.from(dt.files || []).forEach(tryAddFile);
+	  Array.from(dt.items || []).forEach((it) => {
+	    if (it.kind === 'file' && /^image\\//i.test(it.type || '')) {
+	      tryAddFile(it.getAsFile());
+	    }
+	  });
 
-  // Intercept only if image file handles are present, or if HTML may contain an
-  // embedded data:image URL. Plain text paste remains browser-native.
-  if (rawFiles.length === 0 && htmlItems.length === 0) return;
-  e.preventDefault();
+	  const imageFromDataUrl = (dataUrl, name) => {
+	    const m = /^data:(image\\/[a-z0-9.+-]+);base64,/i.exec(dataUrl || '');
+	    if (!m) return null;
+	    return { dataUrl, mimeType: m[1], name: name || 'pasted image' };
+	  };
+	  const extractDataUrlImages = (text) => {
+	    const out = [];
+	    const re = new RegExp('data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=\\r\\n]+', 'ig');
+	    let m;
+	    while ((m = re.exec(String(text || '')))) {
+	      const img = imageFromDataUrl(m[0].replace(/[\\r\\n]/g, ''), 'pasted image');
+	      if (img) out.push(img);
+	    }
+	    return out;
+	  };
+	  const inlineImages = [...extractDataUrlImages(htmlText), ...extractDataUrlImages(plainText)];
 
-  // ------- ASYNC phase: read file/data URLs -------
-  (async () => {
-    const images = [];
-    for (const f of rawFiles) {
-      try { images.push(await readImageFile(f)); } catch (_) { /* skip */ }
-    }
-    if (images.length === 0) {
-      for (const it of htmlItems) images.push(...extractDataUrlImages(await readStringItem(it)));
-      if (images.length === 0) {
-        for (const it of plainItems) images.push(...extractDataUrlImages(await readStringItem(it)));
-      }
-    }
-    if (!images.length) return;
-    const slots = Math.max(0, 8 - pastedImages.length);
-    if (slots <= 0) { addErrorMsg('⚠ 最多只能附加 8 张图片。'); return; }
-    pastedImages.push(...images.slice(0, slots));
-    renderAttachments();
-  })();
-});
+	  // If there are no image files and no embedded data:image URLs, let the
+	  // browser perform a completely normal text paste. This preserves multiline
+	  // paste, selection replacement, undo behavior, and IME/browser quirks.
+	  if (rawFiles.length === 0 && inlineImages.length === 0) return;
+	  e.preventDefault();
+
+	  const insertTextAtCursor = (text) => {
+	    const s = String(text || '');
+	    if (!s) return false;
+	    const start = input.selectionStart || 0;
+	    const end = input.selectionEnd || start;
+	    const value = input.value || '';
+	    input.value = value.slice(0, start) + s + value.slice(end);
+	    const pos = start + s.length;
+	    try { input.setSelectionRange(pos, pos); } catch (_) {}
+	    autosizeInput();
+	    input.dispatchEvent(new Event('input', { bubbles: true }));
+	    return true;
+	  };
+
+	  (async () => {
+	    const images = inlineImages.slice();
+	    for (const f of rawFiles) {
+	      try { images.push(await readImageFile(f)); } catch (_) { /* skip */ }
+	    }
+	    if (!images.length) {
+	      insertTextAtCursor(plainText);
+	      return;
+	    }
+	    const slots = Math.max(0, 8 - pastedImages.length);
+	    if (slots <= 0) { addErrorMsg('⚠ 最多只能附加 8 张图片。'); return; }
+	    pastedImages.push(...images.slice(0, slots));
+	    renderAttachments();
+	  })();
+	});
 
 sendBtn.addEventListener('click', () => {
   if (busy) {
@@ -5817,7 +5880,7 @@ sendBtn.addEventListener('click', () => {
     // the server respond with an appropriate error if needed.
     console.warn('[burstcode] current model not flagged as vision-capable; sending anyway');
   }
-  vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked } });
+  vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked } });
   pastedImages = [];
   renderAttachments();
   input.value = '';
@@ -6099,7 +6162,7 @@ pendingRejectBtn.addEventListener('click', (ev) => {
 historyBtn.addEventListener('click', () => {
   const open = historyEl.classList.toggle('open');
   if (open) {
-    // Close the lessons overlay so they don't stack.
+    // Close the other overlays so they don't stack.
     lessonsEl.classList.remove('open');
     vscode.postMessage({ type: 'request-sessions' });
     renderHistory();

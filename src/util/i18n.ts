@@ -74,6 +74,19 @@ const EN: Dict = {
   'web.configured': 'configured',
   'web.notConfigured': 'not configured',
 
+  // MCP group
+  'mcp.group': 'MCP',
+  'mcp.configured': '{0} enabled',
+  'mcp.notConfigured': 'not configured',
+  'mcp.servers': 'MCP servers…',
+  'mcp.servers.desc': '{0} configured',
+  'mcp.servers.empty': 'click to configure',
+  'mcp.servers.tip': 'Configure burstcode.mcp.servers. Stdio servers use command/args/env/cwd; remote servers use url/headers.',
+  'mcp.tools': 'Enabled MCP tools…',
+  'mcp.tools.all': 'all discovered tools',
+  'mcp.tools.selected': '{0} selected',
+  'mcp.tools.tip': 'Open a picker from this left panel to list discovered tools from all configured MCP servers and choose which ones are enabled for agent runs. Empty selection means all discovered tools are enabled.',
+
   // Background Explorer group
   'bg.group': 'Background Explorer',
   'bg.idleAnalyser': 'Idle-time codebase analyser',
@@ -185,6 +198,19 @@ const ZH: Dict = {
   'web.braveTest.tip': '发送一次小的 Brave Search 请求，验证 API Key 和代理设置是否可用。',
   'web.configured': '已配置',
   'web.notConfigured': '未配置',
+
+  // MCP group
+  'mcp.group': 'MCP 配置',
+  'mcp.configured': '已启用 {0} 个',
+  'mcp.notConfigured': '未配置',
+  'mcp.servers': 'MCP 服务器…',
+  'mcp.servers.desc': '已配置 {0} 个',
+  'mcp.servers.empty': '点击配置',
+  'mcp.servers.tip': '配置 burstcode.mcp.servers。stdio 服务使用 command/args/env/cwd；远程服务使用 url/headers。',
+  'mcp.tools': '启用的 MCP 工具…',
+  'mcp.tools.all': '使用全部发现的工具',
+  'mcp.tools.selected': '已指定 {0} 个',
+  'mcp.tools.tip': '从左侧面板打开选择器，列出所有已配置 MCP 服务器发现到的工具，并选择哪些工具允许在 agent 运行中使用。未指定时表示启用全部发现的工具。',
 
   // Background Explorer group
   'bg.group': '后台探索器',

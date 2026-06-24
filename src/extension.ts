@@ -23,6 +23,7 @@ import {
 import { WorkspaceIndex } from './context/WorkspaceIndex';
 import { BackgroundExplorer, ExplorerStatus } from './background/BackgroundExplorer';
 import { t, UI_LANGUAGE_CONFIG_KEY } from './util/i18n';
+import { listMcpToolInventory, readMcpEnabledToolNames } from './agent/tools/mcp';
 import * as path from 'path';
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -202,6 +203,53 @@ export function activate(context: vscode.ExtensionContext): void {
         } else if (action === 'Copy Details') {
           await vscode.env.clipboard.writeText(message);
         }
+      }
+    }),
+    vscode.commands.registerCommand('burstcode.mcp.selectTools', async () => {
+      const logger = new Logger();
+      try {
+        const inventory = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'BurstCode: loading MCP tools…' },
+          () => listMcpToolInventory(logger)
+        );
+        const realTools = inventory.filter((tool) => tool.exposedName);
+        if (realTools.length === 0) {
+          vscode.window.showInformationMessage('BurstCode: no MCP tools discovered. Configure MCP servers first.');
+          return;
+        }
+        const configured = readMcpEnabledToolNames();
+        const current = configured === undefined ? undefined : new Set(configured);
+        type Item = vscode.QuickPickItem & { id: string };
+        const items: Item[] = realTools.map((tool) => {
+          const id = `${tool.server}.${tool.name}`;
+          return {
+            label: tool.name,
+            description: tool.server,
+            detail: tool.description,
+            picked: current === undefined ? true : current.has(id) || current.has(tool.name) || current.has(tool.exposedName),
+            id
+          };
+        });
+        const picked = await vscode.window.showQuickPick(items, {
+          title: 'Select enabled MCP tools',
+          placeHolder: 'Unchecked tools will be hidden from agent runs. Select all to use every discovered MCP tool.',
+          canPickMany: true
+        });
+        if (!picked) return;
+        const selected = picked.map((item) => item.id).sort();
+        const value = selected.length === realTools.length ? undefined : selected;
+        const rootCfg = vscode.workspace.getConfiguration();
+        const inspected = rootCfg.inspect<string[]>('burstcode.mcp.enabledTools');
+        let target: vscode.ConfigurationTarget = vscode.ConfigurationTarget.Global;
+        if (inspected?.workspaceFolderValue !== undefined) {
+          target = vscode.ConfigurationTarget.WorkspaceFolder;
+        } else if (inspected?.workspaceValue !== undefined) {
+          target = vscode.ConfigurationTarget.Workspace;
+        }
+        await rootCfg.update('burstcode.mcp.enabledTools', value, target);
+        vscode.window.showInformationMessage(value ? `BurstCode: enabled ${selected.length} MCP tool(s).` : 'BurstCode: all MCP tools enabled.');
+      } finally {
+        logger.dispose();
       }
     }),
     vscode.commands.registerCommand('burstcode.selectModel', async () => {

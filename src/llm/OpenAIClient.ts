@@ -506,11 +506,23 @@ class ThinkSplitter {
     const out: StreamChunk[] = [];
     while (true) {
       if (this.mode === 'outside') {
-        const idx = this.buf.indexOf(ThinkSplitter.OPEN);
-        if (idx >= 0) {
-          const before = this.buf.slice(0, idx);
+        const openIdx = this.buf.indexOf(ThinkSplitter.OPEN);
+        const closeIdx = this.buf.indexOf(ThinkSplitter.CLOSE);
+        if (closeIdx >= 0 && (openIdx < 0 || closeIdx < openIdx)) {
+          // Some OpenAI-compatible thinking gateways occasionally stream the
+          // closing tag in `content` without the matching opening tag (often
+          // after a retry/resume). Treat the prefix as hidden reasoning and
+          // discard the stray marker so `</think>` never leaks into the visible
+          // answer or persistent assistant content.
+          const before = this.buf.slice(0, closeIdx);
+          if (before) out.push({ reasoningDelta: before });
+          this.buf = this.buf.slice(closeIdx + ThinkSplitter.CLOSE.length);
+          continue;
+        }
+        if (openIdx >= 0) {
+          const before = this.buf.slice(0, openIdx);
           if (before) out.push({ contentDelta: before });
-          this.buf = this.buf.slice(idx + ThinkSplitter.OPEN.length);
+          this.buf = this.buf.slice(openIdx + ThinkSplitter.OPEN.length);
           this.mode = 'inside';
           continue;
         }
@@ -558,12 +570,13 @@ class ThinkSplitter {
  * response. We backfill an empty string when the field is missing so the
  * request always validates while preserving any captured chain-of-thought.
  */
-function normalizeReasoningContent(messages: ChatMessage[]): ChatMessage[] {
-  // Only backfill reasoning_content when the session has actually engaged
-  // thinking mode at least once. Unconditionally adding the field to every
-  // assistant message can trigger "failed to marshal request body to JSON"
-  // errors in Go-based API proxies that don't expect the extra field.
-  const hasThinking = messages.some((m) => {
+function normalizeReasoningContent(messages: ChatMessage[], opts: { requireThinkingSeen?: boolean } = {}): ChatMessage[] {
+  // Most providers only want reasoning_content backfilled after the session has
+  // actually engaged thinking mode at least once. Unconditionally adding the
+  // field to every assistant message can trigger "failed to marshal request body
+  // to JSON" errors in Go-based API proxies that don't expect the extra field.
+  const requireThinkingSeen = opts.requireThinkingSeen ?? true;
+  const hasThinking = !requireThinkingSeen || messages.some((m) => {
     if (m.role !== 'assistant') return false;
     const rc = (m as unknown as Record<string, unknown>).reasoning_content;
     return typeof rc === 'string' && rc.length > 0;
@@ -587,24 +600,33 @@ function normalizeReasoningContent(messages: ChatMessage[]): ChatMessage[] {
  *             input messages, the API will return a 400 error"
  *      → For these we STRIP `reasoning_content` from every assistant message.
  *
- *   2. The newer thinking models (DeepSeek V3.1 / V3.2 thinking) DO support
- *      function calling and require the OPPOSITE for tool-call turns: an
- *      assistant message that carries `tool_calls` MUST round-trip its
- *      `reasoning_content`, otherwise:
- *        400 "The `reasoning_content` in the thinking mode must be passed back
- *             to the API."
- *      A turn that only emitted a tool call (no visible chain-of-thought) is
- *      saved by AgentLoop WITHOUT the field, so on the next request it is
- *      missing and trips this error. → For tool-call assistant messages we
- *      backfill `reasoning_content: ''` when absent; for plain assistant
- *      answers (no tool_calls) we strip it, matching DeepSeek's documented
- *      "previous-round CoT is not concatenated into the context" rule.
+ *   2. Newer thinking models differ by generation/provider:
+ *      - V3.x thinking models support function calling and require
+ *        `reasoning_content` to round-trip on assistant tool-call turns; for
+ *        plain assistant answers we strip it, matching DeepSeek's documented
+ *        "previous-round CoT is not concatenated into the context" rule.
+ *      - V4/Flash thinking providers can validate the whole assistant history
+ *        once thinking mode is engaged and reject any assistant message without
+ *        the field:
+ *          400 "The `reasoning_content` in the thinking mode must be passed
+ *               back to the API."
+ *        → For V4/Flash models, use the generic thinking-mode backfill rule so
+ *        every assistant message has `reasoning_content` when the session has
+ *        ever captured non-empty reasoning.
  */
 function normalizeDeepSeekReasoning(messages: ChatMessage[], model: string): ChatMessage[] {
   const lower = model.toLowerCase();
   // Pure reasoning models (R1 / deepseek-reasoner) cannot accept reasoning_content
   // at all and do not do tool calls — strip the field everywhere.
   const isPureReasoner = lower.includes('reasoner') || lower.includes('-r1') || lower.includes('/r1');
+  if (isPureReasoner) return stripAssistantReasoningContent(messages);
+
+  // DeepSeek V4/Flash thinking endpoints behave like Qwen-thinking validators:
+  // after thinking mode appears in a session, every assistant message must carry
+  // reasoning_content, even when the value is empty.
+  const backfillAllAssistantReasoning = lower.includes('v4') || lower.includes('flash');
+  if (backfillAllAssistantReasoning) return normalizeReasoningContent(messages, { requireThinkingSeen: false });
+
   return messages.map((m) => {
     if (m.role !== 'assistant') return m;
     const am = m as ChatMessage & {
@@ -613,9 +635,9 @@ function normalizeDeepSeekReasoning(messages: ChatMessage[], model: string): Cha
     };
     const hasToolCalls = Array.isArray(am.tool_calls) && am.tool_calls.length > 0;
 
-    if (isPureReasoner || !hasToolCalls) {
-      // Strip reasoning_content: required for R1, and matches DeepSeek's
-      // "CoT not concatenated" rule for plain answer turns on thinking models.
+    if (!hasToolCalls) {
+      // Strip reasoning_content to match DeepSeek's "CoT not concatenated" rule
+      // for plain answer turns on V3.x thinking models.
       if (typeof am.reasoning_content === 'undefined') return m;
       const { reasoning_content: _rc, ...rest } = am;
       return rest as ChatMessage;
@@ -898,7 +920,13 @@ export class OpenAIClient {
         if (delta?.content) {
           for (const c of splitter.feed(delta.content)) yield c;
         }
-        const reasoning = (delta as typeof delta & { reasoning_content?: string }).reasoning_content;
+        // Capture the chain-of-thought from whichever field the backend uses:
+        // DeepSeek/Qwen-native use `reasoning_content`; OpenRouter and some
+        // DeepSeek proxies stream it as `reasoning`. Losing it here means a
+        // DeepSeek tool-call turn gets saved without its reasoning and the next
+        // request 400s ("reasoning_content ... must be passed back").
+        const d = delta as typeof delta & { reasoning_content?: string; reasoning?: string };
+        const reasoning = d.reasoning_content ?? d.reasoning;
         if (reasoning) {
           yield { reasoningDelta: reasoning };
         }

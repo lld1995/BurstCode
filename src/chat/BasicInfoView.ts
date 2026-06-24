@@ -70,6 +70,7 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
         e.affectsConfiguration('burstcode.shell') ||
         e.affectsConfiguration('burstcode.ui') ||
         e.affectsConfiguration('burstcode.web') ||
+        e.affectsConfiguration('burstcode.mcp') ||
         e.affectsConfiguration('http.proxy')
       ) {
         this.refresh();
@@ -102,6 +103,7 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     const bg = vscode.workspace.getConfiguration('burstcode.background');
     const shell = vscode.workspace.getConfiguration('burstcode.shell');
     const web = vscode.workspace.getConfiguration('burstcode.web');
+    const mcp = vscode.workspace.getConfiguration('burstcode.mcp');
     const ui = vscode.workspace.getConfiguration('burstcode.ui');
 
     const bgEnabled = bg.get<boolean>('enabled') ?? false;
@@ -114,6 +116,10 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     const askUserSound = ui.get<boolean>('askUserSound') ?? true;
     const proxyUrl = (web.get<string>('proxyUrl') ?? '').trim();
     const braveKey = (web.get<string>('braveApiKey') ?? '').trim();
+    const mcpServers = (mcp.get<unknown[]>('servers') ?? []).filter((s) => !!s && typeof s === 'object') as Array<Record<string, unknown>>;
+    const mcpEnabledCount = mcpServers.filter((s) => s.disabled !== true).length;
+    const mcpSelectedTools = mcp.get<string[]>('enabledTools') ?? [];
+    const mcpSelectedToolCount = mcpSelectedTools.filter((v) => typeof v === 'string' && v.trim()).length;
     const proxyDesc = proxyUrl ? t('web.proxy.configured') : t('web.proxy.fallback');
 
     const status = this.backgroundStatus;
@@ -237,6 +243,34 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
         command: {
           command: 'burstcode.web.testBrave',
           title: 'Test Brave Search'
+        }
+      })
+    ];
+
+    // ---------- MCP ----------
+    const mcpGroup = new BasicNode('group', t('mcp.group'), {
+      description: mcpEnabledCount > 0 ? t('mcp.configured', mcpEnabledCount) : t('mcp.notConfigured'),
+      icon: 'plug',
+      expanded: true
+    });
+    mcpGroup.children = [
+      new BasicNode('leaf', t('mcp.servers'), {
+        description: mcpServers.length > 0 ? t('mcp.servers.desc', mcpServers.length) : t('mcp.servers.empty'),
+        icon: mcpServers.length > 0 ? 'server-process' : 'warning',
+        tooltip: t('mcp.servers.tip'),
+        command: {
+          command: 'workbench.action.openSettings',
+          title: 'Configure MCP Servers',
+          arguments: ['burstcode.mcp.servers']
+        }
+      }),
+      new BasicNode('leaf', t('mcp.tools'), {
+        description: mcpSelectedToolCount > 0 ? t('mcp.tools.selected', mcpSelectedToolCount) : t('mcp.tools.all'),
+        icon: 'tools',
+        tooltip: t('mcp.tools.tip'),
+        command: {
+          command: 'burstcode.mcp.selectTools',
+          title: 'Select Enabled MCP Tools'
         }
       })
     ];
@@ -374,7 +408,7 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
       icon: 'info'
     });
 
-    return [modelsGroup, permissions, webGroup, bgGroup, actions, uiGroup, advanced, about];
+    return [modelsGroup, permissions, webGroup, mcpGroup, bgGroup, actions, uiGroup, advanced, about];
   }
 
   private toggleNode(

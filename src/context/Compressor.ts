@@ -103,13 +103,25 @@ export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig)
         tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
       };
       const am = m as Mut;
+      const hasToolCalls = Array.isArray(am.tool_calls) && am.tool_calls.length > 0;
       let mutated: Mut | null = null;
-      if (typeof am.reasoning_content === 'string' && am.reasoning_content.length > 0) {
+      // Strip replayed chain-of-thought ONLY on plain-answer turns. Assistant
+      // messages that carry tool_calls must KEEP their reasoning_content: the
+      // DeepSeek thinking models require the chain-of-thought to be passed back
+      // on every tool-call turn that remains in history, or the next request
+      // 400s with "The `reasoning_content` in the thinking mode must be passed
+      // back to the API." (DeepSeek ignores reasoning on non-tool turns, so
+      // dropping it there is both safe and the documented behaviour.) Without
+      // this guard a tool-call turn loses its reasoning the moment it ages past
+      // zone 0 — e.g. after a second user turn or any synthetic user message the
+      // agent loop injects mid-run (stuck-detector, premature-stop, …).
+      if (!hasToolCalls && typeof am.reasoning_content === 'string' && am.reasoning_content.length > 0) {
         mutated = { ...am, reasoning_content: '' };
       }
-      if (am.tool_calls && am.tool_calls.length > 0) {
+      if (hasToolCalls && am.tool_calls) {
+        const toolCalls = am.tool_calls;
         const argsCap = ZONE_CAPS[zone];
-        const trimmed = am.tool_calls.map((tc) => {
+        const trimmed = toolCalls.map((tc) => {
           const argStr = typeof tc.function.arguments === 'string' ? tc.function.arguments : '';
           if (argStr.length <= argsCap) return tc;
           // Keep arguments as valid JSON to satisfy strict server validators,
@@ -123,7 +135,7 @@ export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig)
           });
           return { ...tc, function: { ...tc.function, arguments: placeholder } };
         });
-        const anyChanged = trimmed.some((tc, idx) => tc !== am.tool_calls![idx]);
+        const anyChanged = trimmed.some((tc, idx) => tc !== toolCalls[idx]);
         if (anyChanged) {
           mutated = { ...(mutated ?? am), tool_calls: trimmed };
         }

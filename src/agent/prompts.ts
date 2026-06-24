@@ -415,6 +415,14 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): string {
 
   if (input.workspaceRoot) {
     volatile.push(`<workspace_root>${input.workspaceRoot}</workspace_root>`);
+    volatile.push(
+      `<burstcode_config_locations>\n` +
+      `IMPORTANT: If the user asks where BurstCode's rules/skills/skill directory is, answer with these fixed locations; do NOT infer a different answer from similarly-named project folders in the workspace outline.\n` +
+      `- BurstCode rules file: .burstcode/rules.md\n` +
+      `- BurstCode skills directory: .burstcode/skills/\n` +
+      `Rules/skills contents are injected below only when enabled and available; if content is not injected and you need it, read the paths above with file tools.\n` +
+      `</burstcode_config_locations>`
+    );
   }
 
   if (input.globalRules && input.globalRules.trim().length > 0) {

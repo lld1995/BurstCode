@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.111",
+  "version": "0.1.112",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -296,16 +296,84 @@
           "order": 34,
           "description": "Image profile · skip TLS certificate verification for the image baseURL."
         },
+        "burstcode.mcp.servers": {
+          "type": "array",
+          "order": 39,
+          "default": [],
+          "markdownDescription": "**MCP** · Model Context Protocol servers exposed as BurstCode tools. Multiple servers are connected and used together. Each entry requires `name` and either `command` (stdio) or `url` (HTTP/SSE). The standard `{ \"mcpServers\": { \"name\": { ... } } }` object form (as used by Claude Desktop / Cursor) is also accepted — the key becomes the server name. Configure which discovered MCP tools are enabled from the BurstCode left panel.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Short server name used as the MCP tool prefix."
+              },
+              "command": {
+                "type": "string",
+                "description": "Command for a stdio MCP server, e.g. npx, node, python."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "description": "Arguments passed to command. Supports ${workspaceFolder}."
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "default": {},
+                "description": "Extra environment variables for stdio MCP servers. Values support ${workspaceFolder}."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory for stdio MCP servers. Supports ${workspaceFolder}."
+              },
+              "url": {
+                "type": "string",
+                "description": "URL for a remote HTTP/SSE MCP server."
+              },
+              "headers": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "default": {},
+                "description": "HTTP headers for remote MCP servers."
+              },
+              "disabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Disable this MCP server without deleting its config."
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        },
+        "burstcode.mcp.enabledTools": {
+          "type": "array",
+          "order": 40,
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "markdownDescription": "**MCP** · Enabled MCP tool IDs selected from the BurstCode left panel. Empty means all discovered tools from configured MCP servers are enabled. Prefer using the left-panel **MCP 配置 → 启用的 MCP 工具…** picker instead of editing this manually."
+        },
         "burstcode.web.proxyUrl": {
           "type": "string",
           "default": "",
-          "order": 40,
+          "order": 41,
           "description": "Web tools · HTTP/HTTPS proxy URL used by web_search and read_webpage. Leave empty to fall back to VS Code http.proxy, then HTTPS_PROXY/HTTP_PROXY."
         },
         "burstcode.web.braveApiKey": {
           "type": "string",
           "default": "",
-          "order": 41,
+          "order": 42,
           "markdownDescription": "**Web tools** · Brave Search API key. When configured, `web_search` tries Brave before DuckDuckGo/Bing."
         },
         "burstcode.ui.language": {
@@ -581,6 +649,7 @@
     "test": "npm run compile-tests && node --test out/test/runTest.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
     "diff": "^5.2.0",
     "gpt-tokenizer": "^2.5.1",
     "openai": "^4.71.0"
