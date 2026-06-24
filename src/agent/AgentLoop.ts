@@ -984,11 +984,13 @@ export class AgentLoop {
         preAnnounced.clear();
         argDeltaBuffers.clear();
         finishReason = undefined;
-        // Overall timeout for the LLM stream: if chunks stop arriving for
-        // 120s, treat it as a stream error and either retry or surface it.
+        // Idle timeout for the LLM stream: if NO chunks arrive for
+        // 300s, treat it as a stream error and either retry or surface it.
+        // Each received chunk resets the timer (true idle timeout), so a
+        // slow model that keeps outputting will never be killed prematurely.
         // This prevents the for-await from hanging forever on a half-open
-        // connection or a slow LLM.
-        const STREAM_TIMEOUT_MS = 120_000;
+        // connection or a slow/silent LLM.
+        const STREAM_TIMEOUT_MS = 300_000;
         // Sentinel distinguishes a real iterator end from a timeout expiry.
         // Using { done: true } for both would silently treat timeout as
         // normal completion (the timeout throw below would be dead code).
@@ -1011,16 +1013,37 @@ export class AgentLoop {
           cancellation
         )[Symbol.asyncIterator]();
         let streamConsumed = false;
+        // Idle-timeout helpers: one shared timer is reset on every received
+        // chunk so the timeout only fires when the stream goes silent.
+        let idleTimerId: ReturnType<typeof setTimeout> | undefined;
+        let idleResolve: ((v: typeof STREAM_TIMEOUT_SENTINEL) => void) | undefined;
+        const resetIdleTimer = () => {
+          if (idleTimerId !== undefined) clearTimeout(idleTimerId);
+          idleTimerId = setTimeout(() => {
+            idleTimerId = undefined;
+            idleResolve?.(STREAM_TIMEOUT_SENTINEL);
+          }, STREAM_TIMEOUT_MS);
+        };
+        const clearIdleTimer = () => {
+          if (idleTimerId !== undefined) { clearTimeout(idleTimerId); idleTimerId = undefined; }
+          idleResolve = undefined;
+        };
         try {
           let streamDone = false;
           while (!streamDone) {
             if (cancellation.isCancellationRequested) break;
+            // Build a fresh idle-timeout promise for this iteration, wiring
+            // up idleResolve so resetIdleTimer() can trigger it if needed.
+            const idlePromise = new Promise<typeof STREAM_TIMEOUT_SENTINEL>((resolve) => {
+              idleResolve = resolve;
+            });
+            resetIdleTimer();
             const result = await Promise.race([
               streamIter.next(),
-              new Promise<typeof STREAM_TIMEOUT_SENTINEL>((resolve) =>
-                setTimeout(() => resolve(STREAM_TIMEOUT_SENTINEL), STREAM_TIMEOUT_MS)
-              )
+              idlePromise
             ]);
+            // A chunk arrived — cancel the pending idle timer immediately.
+            clearIdleTimer();
             if (result === STREAM_TIMEOUT_SENTINEL) {
               throw new Error(`LLM stream timed out after ${STREAM_TIMEOUT_MS}ms`);
             }
@@ -1310,6 +1333,10 @@ export class AgentLoop {
             return;
           }
         } finally {
+          // Cancel the idle-timeout timer on any exit path (normal, throw,
+          // cancellation) so it cannot fire and reject a stale promise after
+          // the next resume has already begun a fresh iteration.
+          clearIdleTimer();
           // Clean up the inner generator on any non-natural exit (timeout
           // throw, mid-stream cancellation break, thrown SDK error). This
           // propagates through `streamChat`'s `for await`, which fires the
