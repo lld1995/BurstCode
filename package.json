@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.113",
+  "version": "0.1.115",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -468,18 +468,23 @@
         },
         "burstcode.agent.subagentMaxIterations": {
           "type": "number",
-          "default": 64,
-          "description": "Maximum tool-calling iterations per launched sub-agent."
+          "default": 4,
+          "description": "Maximum tool-calling iterations per launched sub-agent. Keep this low because sub-agents are summary workers, not full foreground agents."
         },
         "burstcode.agent.maxConcurrentSubagents": {
           "type": "number",
-          "default": 4,
+          "default": 2,
           "description": "Maximum number of sub-agents that may run concurrently inside one foreground agent request."
         },
         "burstcode.agent.maxSubagentTasksPerCall": {
           "type": "number",
-          "default": 8,
+          "default": 4,
           "description": "Maximum number of tasks accepted by one launch_subagent tool call."
+        },
+        "burstcode.agent.subagentTaskTimeoutMs": {
+          "type": "number",
+          "default": 180000,
+          "description": "Hard timeout in milliseconds for each launched sub-agent task before it is cancelled and returned as partial/timeout."
         },
         "burstcode.agent.enableWriteSubagents": {
           "type": "boolean",

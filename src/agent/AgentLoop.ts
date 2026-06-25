@@ -77,9 +77,9 @@ function buildContextStatusNote(tier: number, used: number, max: number): string
     return (
       head +
       ' CRITICAL — automatic compression will trigger soon and may drop detail. ' +
-      'Do NOT start new large reads. Finish or narrow the current step. If you still need to read, ' +
-      'delegate it to launch_subagent (it reads in its own isolated window; only a summary returns here). ' +
-      'If the remaining work is a distinct sub-task, call save_topic_doc then compress_context to reclaim budget.'
+      'Do NOT start new large reads. Finish or narrow the current step. For one-off context pressure, ' +
+      'let automatic compression run or use compress_context only when it is a genuine unrelated topic switch. ' +
+      'Use launch_subagent only for independent broad exploration where a summary is sufficient; do not delegate merely because context is high.'
     );
   }
   if (tier >= 2) {
@@ -87,8 +87,8 @@ function buildContextStatusNote(tier: number, used: number, max: number): string
       head +
       ' Budget is tightening — scale down what you pull into context: ' +
       '(1) read NARROW line ranges via read_file (startLine/endLine) instead of whole files; ' +
-      '(2) push broad exploration to launch_subagent so raw file content stays out of this window; ' +
-      '(3) if the current topic is wrapping up, save_topic_doc then compress_context.'
+      '(2) let stale context be compressed/truncated when pressure is the only issue; ' +
+      '(3) use launch_subagent only for independent broad exploration where you only need a concise summary, not for ordinary pre-edit reads.'
     );
   }
   return (

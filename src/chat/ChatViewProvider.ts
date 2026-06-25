@@ -1848,6 +1848,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const lspTools = buildLspTools(bridge, this.depGuard);
     const editTools = buildEditTools(this.applier, askUser, session.id, messageIndex);
     const mcpTools = opts.useMcp === false ? [] : await buildMcpTools(this.logger);
+    const subagentTaskTimeoutMs = Math.max(30_000, agentCfg.get<number>('subagentTaskTimeoutMs') ?? 180_000);
     const subagentTool = buildSubagentTool({
       clientFactory: () => new OpenAIClient(llmCfg, this.logger),
       logger: this.logger,
@@ -1856,9 +1857,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       writeTools: editTools.filter((t) => t.name === 'propose_edit'),
       systemPrompt,
       contextWindow: llmCfg.contextWindow,
-      maxIterations: agentCfg.get<number>('subagentMaxIterations') ?? 8,
-      maxConcurrent: Math.max(1, agentCfg.get<number>('maxConcurrentSubagents') ?? 4),
-      maxTasksPerCall: Math.max(1, agentCfg.get<number>('maxSubagentTasksPerCall') ?? 8),
+      maxIterations: Math.max(1, agentCfg.get<number>('subagentMaxIterations') ?? 4),
+      maxConcurrent: Math.max(1, agentCfg.get<number>('maxConcurrentSubagents') ?? 2),
+      maxTasksPerCall: Math.max(1, agentCfg.get<number>('maxSubagentTasksPerCall') ?? 4),
+      taskTimeoutMs: subagentTaskTimeoutMs,
       enableWrites: agentCfg.get<boolean>('enableWriteSubagents') ?? true
     });
 
@@ -2366,7 +2368,7 @@ setTimeout(() => {
   /* Note: no scroll-behavior:smooth so that auto-follow detection (which
      compares scrollTop against scrollHeight on every scroll event) is not
      fooled by intermediate frames of a smooth-scroll animation. */
-  #log { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; overflow-anchor: none; padding: 16px 14px 60px; }
+  #log { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; overflow-anchor: none; padding: 16px 14px 16px; }
   #log .turn { margin-bottom: 18px; max-width: 100%; }
   #log .turn:last-child { margin-bottom: 8px; }
 
@@ -2383,9 +2385,9 @@ setTimeout(() => {
   .msg.assistant { padding: 2px 4px 2px 26px; line-height: 1.6; word-wrap: break-word; position: relative; }
   .msg.assistant::before { content: '⏺'; color: var(--vscode-charts-green); position: absolute; left: 6px; top: 2px; opacity: 0.85; }
   /* Bottom action bar — only revealed on hover. Modeled after ChatGPT/Claude. */
-  .msg.assistant .msg-actions { display: flex; align-items: center; gap: 2px; margin-top: 6px; opacity: 0; transform: translateY(-2px); transition: opacity 0.18s ease, transform 0.18s ease; pointer-events: none; }
+  .msg.assistant .msg-actions { display: flex; align-items: center; gap: 2px; margin-top: 0; max-height: 0; overflow: hidden; opacity: 0; transform: translateY(-2px); transition: opacity 0.18s ease, transform 0.18s ease, max-height 0.18s ease, margin-top 0.18s ease; pointer-events: none; }
   .msg.assistant:hover .msg-actions,
-  .msg.assistant:focus-within .msg-actions { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  .msg.assistant:focus-within .msg-actions { margin-top: 6px; max-height: 28px; opacity: 1; transform: translateY(0); pointer-events: auto; }
   .msg.assistant .msg-actions .act { display: inline-flex; align-items: center; gap: 5px; background: transparent; border: 1px solid transparent; color: var(--vscode-descriptionForeground); cursor: pointer; padding: 3px 8px; border-radius: 6px; font-size: 0.78em; font-family: inherit; line-height: 1; transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease; }
   .msg.assistant .msg-actions .act:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
   .msg.assistant .msg-actions .act:active { transform: scale(0.97); }
@@ -5919,26 +5921,31 @@ const modelsState = {
   fetched: { loading: false, models: null, error: null, fetchedAt: 0 }
 };
 
+function positionModelPicker() {
+  const br = modelPickerBtn.getBoundingClientRect();
+  const gap = 4;
+  const left = Math.max(4, br.left);
+  const maxRight = window.innerWidth - 4;
+  const width = Math.min(320, Math.max(220, maxRight - left));
+
+  // Apply width before measuring: the popover has max-height:60vh, so the
+  // rendered height can be much smaller than scrollHeight when the model list is
+  // long. Position from the actual rendered height to avoid a large visual gap.
+  modelPicker.style.left = left + 'px';
+  modelPicker.style.width = width + 'px';
+
+  const renderedHeight = modelPicker.getBoundingClientRect().height;
+  let top = br.top - renderedHeight - gap;
+  if (top < 4) top = br.bottom + gap; // flip below if not enough room above
+  modelPicker.style.top = top + 'px';
+}
+
 function setModelPickerOpen(open) {
   if (open) {
     renderModelPicker();
     modelPicker.classList.add('open');
     modelPickerBtn.setAttribute('aria-expanded', 'true');
-    // Position the popover above the button using fixed coordinates.
-    const br = modelPickerBtn.getBoundingClientRect();
-    // Estimate height (will relayout after display:block, so use scrollHeight)
-    requestAnimationFrame(() => {
-      const ph = modelPicker.scrollHeight;
-      const gap = 4;
-      let top = br.top - ph - gap;
-      if (top < 4) top = br.bottom + gap; // flip below if not enough room
-      const left = Math.max(4, br.left);
-      const maxRight = window.innerWidth - 4;
-      const width = Math.min(320, maxRight - left);
-      modelPicker.style.top = top + 'px';
-      modelPicker.style.left = left + 'px';
-      modelPicker.style.width = width + 'px';
-    });
+    requestAnimationFrame(positionModelPicker);
   } else {
     modelPicker.classList.remove('open');
     modelPickerBtn.setAttribute('aria-expanded', 'false');

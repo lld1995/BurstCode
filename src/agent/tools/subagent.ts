@@ -26,6 +26,7 @@ export interface SubagentToolOptions {
   maxIterations: number;
   maxConcurrent: number;
   maxTasksPerCall: number;
+  taskTimeoutMs: number;
   enableWrites: boolean;
 }
 
@@ -85,7 +86,7 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
       function: {
         name: 'launch_subagent',
         description:
-          'Run focused sub-agents concurrently for independent fan-out tasks. Write tasks require mode="write", independent=true, allowedFiles. See BATCH_PROTOCOL for when to prefer this over inline tool batching.\n\nWHEN TO USE — prefer launch_subagent when EITHER: (1) the context window is already large and you need more heavy file reads / grep sweeps (offload to avoid bloat), OR (2) the task is fully independent and isolated — exploring an unfamiliar subsystem or module where you only need a summary back, with no immediate propose_edit depending on the raw file content. For everything else (context still small, or you need exact file content for an edit), use collect_context / read_file directly — they are faster and cheaper.',
+          'Run focused sub-agents concurrently for independent fan-out tasks. Write tasks require mode="write", independent=true, allowedFiles. See BATCH_PROTOCOL for when to prefer this over inline tool batching.\n\nWHEN TO USE — use launch_subagent only when the work is both independent and broad enough that returning a concise summary is cheaper than injecting raw file content here. Do NOT use it merely because context is high: for ordinary context pressure, narrow reads, compress/truncate stale context, or continue with targeted local tools. Sub-agents have their own LLM loop and are slower than direct tools for small lookups or pre-edit reads.',
         parameters: {
           type: 'object',
           properties: {
@@ -212,17 +213,21 @@ async function runTask(
     { role: 'system', content: buildTaskSystemPrompt(task, options.systemPrompt) },
     { role: 'user', content: buildTaskUserPrompt(task) }
   ];
+  const taskTokenSource = new vscode.CancellationTokenSource();
+  const parentSub = cancellation.onCancellationRequested(() => taskTokenSource.cancel());
+  const timeoutMs = Math.max(30_000, Math.floor(options.taskTimeoutMs || 0));
+  const timeout = setTimeout(() => taskTokenSource.cancel(), timeoutMs);
   const agent = new AgentLoop(options.clientFactory(), tools, options.applier, options.logger, {
     contextWindow: options.contextWindow,
     maxIterations: options.maxIterations,
     requireConfirmBeforeEdit: true,
-    autoContinueOnLength: true,
-    maxAutoContinues: 1,
+    autoContinueOnLength: false,
+    maxAutoContinues: 0,
     autoResumeOnStreamError: true,
     maxAutoResumes: 1,
-    maxStuckRepeats: 2,
-    autoContinueOnPrematureStop: true,
-    maxPrematureStopContinues: 2,
+    maxStuckRepeats: 1,
+    autoContinueOnPrematureStop: false,
+    maxPrematureStopContinues: 0,
     systemPrompt: buildTaskSystemPrompt(task, options.systemPrompt)
   } satisfies AgentOptions);
 
@@ -234,36 +239,46 @@ async function runTask(
   let toolCalls = 0;
   let errors = 0;
   let doneReason = 'unknown';
-  for await (const event of agent.run(messages, cancellation)) {
-    if (event.type === 'assistant-message') {
-      const payload = event.payload as { text?: unknown } | undefined;
-      const text = String(payload?.text ?? '').trim();
-      if (text) assistantTurns.push(text);
-    } else if (event.type === 'tool-call-start') {
-      const payload = event.payload as { name?: unknown } | undefined;
-      onProgress?.(`  → ${String(payload?.name ?? 'tool')}`);
-    } else if (event.type === 'tool-call-end') {
-      toolCalls++;
-      const payload = event.payload as { name?: unknown; isError?: unknown; result?: unknown } | undefined;
-      const toolName = String(payload?.name ?? 'tool');
-      toolCallNames.push(toolName);
-      if (payload?.isError) {
+  try {
+    for await (const event of agent.run(messages, taskTokenSource.token)) {
+      if (event.type === 'assistant-message') {
+        const payload = event.payload as { text?: unknown } | undefined;
+        const text = String(payload?.text ?? '').trim();
+        if (text) assistantTurns.push(text);
+      } else if (event.type === 'tool-call-start') {
+        const payload = event.payload as { name?: unknown } | undefined;
+        onProgress?.(`  → ${String(payload?.name ?? 'tool')}`);
+      } else if (event.type === 'tool-call-end') {
+        toolCalls++;
+        const payload = event.payload as { name?: unknown; isError?: unknown; result?: unknown } | undefined;
+        const toolName = String(payload?.name ?? 'tool');
+        toolCallNames.push(toolName);
+        if (payload?.isError) {
+          errors++;
+          const errContent = String(payload?.result ?? '').slice(0, 400).trim();
+          if (errContent) toolErrors.push(`[${toolName}] ${errContent}`);
+        }
+        onProgress?.(`  ✓ ${toolName}${payload?.isError ? ' (error)' : ''}`);
+      } else if (event.type === 'tool-progress') {
+        const payload = event.payload as { message?: unknown } | undefined;
+        onProgress?.(String(payload?.message ?? ''));
+      } else if (event.type === 'done') {
+        const payload = event.payload as { reason?: unknown } | undefined;
+        doneReason = String(payload?.reason ?? doneReason);
+      } else if (event.type === 'error') {
         errors++;
-        const errContent = String(payload?.result ?? '').slice(0, 400).trim();
-        if (errContent) toolErrors.push(`[${toolName}] ${errContent}`);
+        const errText = String(event.payload ?? '').trim();
+        if (errText) assistantTurns.push(`[error] ${errText}`);
       }
-      onProgress?.(`  ✓ ${toolName}${payload?.isError ? ' (error)' : ''}`);
-    } else if (event.type === 'tool-progress') {
-      const payload = event.payload as { message?: unknown } | undefined;
-      onProgress?.(String(payload?.message ?? ''));
-    } else if (event.type === 'done') {
-      const payload = event.payload as { reason?: unknown } | undefined;
-      doneReason = String(payload?.reason ?? doneReason);
-    } else if (event.type === 'error') {
-      errors++;
-      const errText = String(event.payload ?? '').trim();
-      if (errText) assistantTurns.push(`[error] ${errText}`);
     }
+  } finally {
+    clearTimeout(timeout);
+    parentSub.dispose();
+    taskTokenSource.dispose();
+  }
+  if (!cancellation.isCancellationRequested && doneReason === 'cancelled') {
+    doneReason = `timeout_${timeoutMs}ms`;
+    errors++;
   }
 
   const isPartial = doneReason === 'max_iterations' || doneReason === 'stuck';

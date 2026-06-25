@@ -73,13 +73,14 @@ overflow. Follow these rules:
     and cheaper than spawning a sub-agent. Read files inline unless you have a
     specific reason not to.
 
-  SWITCH TO launch_subagent when EITHER of these is true:
-    1. The context window is already substantially occupied and you still need
-       heavy file reading / broad grep sweeps — offload to keep THIS context lean.
-    2. The task is fully independent: you only need a summary back (no precise
-       file content needed for an immediate propose_edit), and the work involves
-       exploring an isolated area of the codebase (a subsystem, an unfamiliar
-       module, a cross-cutting grep sweep across many files).
+  SWITCH TO launch_subagent only when BOTH are true:
+    1. The task is independent / isolated and does not need precise raw file text
+       for an immediate edit in the parent turn.
+    2. The work would otherwise require broad reading or sweeping many files, and
+       a concise summary is enough to proceed.
+    High context usage alone is NOT a reason to launch a sub-agent. If it is just
+    ordinary context pressure, narrow the read, let auto-compression/truncation do
+    its job, or use compress_context only for a genuine unrelated topic switch.
     The sub-agent reads in its own isolated context window; only its concise
     summary returns here.
 
@@ -87,6 +88,9 @@ overflow. Follow these rules:
     1. Reading any number of files when the context window is still small.
     2. Reading files for an edit you are about to make.
     3. Quick symbol lookups (hover_info / find_definition / document_symbols).
+    4. Handling ordinary context pressure: prefer narrower reads and automatic
+       compression/truncation of stale context; do NOT spawn a sub-agent merely
+       because the current context is high.
 
   AVOID:
     • Re-reading the same file multiple times across turns without making an edit.
@@ -264,15 +268,16 @@ FIRST MOVE — collect_context (default) OR launch_subagent (large context):
       → Use collect_context or read_file directly. Reading 1–4 files inline is
         cheaper and faster than a sub-agent round-trip. This is the DEFAULT.
 
-  • Large context OR independent isolated exploration:
-      → launch_subagent with a focused objective when EITHER:
-        (a) the context is already substantial (many turns, several reads made)
-            and you need more heavy file reading / grep sweeps, OR
-        (b) the task is fully independent — you only need a summary (not raw
-            file content) to proceed, and it explores an isolated area of the
-            codebase with no immediate propose_edit depending on the raw text.
-        The sub-agent reads in its OWN isolated context window; only its
-        concise summary comes back here.
+  • Independent isolated exploration (not just high context):
+      → launch_subagent with a focused objective only when BOTH are true:
+        (a) the task is independent / isolated and the parent only needs a
+            concise summary, not raw file text for immediate editing; AND
+        (b) solving it directly would require broad reading or grep sweeps across
+            many files.
+        Do NOT use launch_subagent merely because context is high. For ordinary
+        context pressure, narrow reads first and let automatic compression /
+        truncation reclaim stale content; use compress_context only for a genuine
+        unrelated topic switch.
 
   • Targeted pre-edit lookup (you know the exact file, range, about to propose_edit):
       → collect_context or read_file for that ONE specific file/range ONLY.
@@ -336,9 +341,11 @@ Heuristic: before emitting any tool_call, ask yourself "what ELSE do I need
 to know that does NOT depend on this call's result?" — if there are 2+ such
 questions, emit them all in this turn.
 
-For ANY fan-out requiring 2+ file reads for understanding (not immediate editing),
-use launch_subagent — it runs each task in its own isolated context window and
-returns only a concise summary, keeping THIS context window lean.`;
+For broad independent fan-out where you only need summaries, use launch_subagent —
+it runs each task in its own isolated context window and returns only a concise
+summary, keeping THIS context window lean. If you need exact file text for an
+immediate edit, or the only problem is that the current context is getting full,
+do NOT use a sub-agent; read a tight range or rely on compression/truncation instead.`;
 
 const CONTEXT_MANAGEMENT = `CONTEXT MANAGEMENT — two tools to keep sessions lean:
 
