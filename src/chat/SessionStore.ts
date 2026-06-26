@@ -219,7 +219,7 @@ export function buildTranscript(
       // we extracted from <think>...</think> tags in Qwen3 / GLM / Kimi
       // output) as a separate collapsible entry that precedes the answer.
       const reasoning = (m as unknown as { reasoning_content?: unknown }).reasoning_content;
-      if (typeof reasoning === 'string' && reasoning) {
+      if (typeof reasoning === 'string' && reasoning.trim().length > 0) {
         entries.push({ kind: 'reasoning', text: reasoning });
       }
       const text = typeof m.content === 'string' ? m.content : '';

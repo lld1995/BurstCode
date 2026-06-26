@@ -10,6 +10,12 @@ function workspaceRoot(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
 
+function truncateMiddleText(text: string, head: number, tail: number): string {
+  if (text.length <= head + tail) return text;
+  const omitted = text.length - head - tail;
+  return `${text.slice(0, head)}\n... [truncated ${omitted} chars; request a narrower range/search if needed] ...\n${text.slice(-tail)}`;
+}
+
 function resolveUri(target: string): vscode.Uri {
   if (target.startsWith('file:')) return vscode.Uri.parse(target);
   let absPath: string;
@@ -489,7 +495,7 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string): T
       function: {
         name: 'write_file',
         description:
-          'Write (or overwrite) a file on disk immediately — no user review step, no diff UI. Use for agent-generated helper scripts, temp/scratch files, config stubs, and any file the agent needs to create and then immediately execute or read back. NOT for modifying the user\'s existing source files — use propose_edit for those so the user can review the diff. Parent directories are created automatically. Path may be workspace-relative or absolute.',
+          'Write (or overwrite) a file on disk immediately — no user review step, no diff UI. Use for agent-generated helper scripts, temp/scratch files, config stubs, and any file the agent needs to create and then immediately execute or read back. NOT for modifying the user\'s existing source files — use propose_edit for those so the user can review the diff. Parent directories are created automatically. Path may be workspace-relative or absolute. If writing a whole file / large content fails, is truncated, or cannot parse, DO NOT retry the same giant payload; read back the current file and split the write into smaller generated files/chunks or append/repair only the missing tail in follow-up calls.',
         parameters: {
           type: 'object',
           properties: {
@@ -524,7 +530,14 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string): T
           meta: { uri: uri.toString(), bytes: Buffer.byteLength(content, 'utf8'), created: !existed }
         };
       } catch (err) {
-        return { content: `write_file failed: ${String((err as Error).message ?? err)}`, isError: true };
+        return {
+          content:
+            `write_file failed: ${String((err as Error).message ?? err)}. ` +
+            `If this was a whole-file or large-content write, do not retry the same oversized payload. ` +
+            `Read the current file state, then split the work into smaller write_file/propose_edit calls ` +
+            `(for example separate files/chunks, or append/repair only the missing tail).`,
+          isError: true
+        };
       }
     }
   };
@@ -542,6 +555,12 @@ const CC_MAX_READS = 16;
 const CC_MAX_GREPS = 16;
 const CC_MAX_LISTS = 8;
 const CC_MAX_OUTLINES = 8;
+// collect_context is intentionally convenient, so it also needs a hard output
+// budget: a single broad call (many reads / full files / large greps) otherwise
+// lands as one huge tool_result and can blow the next LLM request before the
+// normal older-history compressor gets a chance to help.
+const CC_MAX_SECTION_CHARS = 14_000;
+const CC_MAX_TOTAL_CHARS = 64_000;
 
 export function buildCollectContextTool(applier?: HunkApplier, sessionId?: string): Tool {
   const readFileTool = buildReadFileTool(applier, sessionId);
@@ -659,22 +678,37 @@ export function buildCollectContextTool(applier?: HunkApplier, sessionId?: strin
 
       const sections: string[] = [];
       let errorCount = 0;
+      let truncatedCount = 0;
       settled.forEach((s, i) => {
         const label = tasks[i].label;
         if (s.status === 'fulfilled') {
           if (s.value.isError) errorCount++;
           const tag = s.value.isError ? ' [error]' : '';
-          sections.push(`===== ${label}${tag} =====\n${s.value.content}`);
+          const raw = s.value.content;
+          const body = raw.length > CC_MAX_SECTION_CHARS
+            ? truncateMiddleText(raw, Math.floor(CC_MAX_SECTION_CHARS * 0.55), Math.floor(CC_MAX_SECTION_CHARS * 0.35))
+            : raw;
+          if (body !== raw) truncatedCount++;
+          sections.push(`===== ${label}${tag} =====\n${body}`);
         } else {
           errorCount++;
           sections.push(`===== ${label} [failed] =====\n${String(s.reason)}`);
         }
       });
 
-      const header = `# collect_context: ${tasks.length} source(s), ${errorCount} error(s)`;
+      let body = sections.join('\n\n');
+      if (body.length > CC_MAX_TOTAL_CHARS) {
+        body = truncateMiddleText(body, Math.floor(CC_MAX_TOTAL_CHARS * 0.58), Math.floor(CC_MAX_TOTAL_CHARS * 0.34));
+        truncatedCount++;
+      }
+
+      const truncateNote = truncatedCount > 0
+        ? `, ${truncatedCount} truncated (output capped; use narrower files/searches or read_file for exact missing ranges)`
+        : '';
+      const header = `# collect_context: ${tasks.length} source(s), ${errorCount} error(s)${truncateNote}`;
       return {
-        content: `${header}\n\n${sections.join('\n\n')}`,
-        meta: { tasks: tasks.length, errors: errorCount },
+        content: `${header}\n\n${body}`,
+        meta: { tasks: tasks.length, errors: errorCount, truncated: truncatedCount > 0 },
         isError: errorCount === tasks.length
       };
     }

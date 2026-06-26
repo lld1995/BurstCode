@@ -365,6 +365,13 @@ export function normalizeToolResult(toolName: string, content: string): string {
     return content.replace(/\n{3,}/g, '\n\n');
   }
 
+  // collect_context already caps live output, but keep a second storage-time
+  // safety net so old sessions / future format changes cannot carry one huge
+  // bundled context result into every subsequent request.
+  if (toolName === 'collect_context') {
+    return content.length > 50000 ? truncateMiddle(content, 28000, 16000) : content;
+  }
+
   // launch_subagent: concatenated per-task reports; keep head + tail so the
   // overall summary AND the final task's conclusion survive.
   if (toolName === 'launch_subagent') {

@@ -2373,22 +2373,29 @@ setTimeout(() => {
   #log .turn:last-child { margin-bottom: 8px; }
 
   /* User: subtle prefix block, like a quoted prompt */
-  .msg.user { display: flex; gap: 8px; padding: 6px 10px; background: var(--vscode-textBlockQuote-background); border-left: 2px solid var(--vscode-textLink-foreground); border-radius: 0 4px 4px 0; line-height: 1.5; word-wrap: break-word; opacity: 0.95; position: relative; }
+  .msg.user { display: flex; gap: 8px; padding: 6px 10px; margin-bottom: 28px; background: var(--vscode-textBlockQuote-background); border-left: 2px solid var(--vscode-textLink-foreground); border-radius: 0 4px 4px 0; line-height: 1.5; word-wrap: break-word; opacity: 0.95; position: relative; }
+  .msg.user::after { content: ''; position: absolute; left: 0; right: 0; top: 100%; height: 28px; }
   .msg.user .gutter { color: var(--vscode-textLink-foreground); font-weight: 700; flex-shrink: 0; user-select: none; }
   .msg.user .body { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
-  .msg.user .rollback-btn { flex-shrink: 0; background: transparent; border: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); cursor: pointer; padding: 2px 6px; border-radius: 4px; font-size: 0.78em; opacity: 0.55; transition: opacity 0.15s, background 0.15s, color 0.15s; display: inline-flex; align-items: center; gap: 3px; align-self: flex-start; }
-  .msg.user:hover .rollback-btn { opacity: 0.9; }
-  .msg.user .rollback-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
-  .msg.user .rollback-btn svg { width: 11px; height: 11px; }
+  .msg.user .user-actions { position: absolute; left: 26px; top: 100%; display: flex; align-items: center; gap: 2px; min-height: 22px; margin-top: 0; padding-top: 4px; z-index: 1; visibility: hidden; opacity: 0; transition: opacity 0.18s ease, visibility 0.18s ease; pointer-events: none; }
+  .msg.user:hover .user-actions,
+  .msg.user:focus-within .user-actions,
+  .msg.user .user-actions:hover,
+  .msg.user .user-actions:focus-within { visibility: visible; opacity: 1; pointer-events: auto; }
+  .msg.user .user-actions .act { display: inline-flex; align-items: center; gap: 5px; background: transparent; border: 1px solid transparent; color: var(--vscode-descriptionForeground); cursor: pointer; padding: 3px 8px; border-radius: 6px; font-size: 0.78em; font-family: inherit; line-height: 1; transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease; min-height: 22px; white-space: nowrap; }
+  .msg.user .user-actions .act:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+  .msg.user .user-actions .act:active { transform: scale(0.97); }
+  .msg.user .user-actions .act.copied { color: var(--vscode-charts-green, #2ea043); border-color: color-mix(in srgb, var(--vscode-charts-green, #2ea043) 30%, transparent); background: color-mix(in srgb, var(--vscode-charts-green, #2ea043) 10%, transparent); }
+  .msg.user .user-actions .act svg { width: 12px; height: 12px; flex-shrink: 0; }
 
   /* Assistant: clean prose, no bubble. Rendered as Markdown. */
   .msg.assistant { padding: 2px 4px 2px 26px; line-height: 1.6; word-wrap: break-word; position: relative; }
   .msg.assistant::before { content: '⏺'; color: var(--vscode-charts-green); position: absolute; left: 6px; top: 2px; opacity: 0.85; }
-  /* Bottom action bar — only revealed on hover. Modeled after ChatGPT/Claude. */
-  .msg.assistant .msg-actions { display: flex; align-items: center; gap: 2px; margin-top: 0; max-height: 0; overflow: hidden; opacity: 0; transform: translateY(-2px); transition: opacity 0.18s ease, transform 0.18s ease, max-height 0.18s ease, margin-top 0.18s ease; pointer-events: none; }
+  /* Bottom action bar — reserve its height even before hover so reveal never changes layout. */
+  .msg.assistant .msg-actions { display: flex; align-items: center; gap: 2px; margin-top: 6px; min-height: 22px; visibility: hidden; opacity: 0; transition: opacity 0.18s ease, visibility 0.18s ease; pointer-events: none; }
   .msg.assistant:hover .msg-actions,
-  .msg.assistant:focus-within .msg-actions { margin-top: 6px; max-height: 28px; opacity: 1; transform: translateY(0); pointer-events: auto; }
-  .msg.assistant .msg-actions .act { display: inline-flex; align-items: center; gap: 5px; background: transparent; border: 1px solid transparent; color: var(--vscode-descriptionForeground); cursor: pointer; padding: 3px 8px; border-radius: 6px; font-size: 0.78em; font-family: inherit; line-height: 1; transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease; }
+  .msg.assistant:focus-within .msg-actions { visibility: visible; opacity: 1; pointer-events: auto; }
+  .msg.assistant .msg-actions .act { display: inline-flex; align-items: center; gap: 5px; background: transparent; border: 1px solid transparent; color: var(--vscode-descriptionForeground); cursor: pointer; padding: 3px 8px; border-radius: 6px; font-size: 0.78em; font-family: inherit; line-height: 1; transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease; min-height: 22px; }
   .msg.assistant .msg-actions .act:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
   .msg.assistant .msg-actions .act:active { transform: scale(0.97); }
   .msg.assistant .msg-actions .act.copied { color: var(--vscode-charts-green, #2ea043); border-color: color-mix(in srgb, var(--vscode-charts-green, #2ea043) 30%, transparent); background: color-mix(in srgb, var(--vscode-charts-green, #2ea043) 10%, transparent); }
@@ -4749,28 +4756,46 @@ function addUserMsg(text, messageIndex, checkpointRef, checkpointError, imageCou
     el.appendChild(imgBadge);
   }
 
-  // Always surface a rollback affordance on user messages — earlier
-  // versions only rendered the button when a git checkpointRef was
-  // captured, which silently hid the feature whenever git checkpointing
-  // was disabled, failed at runtime, or the session was saved before
-  // checkpoints existed (old sessions). We now show the button
-  // unconditionally and degrade gracefully when no checkpoint is
-  // available: the click handler is the same, but the backend falls
-  // back to chat-only truncation after an explicit confirmation.
+  const actions = document.createElement('div');
+  actions.className = 'user-actions';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'act copy-user-btn';
+  copyBtn.title = 'Copy prompt text';
+  copyBtn.setAttribute('aria-label', 'Copy prompt text');
+  copyBtn.innerHTML = ICON_COPY_TEXT + '<span>Copy</span>';
+  copyBtn.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const txt = text || '';
+    if (!txt) return;
+    const done = () => flashCopied(copyBtn, ICON_COPY_TEXT, 'Copy');
+    try {
+      const p = navigator.clipboard && navigator.clipboard.writeText(txt);
+      if (p && typeof p.then === 'function') p.then(done, done); else done();
+    } catch (_) { done(); }
+  });
+  actions.appendChild(copyBtn);
+
+  // "Retry" reuses the existing rollback path: jump chat/code back to the
+  // state before this prompt, then prefill the composer with the prompt so the
+  // user can send the revised/retried request without retyping it.
   if (typeof messageIndex === 'number') {
-    const btn = document.createElement('button');
-    btn.className = 'rollback-btn';
-    // Tooltip carries the exact reason when checkpointing failed (passed up
-    // from GitCheckpoint.createCheckpoint via the user-message payload), so
-    // the user can diagnose a broken setup without opening the output panel.
-    btn.title = checkpointRef
-      ? 'Roll back code & chat to the state right before this prompt'
+    const retryBtn = document.createElement('button');
+    retryBtn.type = 'button';
+    retryBtn.className = 'act retry-user-btn';
+    retryBtn.title = checkpointRef
+      ? 'Retry from the state right before this prompt'
       : checkpointError
-        ? 'No checkpoint for this prompt (' + checkpointError + ') — click to truncate chat history only'
-        : 'No checkpoint captured for this prompt — click to truncate chat history only';
-    if (!checkpointRef) btn.dataset.chatOnly = 'true';
-    btn.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8a5 5 0 1 0 1.5-3.5"/><path d="M3 3v3h3"/></svg><span>Rollback</span>';
-    btn.addEventListener('click', () => {
+        ? 'No checkpoint for this prompt (' + checkpointError + ') — click to retry by truncating chat history only'
+        : 'No checkpoint captured for this prompt — click to retry by truncating chat history only';
+    retryBtn.setAttribute('aria-label', 'Retry this prompt');
+    if (!checkpointRef) retryBtn.dataset.chatOnly = 'true';
+    retryBtn.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8a5 5 0 1 0 1.5-3.5"/><path d="M3 3v3h3"/></svg><span>Retry</span>';
+    retryBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
       // Read ref from dataset at click time so that async-created checkpoints
       // (whose ref arrives via 'update-checkpoint-ref' after this button was
       // first rendered) are correctly picked up.
@@ -4779,8 +4804,10 @@ function addUserMsg(text, messageIndex, checkpointRef, checkpointError, imageCou
         payload: { ref: el.dataset.checkpointRef || '', messageIndex }
       });
     });
-    el.appendChild(btn);
+    actions.appendChild(retryBtn);
   }
+
+  if (actions.childElementCount > 0) el.appendChild(actions);
   log.appendChild(el);
   // The user just submitted a prompt; jump them to the bottom regardless of
   // where they were reading, and re-arm auto-follow for the upcoming run.
@@ -5043,10 +5070,10 @@ window.addEventListener('message', (e) => {
         const msgEl = log.querySelector('[data-message-index="' + cpIdx + '"]');
         if (msgEl) {
           msgEl.dataset.checkpointRef = cpRef;
-          const rollBtn = msgEl.querySelector('.rollback-btn');
-          if (rollBtn) {
-            rollBtn.title = 'Roll back code & chat to the state right before this prompt';
-            delete rollBtn.dataset.chatOnly;
+          const retryBtn = msgEl.querySelector('.retry-user-btn, .rollback-btn');
+          if (retryBtn) {
+            retryBtn.title = 'Retry from the state right before this prompt';
+            delete retryBtn.dataset.chatOnly;
           }
         }
       }
@@ -5128,10 +5155,12 @@ window.addEventListener('message', (e) => {
       break;
     }
     case 'reasoning-delta': {
+      const delta = String(msg.payload && msg.payload.text || '');
+      if (!activeReasoningEl && delta.trim().length === 0) break;
       if (!activeReasoningEl) {
         activeReasoningEl = addReasoningMsg('', { open: true, streaming: true });
       }
-      const raw = (activeReasoningEl.dataset.raw || '') + msg.payload.text;
+      const raw = (activeReasoningEl.dataset.raw || '') + delta;
       activeReasoningEl.dataset.raw = raw;
       const body = activeReasoningEl.querySelector('.body');
       if (body) body.textContent = raw;
@@ -5142,9 +5171,14 @@ window.addEventListener('message', (e) => {
       // First content delta after thinking arrived: stop the pulse and
       // collapse the thinking block so the answer takes focus.
       if (activeReasoningEl) {
-        const sum = activeReasoningEl.querySelector('summary');
-        if (sum) delete sum.dataset.streaming;
-        activeReasoningEl.open = false;
+        const rawReasoning = activeReasoningEl.dataset.raw || '';
+        if (rawReasoning.trim().length === 0) {
+          activeReasoningEl.remove();
+        } else {
+          const sum = activeReasoningEl.querySelector('summary');
+          if (sum) delete sum.dataset.streaming;
+          activeReasoningEl.open = false;
+        }
         activeReasoningEl = null;
       }
       if (!activeAssistantEl) {
@@ -5161,9 +5195,14 @@ window.addEventListener('message', (e) => {
       // End-of-turn: also stop reasoning pulse if the model emitted no
       // assistant content (tool-only turns).
       if (activeReasoningEl) {
-        const sum = activeReasoningEl.querySelector('summary');
-        if (sum) delete sum.dataset.streaming;
-        activeReasoningEl.open = false;
+        const rawReasoning = activeReasoningEl.dataset.raw || '';
+        if (rawReasoning.trim().length === 0) {
+          activeReasoningEl.remove();
+        } else {
+          const sum = activeReasoningEl.querySelector('summary');
+          if (sum) delete sum.dataset.streaming;
+          activeReasoningEl.open = false;
+        }
         activeReasoningEl = null;
       }
       if (activeAssistantEl && msg.payload && typeof msg.payload.text === 'string') {

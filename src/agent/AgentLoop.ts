@@ -1058,8 +1058,15 @@ export class AgentLoop {
               yield { type: 'assistant-delta', payload: chunk.contentDelta };
             }
             if (chunk.reasoningDelta) {
-              reasoningText += chunk.reasoningDelta;
-              yield { type: 'reasoning-delta', payload: chunk.reasoningDelta };
+              // Some Claude/OpenAI-compatible gateways emit whitespace-only
+              // reasoning deltas near the end of a turn. If we surface/persist
+              // those, the UI shows one or more empty "Thinking" blocks. Ignore
+              // leading whitespace-only reasoning; preserve whitespace once real
+              // reasoning text has started.
+              if (reasoningText.length > 0 || chunk.reasoningDelta.trim().length > 0) {
+                reasoningText += chunk.reasoningDelta;
+                yield { type: 'reasoning-delta', payload: chunk.reasoningDelta };
+              }
             }
             if (chunk.toolCallDelta) {
               const idx = chunk.toolCallDelta.index;
@@ -1373,7 +1380,7 @@ export class AgentLoop {
       const assistantMsg: ChatMessage = {
         role: 'assistant',
         content: assistantText || null,
-        ...(reasoningText ? { reasoning_content: reasoningText } : {}),
+        ...(reasoningText.trim().length > 0 ? { reasoning_content: reasoningText } : {}),
         ...(toolCalls.length
           ? {
               tool_calls: toolCalls.map((tc, i) => ({

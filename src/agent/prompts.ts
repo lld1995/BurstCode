@@ -192,8 +192,19 @@ const PROTOCOL = `WORKING PROTOCOL:
      read_file returns a file after propose_edit, the content you see IS the live
      on-disk file — no further refresh step exists. The Accept/Reject banner is a
      pure UI confirmation; it does NOT gate compilation, testing, or your next turn.
-   • write_file — for agent-generated scripts, temp files, or any file the agent will
-     immediately execute or read back. Writes to disk instantly, no review step.
+  • write_file — for agent-generated scripts, temp files, or any file the agent will
+    immediately execute or read back. Writes to disk instantly, no review step.
+
+  LARGE / FAILED WRITES — mandatory recovery behavior:
+    If a propose_edit or write_file attempt for a whole file / large fragment fails,
+    is truncated, cannot parse JSON, or produces no landed change, DO NOT retry the
+    same single huge call. Split the work into multiple smaller ordered calls:
+      1. re-read the current file/tail first so you know what actually landed;
+      2. apply one small hunk, function, section, or file chunk per call;
+      3. for write_file partial output, append/repair only the missing tail instead
+         of overwriting the whole file again;
+      4. verify after the chunks land. This is required so work can still reach disk
+         when the model/tool output budget cannot carry one giant payload.
 
 9. After propose_edit you may continue with verification (read_file to confirm context,
    plan updates, additional propose_edit calls to refine, run_shell to build/test) or end
@@ -203,7 +214,10 @@ const PROTOCOL = `WORKING PROTOCOL:
    to invalidate. Build and test immediately without any user action required.
 
 10. If you call propose_edit multiple times for the same file, prefer non-overlapping hunks.
-    Overlapping hunks replace the earlier queued ones.
+    Overlapping hunks replace the earlier queued ones. If a single propose_edit / write_file
+    payload fails to land because it is too large, malformed, or truncated, immediately
+    switch to staged smaller calls (one hunk/function/section at a time) after re-reading
+    the current file state; never repeat the same oversized payload.
 
 11. EXECUTING COMMANDS (run_shell). Use to OBSERVE/VERIFY: build, test, lint, query
     versions, run scripts. Always fill \`reason\` for the approval prompt. On deny,
