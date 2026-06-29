@@ -179,6 +179,8 @@ interface RunContext {
   live: SessionLive;
   /** Pending askUser promise — resolved by the webview message. */
   pendingAsk?: { resolve: (value: string) => void; id: string; spec: PendingAskSnap };
+  /** User messages sent while the agent was already running — drained by AgentLoop at each iteration boundary. */
+  queuedUserMessages: string[];
 }
 
 /** Workspace-state key for the persisted browser-style open-tab working set. */
@@ -933,7 +935,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               })
               .slice(0, 8)
           : [];
-        await this.runAgent(String(payload.text ?? ''), {
+        const text = String(payload.text ?? '');
+        // If this session is already running, queue the message instead of
+        // blocking. The AgentLoop drains the queue at the next iteration
+        // boundary and injects it as a user turn so the model addresses it
+        // without interrupting the current response.
+        const sid = this.currentSession?.id;
+        if (sid && this.runs.has(sid)) {
+          if (text.trim()) {
+            const ctx = this.runs.get(sid)!;
+            ctx.queuedUserMessages.push(text);
+            this.post({ type: 'queued-user-message', payload: { text } });
+          }
+          break;
+        }
+        await this.runAgent(text, {
           images,
           useRules: payload.useRules !== false,
           useSkills: payload.useSkills !== false,
@@ -997,8 +1013,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case 'rollback': {
-        const payload = (msg.payload ?? {}) as { ref?: string; messageIndex?: number };
-        await this.rollbackToCheckpoint(String(payload.ref ?? ''), Number(payload.messageIndex ?? -1));
+        const payload = (msg.payload ?? {}) as { ref?: string; messageIndex?: number; prefill?: boolean };
+        await this.rollbackToCheckpoint(
+          String(payload.ref ?? ''),
+          Number(payload.messageIndex ?? -1),
+          payload.prefill !== false
+        );
         break;
       }
       case 'ask-user-response': {
@@ -1524,7 +1544,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * back to chat-only truncation behind an explicit confirmation so the
    * user understands that the code state is NOT being restored.
    */
-  private async rollbackToCheckpoint(ref: string, messageIndex: number): Promise<void> {
+  private async rollbackToCheckpoint(ref: string, messageIndex: number, prefillRolledBackPrompt = true): Promise<void> {
     if (!this.currentSession || !Number.isFinite(messageIndex) || messageIndex < 0) {
       vscode.window.showWarningMessage('BurstCode: nothing to roll back to.');
       return;
@@ -1643,9 +1663,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           plan: session.plan ?? []
         }
       });
-      // Drop the rolled-back prompt back into the composer so the user can
-      // tweak it and resend instead of retyping the whole thing.
-      if (prefillText) {
+      // Retry drops the rolled-back prompt back into the composer so the user can
+      // tweak it and resend instead of retyping the whole thing. Plain Rollback
+      // leaves the composer untouched because the user only asked to restore state.
+      if (prefillRolledBackPrompt && prefillText) {
         this.post({ type: 'prefill-composer', payload: { text: prefillText } });
       }
       vscode.window.showInformationMessage(
@@ -1695,7 +1716,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       sessionId: session.id,
       session,
       cts,
-      live: emptyLive()
+      live: emptyLive(),
+      queuedUserMessages: []
     };
     this.runs.set(session.id, ctx);
     session.status = 'running';
@@ -1898,7 +1920,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       autoContinueOnPrematureStop: agentCfg.get<boolean>('autoContinueOnPrematureStop') ?? true,
       maxPrematureStopContinues: agentCfg.get<number>('maxPrematureStopContinues') ?? 2,
       askUser,
-      systemPrompt
+      systemPrompt,
+      drainQueuedUserMessages: () => ctx.queuedUserMessages.splice(0)
     });
 
     let doneReason: string | undefined;
@@ -2155,7 +2178,7 @@ document.addEventListener('click', (ev) => {
   } catch (e) {}
 }, true);
 function runProbe() {
-  const ids = ['tabs', 'newBtn', 'historyBtn', 'lessonsBtn', 'cfgBtn', 'modelPickerBtn', 'sendBtn', 'bgStatus', 'input'];
+const ids = ['tabs', 'newBtn', 'historyBtn', 'lessonsBtn', 'cfgBtn', 'modelPickerBtn', 'sendBtn', 'queueBtn', 'bgStatus', 'input'];
   const lines = [];
   for (const id of ids) {
     try {
@@ -2387,6 +2410,13 @@ setTimeout(() => {
   .msg.user .user-actions .act:active { transform: scale(0.97); }
   .msg.user .user-actions .act.copied { color: var(--vscode-charts-green, #2ea043); border-color: color-mix(in srgb, var(--vscode-charts-green, #2ea043) 30%, transparent); background: color-mix(in srgb, var(--vscode-charts-green, #2ea043) 10%, transparent); }
   .msg.user .user-actions .act svg { width: 12px; height: 12px; flex-shrink: 0; }
+  .msg.user.queued { border-left-color: var(--vscode-charts-yellow, #cca700); opacity: 0.82; }
+  .msg.user.queued .queued-badge { display: inline-block; font-size: 0.7em; padding: 1px 6px; border-radius: 3px; background: color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 18%, transparent); color: var(--vscode-charts-yellow, #cca700); margin-left: 6px; vertical-align: middle; white-space: nowrap; font-weight: 600; }
+  #queueBtn { width: 28px; height: 28px; padding: 0; border: none; border-radius: 7px; background: var(--vscode-charts-yellow, #cca700); color: #000; cursor: pointer; display: none; align-items: center; justify-content: center; flex-shrink: 0; transition: opacity 0.15s, transform 0.1s; }
+  #queueBtn.show { display: flex; }
+  #queueBtn:hover { opacity: 0.82; }
+  #queueBtn:active { transform: scale(0.94); }
+  #queueBtn svg { width: 14px; height: 14px; display: block; }
 
   /* Assistant: clean prose, no bubble. Rendered as Markdown. */
   .msg.assistant { padding: 2px 4px 2px 26px; line-height: 1.6; word-wrap: break-word; position: relative; }
@@ -2771,6 +2801,9 @@ setTimeout(() => {
         <div id="attachments" class="attachments" aria-label="Image attachments"></div>
         <textarea id="input" rows="1" placeholder="Ask BurstCode..."></textarea>
       </div>
+      <button id="queueBtn" title="Queue message (Enter) — will be processed after current response" aria-label="Queue message">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg>
+      </button>
       <button id="sendBtn" title="Send (Enter)" aria-label="Send" data-mode="send">
         <svg class="icon-send" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg>
         <svg class="icon-stop" viewBox="0 0 16 16" fill="currentColor"><rect x="4.5" y="4.5" width="7" height="7" rx="1.2"/></svg>
@@ -2820,6 +2853,7 @@ const rulesToggle = document.getElementById('rulesToggle');
 const skillsToggle = document.getElementById('skillsToggle');
 const mcpToggle = document.getElementById('mcpToggle');
 const sendBtn = document.getElementById('sendBtn');
+const queueBtn = document.getElementById('queueBtn');
 const newBtn = document.getElementById('newBtn');
 const cfgBtn = document.getElementById('cfgBtn');
 const modelPickerBtn = document.getElementById('modelPickerBtn');
@@ -4778,14 +4812,36 @@ function addUserMsg(text, messageIndex, checkpointRef, checkpointError, imageCou
   });
   actions.appendChild(copyBtn);
 
-  // "Retry" reuses the existing rollback path: jump chat/code back to the
-  // state before this prompt, then prefill the composer with the prompt so the
-  // user can send the revised/retried request without retyping it.
   if (typeof messageIndex === 'number') {
+    const currentRef = () => el.dataset.checkpointRef || '';
+    const checkpointTitle = () => currentRef()
+      ? 'Restore code and chat to the state right before this prompt'
+      : checkpointError
+        ? 'No checkpoint for this prompt (' + checkpointError + ') — only chat history can be truncated'
+        : 'No checkpoint captured for this prompt — only chat history can be truncated';
+
+    const rollbackBtn = document.createElement('button');
+    rollbackBtn.type = 'button';
+    rollbackBtn.className = 'act rollback-btn';
+    rollbackBtn.title = checkpointTitle();
+    rollbackBtn.setAttribute('aria-label', 'Rollback to before this prompt');
+    if (!checkpointRef) rollbackBtn.dataset.chatOnly = 'true';
+    rollbackBtn.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4H3v3"/><path d="M3 7a5 5 0 1 0 1.5-3.5"/><path d="M8 5v4l3 1.5"/></svg><span>Rollback</span>';
+    rollbackBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      rollbackBtn.title = checkpointTitle();
+      vscode.postMessage({
+        type: 'rollback',
+        payload: { ref: currentRef(), messageIndex, prefill: true }
+      });
+    });
+    actions.appendChild(rollbackBtn);
+
     const retryBtn = document.createElement('button');
     retryBtn.type = 'button';
     retryBtn.className = 'act retry-user-btn';
-    retryBtn.title = checkpointRef
+    retryBtn.title = currentRef()
       ? 'Retry from the state right before this prompt'
       : checkpointError
         ? 'No checkpoint for this prompt (' + checkpointError + ') — click to retry by truncating chat history only'
@@ -4797,11 +4853,11 @@ function addUserMsg(text, messageIndex, checkpointRef, checkpointError, imageCou
       ev.preventDefault();
       ev.stopPropagation();
       // Read ref from dataset at click time so that async-created checkpoints
-      // (whose ref arrives via 'update-checkpoint-ref' after this button was
+      // (whose ref arrives via 'update-checkpoint-ref' after these buttons were
       // first rendered) are correctly picked up.
       vscode.postMessage({
         type: 'rollback',
-        payload: { ref: el.dataset.checkpointRef || '', messageIndex }
+        payload: { ref: currentRef(), messageIndex, prefill: true }
       });
     });
     actions.appendChild(retryBtn);
@@ -4930,11 +4986,26 @@ function addErrorMsg(text) {
   return el;
 }
 
+function updateSendButton() {
+  if (!busy) {
+    sendBtn.dataset.mode = 'send';
+    sendBtn.title = 'Send (Enter)';
+    sendBtn.setAttribute('aria-label', 'Send');
+  } else {
+    sendBtn.dataset.mode = 'stop';
+    sendBtn.title = 'Stop (Esc)';
+    sendBtn.setAttribute('aria-label', 'Stop');
+  }
+}
+
+function updateQueueButton() {
+  queueBtn.classList.toggle('show', busy && input.value.trim().length > 0);
+}
+
 function setBusy(v) {
   busy = v;
-  sendBtn.dataset.mode = v ? 'stop' : 'send';
-  sendBtn.title = v ? 'Stop (Esc)' : 'Send (Enter)';
-  sendBtn.setAttribute('aria-label', v ? 'Stop' : 'Send');
+  updateSendButton();
+  updateQueueButton();
 }
 
 window.addEventListener('message', (e) => {
@@ -5061,6 +5132,28 @@ window.addEventListener('message', (e) => {
         msg.payload.imageUrls
       );
       break;
+    case 'queued-user-message': {
+      // User sent a message while the agent was running. Display it with a
+      // "queued" badge; the AgentLoop will inject it at the next iteration.
+      clearEmptyState();
+      const qEl = document.createElement('div');
+      qEl.className = 'msg user queued';
+      const qGutter = document.createElement('span');
+      qGutter.className = 'gutter';
+      qGutter.textContent = '>';
+      const qBody = document.createElement('span');
+      qBody.className = 'body';
+      qBody.textContent = msg.payload.text || '';
+      const qBadge = document.createElement('span');
+      qBadge.className = 'queued-badge';
+      qBadge.textContent = 'queued';
+      qEl.appendChild(qGutter);
+      qEl.appendChild(qBody);
+      qEl.appendChild(qBadge);
+      log.appendChild(qEl);
+      scrollToBottom();
+      break;
+    }
     case 'update-checkpoint-ref': {
       // Checkpoint was created asynchronously after the user message was
       // rendered. Update the rollback button so clicking it sends the real ref.
@@ -5070,7 +5163,12 @@ window.addEventListener('message', (e) => {
         const msgEl = log.querySelector('[data-message-index="' + cpIdx + '"]');
         if (msgEl) {
           msgEl.dataset.checkpointRef = cpRef;
-          const retryBtn = msgEl.querySelector('.retry-user-btn, .rollback-btn');
+          const rollbackBtn = msgEl.querySelector('.rollback-btn');
+          if (rollbackBtn) {
+            rollbackBtn.title = 'Restore code and chat to the state right before this prompt';
+            delete rollbackBtn.dataset.chatOnly;
+          }
+          const retryBtn = msgEl.querySelector('.retry-user-btn');
           if (retryBtn) {
             retryBtn.title = 'Retry from the state right before this prompt';
             delete retryBtn.dataset.chatOnly;
@@ -5675,7 +5773,7 @@ window.addEventListener('message', (e) => {
         modelsState.fetched.fetchedAt = cached.fetchedAt;
       }
       renderModelPickerLabel();
-      if (modelPicker.classList.contains('open')) renderModelPicker();
+      if (modelPicker.classList.contains('open')) { renderModelPicker(); positionModelPicker(); }
       break;
     }
     case 'models-fetched': {
@@ -5686,7 +5784,7 @@ window.addEventListener('message', (e) => {
         error: error || null,
         fetchedAt: typeof fetchedAt === 'number' ? fetchedAt : (modelsState.fetched && modelsState.fetched.fetchedAt) || 0
       };
-      if (modelPicker.classList.contains('open')) renderModelPicker();
+      if (modelPicker.classList.contains('open')) { renderModelPicker(); positionModelPicker(); }
       break;
     }
     case 'context-usage': {
@@ -5928,6 +6026,15 @@ sendBtn.addEventListener('click', () => {
   autosizeInput();
 });
 
+queueBtn.addEventListener('click', () => {
+  const text = input.value.trim();
+  if (!text) return;
+  vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked } });
+  input.value = '';
+  autosizeInput();
+  updateQueueButton();
+});
+
 input.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
   if (e.isComposing) return; // don't intercept while IME is composing
@@ -5945,11 +6052,17 @@ input.addEventListener('keydown', (e) => {
     // Shift+Enter -> default newline behavior
     return;
   }
-  // Plain Enter -> send (ignored while busy)
+  // Plain Enter -> send (or queue while busy if there's text)
   e.preventDefault();
-  if (busy) return;
+  if (busy) {
+    if (input.value.trim()) queueBtn.click();
+    return;
+  }
   sendBtn.click();
 });
+
+// Show/hide queue button when text changes while busy.
+input.addEventListener('input', updateQueueButton);
 
 // ============== Model picker ==============
 // Single chat profile only. Background profile is managed via Settings UI
@@ -6041,6 +6154,7 @@ function renderModelPicker() {
     e.stopPropagation();
     modelsState.fetched = { ...cache, loading: true, error: null };
     renderModelPicker();
+    positionModelPicker();
     vscode.postMessage({ type: 'refresh-models' });
   };
   head.appendChild(nm);

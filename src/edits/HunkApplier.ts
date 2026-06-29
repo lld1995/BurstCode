@@ -29,6 +29,10 @@ interface PendingHunk {
   fileUri: vscode.Uri;
   hunk: ProposedHunk;
   status: 'pending' | 'accepted' | 'rejected';
+  /** Chat session that produced this hunk. Empty string for legacy/session-less edits. */
+  sessionId: string;
+  /** User-message index that produced this hunk, used for turn-scoped rollback. */
+  turnIndex: number;
 }
 
 interface PendingFile {
@@ -196,9 +200,10 @@ export class HunkApplier implements vscode.Disposable {
     const fileList: PendingFileSummary[] = [];
     for (const f of this.pending.values()) {
       if (!this.matchesSession(f, sessionId)) continue;
-      const pendingCount = f.hunks.filter((h) => h.status === 'pending').length;
-      const acceptedCount = f.hunks.filter((h) => h.status === 'accepted').length;
-      const rejectedCount = f.hunks.filter((h) => h.status === 'rejected').length;
+      const visibleHunks = this.hunksForSession(f, sessionId);
+      const pendingCount = visibleHunks.filter((h) => h.status === 'pending').length;
+      const acceptedCount = visibleHunks.filter((h) => h.status === 'accepted').length;
+      const rejectedCount = visibleHunks.filter((h) => h.status === 'rejected').length;
       if (pendingCount > 0) {
         files++;
         hunks += pendingCount;
@@ -273,9 +278,19 @@ export class HunkApplier implements vscode.Disposable {
    * files queued without a session ('') are always visible so nothing is
    * orphaned out of the UI.
    */
+  private hunkMatchesSession(hunk: PendingHunk, sessionId?: string | null): boolean {
+    if (sessionId === undefined || sessionId === null) return true;
+    return hunk.sessionId === sessionId || hunk.sessionId === '';
+  }
+
+  private hunksForSession(file: PendingFile, sessionId?: string | null): PendingHunk[] {
+    if (sessionId === undefined || sessionId === null) return file.hunks;
+    return file.hunks.filter((h) => this.hunkMatchesSession(h, sessionId));
+  }
+
   private matchesSession(file: PendingFile, sessionId?: string | null): boolean {
     if (sessionId === undefined || sessionId === null) return true;
-    return file.sessionId === sessionId;
+    return file.hunks.some((h) => this.hunkMatchesSession(h, sessionId));
   }
 
   /**
@@ -290,8 +305,11 @@ export class HunkApplier implements vscode.Disposable {
     let n = 0;
     for (const f of this.pending.values()) {
       if (!this.matchesSession(f, sessionId)) continue;
-      if (f.turnIndex < minTurnIndex) continue;
-      n += f.hunks.filter((h) => h.status === 'pending').length;
+      n += f.hunks.filter((h) =>
+        h.status === 'pending' &&
+        h.turnIndex >= minTurnIndex &&
+        this.hunkMatchesSession(h, sessionId)
+      ).length;
     }
     return n;
   }
@@ -771,6 +789,10 @@ export class HunkApplier implements vscode.Disposable {
     } else {
       entry = existingEntry;
       entry.lastSummary = summary;
+      // A single PendingFile can now contain hunks from multiple chat sessions.
+      // Record every session that appends to it so rollback remains scoped even
+      // when two tabs propose edits to the same file concurrently.
+      this.recordTouchedFile(uri, sessionId);
     }
 
     // Apply pending-hunk refinements: each refinement target is an existing
@@ -815,7 +837,9 @@ export class HunkApplier implements vscode.Disposable {
       id: `${key}::${stamp}::${i}`,
       fileUri: uri,
       hunk: h,
-      status: 'pending'
+      status: 'pending',
+      sessionId,
+      turnIndex
     }));
     // Apply both the baseline-coord drop set AND a defensive original-coord
     // overlap check (catches the rare partial-overlap case the baseline pass
@@ -971,7 +995,7 @@ export class HunkApplier implements vscode.Disposable {
     // any queued file owned by this session.
     const entries = Array.from(this.pending.values()).filter((f) => this.matchesSession(f, sessionId));
     const target =
-      entries.find((f) => f.hunks.some((h) => h.status === 'pending')) ?? entries[0];
+      entries.find((f) => this.hunksForSession(f, sessionId).some((h) => h.status === 'pending')) ?? entries[0];
     if (!target) return;
     await this.openDiffForEntry(target);
   }
@@ -1149,7 +1173,7 @@ export class HunkApplier implements vscode.Disposable {
     // `this.pending.has(...)` re-check inside the lock guards against a
     // file being drained by a per-hunk decision between our snapshot and
     // lock acquisition. No disk writes needed — disk already matches the
-    // accepted state. When `sessionId` is given, only that session's files
+    // accepted state. When `sessionId` is given, only that session's hunks
     // are accepted so a tab switch never decides another session's edits.
     const snapshot = Array.from(this.pending.values()).filter((f) =>
       this.matchesSession(f, sessionId)
@@ -1158,7 +1182,9 @@ export class HunkApplier implements vscode.Disposable {
       snapshot.map((file) =>
         this.withFileLock(file.uri.toString(), async () => {
           if (!this.pending.has(file.uri.toString())) return;
-          for (const h of file.hunks) if (h.status === 'pending') h.status = 'accepted';
+          for (const h of file.hunks) {
+            if (h.status === 'pending' && this.hunkMatchesSession(h, sessionId)) h.status = 'accepted';
+          }
           await this.flushFileIfDone(file);
         })
       )
@@ -1179,7 +1205,9 @@ export class HunkApplier implements vscode.Disposable {
       snapshot.map((file) =>
         this.withFileLock(file.uri.toString(), async () => {
           if (!this.pending.has(file.uri.toString())) return;
-          for (const h of file.hunks) if (h.status === 'pending') h.status = 'rejected';
+          for (const h of file.hunks) {
+            if (h.status === 'pending' && this.hunkMatchesSession(h, sessionId)) h.status = 'rejected';
+          }
           await this.syncDiskToModified(file);
           await this.flushFileIfDone(file);
         })
@@ -1198,8 +1226,12 @@ export class HunkApplier implements vscode.Disposable {
    * message indexes from other tabs are unrelated and must not be rejected.
    */
   async rejectAllFrom(minTurnIndex: number, sessionId?: string | null): Promise<void> {
-    const snapshot = Array.from(this.pending.values()).filter(
-      (f) => this.matchesSession(f, sessionId) && f.turnIndex >= minTurnIndex
+    const snapshot = Array.from(this.pending.values()).filter((f) =>
+      f.hunks.some((h) =>
+        h.status === 'pending' &&
+        h.turnIndex >= minTurnIndex &&
+        this.hunkMatchesSession(h, sessionId)
+      )
     );
     await Promise.all(
       snapshot.map((file) =>
@@ -1207,7 +1239,11 @@ export class HunkApplier implements vscode.Disposable {
           if (!this.pending.has(file.uri.toString())) return;
           let changed = false;
           for (const h of file.hunks) {
-            if (h.status === 'pending') {
+            if (
+              h.status === 'pending' &&
+              h.turnIndex >= minTurnIndex &&
+              this.hunkMatchesSession(h, sessionId)
+            ) {
               h.status = 'rejected';
               changed = true;
             }
@@ -1295,12 +1331,14 @@ export class HunkApplier implements vscode.Disposable {
       accepted: acceptedHunks.length,
       rejected: rejectedHunks.length
     });
+    const flushedSessionIds = Array.from(new Set(file.hunks.map((h) => h.sessionId ?? '')));
     this.diffPreview.unregister(file.proposedUri);
     this.pending.delete(file.uri.toString());
     this.codeLensProvider.refresh();
-    // This session's review cycle ended — allow its NEXT propose_edit run to
-    // open a fresh diff editor even if other sessions still have pending edits.
-    this.diffOpenedForSessions.delete(file.sessionId ?? '');
+    // Every session represented in this file's hunks has had its review cycle
+    // end for this file — allow each session's NEXT propose_edit run to open a
+    // fresh diff editor even if other sessions still have pending edits.
+    for (const sid of flushedSessionIds) this.diffOpenedForSessions.delete(sid);
     // All pending edits drained globally — clear the shared cycle-init promise.
     if (this.pending.size === 0) {
       this.cycleInitPromise = null;
@@ -1407,7 +1445,7 @@ export class HunkApplier implements vscode.Disposable {
     // excluded — they were never applied to modifiedContent, so including
     // their delta would skew every subsequent hunk's reported modStart.
     const sorted = entry.hunks
-      .filter((h) => h.status !== 'rejected')
+      .filter((h) => h.status !== 'rejected' && this.hunkMatchesSession(h, sessionId))
       .slice()
       .sort((a, b) => a.hunk.startLine - b.hunk.startLine);
     let cum = 0;

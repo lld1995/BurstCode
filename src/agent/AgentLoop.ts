@@ -757,6 +757,13 @@ export interface AgentOptions {
   maxStuckRepeats?: number;
   autoContinueOnPrematureStop?: boolean;
   maxPrematureStopContinues?: number;
+  /**
+   * Drain user messages that were queued (sent by the user while the agent
+   * was already running). Returns an array of message texts; the queue is
+   * cleared. Called at each iteration boundary so the LLM sees queued
+   * messages in the next turn. When omitted, queuing is disabled.
+   */
+  drainQueuedUserMessages?: () => string[];
 }
 
 export class AgentLoop {
@@ -866,6 +873,19 @@ export class AgentLoop {
             `If you plan to issue another propose_edit on those files, re-read them with read_file first — ` +
             `the line numbers you saw via the post-edit preview are now stale.`
         });
+      }
+
+      // Drain user messages queued during the previous iteration (sent while
+      // the LLM was streaming / executing tools). Inject them as user turns so
+      // the model addresses them in the upcoming response.
+      if (this.options.drainQueuedUserMessages) {
+        const queued = this.options.drainQueuedUserMessages();
+        for (const q of queued) {
+          messages.push({
+            role: 'user',
+            content: `[queued-during-response] ${q}`
+          });
+        }
       }
 
       // Measure persistent context usage and auto-compress in place when we
@@ -1478,6 +1498,21 @@ export class AgentLoop {
             payload: { count: consecutivePrematureStopContinues, max: maxPrematureStopContinues }
           };
           continue;
+        }
+        // Before ending the run, check if the user queued any messages
+        // while the LLM was producing this response. If so, inject them and
+        // continue instead of terminating — the model should address them.
+        if (this.options.drainQueuedUserMessages) {
+          const queued = this.options.drainQueuedUserMessages();
+          if (queued.length > 0) {
+            for (const q of queued) {
+              messages.push({
+                role: 'user',
+                content: `[queued-during-response] ${q}`
+              });
+            }
+            continue;
+          }
         }
         yield { type: 'done', payload: { reason: finishReason ?? 'stop' } };
         return;
