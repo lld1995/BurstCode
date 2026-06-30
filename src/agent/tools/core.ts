@@ -498,7 +498,7 @@ export function salvageWriteFileArgs(raw: string): Record<string, unknown> | nul
  * existing source files that belong to the user, prefer propose_edit so the
  * user can review and accept the diff.
  */
-export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string): Tool {
+export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string, turnIndex?: number): Tool {
   return {
     name: 'write_file',
     parallelSafe: true,
@@ -539,7 +539,7 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string): T
         }
         // Bind this write to the current session so a later rollback only
         // reverts/deletes files THIS session actually wrote.
-        try { applier?.recordTouchedFile(uri, sessionId); } catch { /* non-fatal */ }
+        try { applier?.recordTouchedFile(uri, sessionId, turnIndex); } catch { /* non-fatal */ }
         const relPath = vscode.workspace.asRelativePath(uri);
         const truncationNote = args.__bc_truncatedSalvage
           ? ' IMPORTANT: this write_file call was TRUNCATED mid-stream; the partial content that arrived was written to disk. Read the file back and append/repair only the missing tail in a smaller follow-up call using mode="append" when the tail is strictly additive.'

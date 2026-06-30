@@ -166,6 +166,13 @@ export class HunkApplier implements vscode.Disposable {
    */
   private readonly sessionTouched = new Map<string, Set<string>>();
   /**
+   * Same touched-file information split by user-message index. The all-session
+   * union above is still useful for legacy callers, but rollback needs this
+   * per-turn view so rolling back prompt N only scopes files written by turns
+   * N and later, not files from earlier successful prompts in the same chat.
+   */
+  private readonly sessionTouchedByTurn = new Map<string, Map<number, Set<string>>>();
+  /**
    * Sessions that have already had an automatic diff editor opened while they
    * still have pending edits. This must be per-session (not one global boolean):
    * multiple chat tabs can run concurrently, and each tab's first propose_edit
@@ -254,14 +261,32 @@ export class HunkApplier implements vscode.Disposable {
    * set is consulted by rollback so it only reverts files THIS session
    * actually changed — never files touched by another chat tab or by hand.
    */
-  recordTouchedFile(uri: vscode.Uri, sessionId = this.currentSessionId): void {
+  recordTouchedFile(
+    uri: vscode.Uri,
+    sessionId = this.currentSessionId,
+    turnIndex = this.currentTurnIndex
+  ): void {
     const sid = sessionId ?? '';
     let set = this.sessionTouched.get(sid);
     if (!set) {
       set = new Set<string>();
       this.sessionTouched.set(sid, set);
     }
-    set.add(this.workspaceRelative(uri));
+    const rel = this.workspaceRelative(uri);
+    set.add(rel);
+
+    let byTurn = this.sessionTouchedByTurn.get(sid);
+    if (!byTurn) {
+      byTurn = new Map<number, Set<string>>();
+      this.sessionTouchedByTurn.set(sid, byTurn);
+    }
+    const idx = Number.isFinite(turnIndex) && turnIndex >= 0 ? Math.floor(turnIndex) : 0;
+    let turnSet = byTurn.get(idx);
+    if (!turnSet) {
+      turnSet = new Set<string>();
+      byTurn.set(idx, turnSet);
+    }
+    turnSet.add(rel);
   }
 
   /**
@@ -270,6 +295,23 @@ export class HunkApplier implements vscode.Disposable {
    */
   touchedFilesFor(sessionId: string): string[] {
     return Array.from(this.sessionTouched.get(sessionId ?? '') ?? []);
+  }
+
+  /**
+   * Workspace-relative POSIX paths written by the given session at or after a
+   * user-message index. Rollback uses this instead of the all-session union so
+   * rolling back a later prompt does not include files from earlier prompts.
+   */
+  touchedFilesFrom(sessionId: string, minTurnIndex: number): string[] {
+    const byTurn = this.sessionTouchedByTurn.get(sessionId ?? '');
+    if (!byTurn) return [];
+    const out = new Set<string>();
+    const min = Number.isFinite(minTurnIndex) ? minTurnIndex : 0;
+    for (const [turn, paths] of byTurn) {
+      if (turn < min) continue;
+      for (const p of paths) out.add(p);
+    }
+    return Array.from(out);
   }
 
   /**
@@ -784,15 +826,15 @@ export class HunkApplier implements vscode.Disposable {
       };
       this.pending.set(key, entry);
       newlyQueued = uri;
-      // Bind this write to the owning session so rollback can scope itself.
-      this.recordTouchedFile(uri, sessionId);
+      // Bind this write to the owning session/turn so rollback can scope itself.
+      this.recordTouchedFile(uri, sessionId, turnIndex);
     } else {
       entry = existingEntry;
       entry.lastSummary = summary;
       // A single PendingFile can now contain hunks from multiple chat sessions.
-      // Record every session that appends to it so rollback remains scoped even
-      // when two tabs propose edits to the same file concurrently.
-      this.recordTouchedFile(uri, sessionId);
+      // Record every session/turn that appends to it so rollback remains scoped
+      // even when two tabs propose edits to the same file concurrently.
+      this.recordTouchedFile(uri, sessionId, turnIndex);
     }
 
     // Apply pending-hunk refinements: each refinement target is an existing

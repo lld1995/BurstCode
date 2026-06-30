@@ -1596,9 +1596,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // must only undo what THIS session produced. We union the in-memory
       // tracker with the set persisted on the checkpoint entry so the scope
       // survives an extension reload (in-memory tracker starts empty then).
-      const sessionScope = new Set(this.applier.touchedFilesFor(this.currentSession.id));
-      const persisted = (this.currentSession.checkpoints ?? []).find((c) => ref && c.ref === ref);
-      for (const p of persisted?.touchedFiles ?? []) sessionScope.add(p);
+      const sessionScope = new Set(this.applier.touchedFilesFrom(this.currentSession.id, messageIndex));
+      for (const cp of this.currentSession.checkpoints ?? []) {
+        if (cp.messageIndex < messageIndex) continue;
+        for (const p of cp.touchedFiles ?? []) sessionScope.add(p);
+      }
 
       // Build a preview of the files that will actually revert so the user can
       // see the blast radius before confirming — and let them click into each
@@ -1867,7 +1869,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const systemPrompt = await systemPromptPromise;
     const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
     const coreReadTools: Tool[] = [buildCollectContextTool(this.applier, session.id), buildReadFileTool(this.applier, session.id), listDirTool, grepSearchTool, workspaceOutlineTool, webSearchTool, readWebpageTool];
-    const writeFileTool = buildWriteFileTool(this.applier, session.id);
+    const writeFileTool = buildWriteFileTool(this.applier, session.id, messageIndex);
     const lspTools = buildLspTools(bridge, this.depGuard);
     const editTools = buildEditTools(this.applier, askUser, session.id, messageIndex);
     const mcpTools = opts.useMcp === false ? [] : await buildMcpTools(this.logger);
@@ -2035,7 +2037,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const checkpointRef = await checkpointPromise;
         session.checkpoints = rebaseCheckpointsAfterMessageCompaction(session.messages, session.checkpoints);
         const own = (session.checkpoints ?? []).find((c) => c.ref === checkpointRef);
-        if (own) own.touchedFiles = this.applier.touchedFilesFor(session.id);
+        if (own) own.touchedFiles = this.applier.touchedFilesFrom(session.id, messageIndex);
       } catch (err) {
         this.logger.debug('Failed to persist touched files on checkpoint', String(err));
       }
