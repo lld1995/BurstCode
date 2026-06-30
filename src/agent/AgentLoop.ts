@@ -406,7 +406,7 @@ function buildInterruptedProgressNote(
       .join('\n');
     parts.push(
       `${salvage.writeFile.fragmentCount} write_file call(s) were recovered and written to disk before resuming. Treat the written file content as committed base work, not draft text.\n` +
-      `If the write_file call was truncated, the file may contain only the streamed prefix. Before retrying, read the current file, then append or repair only the missing tail in a smaller write_file/propose_edit call; do not regenerate the whole file blindly.\n` +
+      `If the write_file call was truncated, the file may contain only the streamed prefix. Before retrying, read the current file/tail, then continue from the exact tail: use write_file mode="append" only for strictly missing suffix bytes, or use a tiny propose_edit/write_file repair for the smallest incorrect block. Do not resend or overwrite the whole file blindly.\n` +
       `Recovered write_file outputs:\n${landed}`
     );
   }
@@ -442,18 +442,48 @@ function buildInterruptedProgressNote(
       `The listed propose_edit fragments / write_file outputs are already on disk; treat them as the baseline and do not re-emit them or replace the same broad ranges. ` +
       `For large tasks, do not restart the implementation plan from scratch: inspect the current live file contents, decide the smallest next missing/incorrect range, then issue a narrow follow-up edit/write. ` +
       `If propose_edit failed or may have garbled a file, enter recovery mode first: read the whole file when feasible, or restore from git/checkpoint if it is too large or clearly corrupted; then make a short revised plan and use a safer edit strategy such as smaller hunks, precise oldText, delete_lines, or a temporary scripted replacement. ` +
-      `For write_file truncation, read the partially-written file first and continue from the actual tail instead of rewriting the whole content. ` +
+      `For write_file truncation, read the partially-written file/tail first and continue from the actual tail: use write_file mode="append" only for a strictly additive missing suffix, otherwise repair the smallest incorrect block; never resend already-written bytes. ` +
       `For missing/wrong braces, brackets, parentheses, tags, or quotes, handle it as a syntax-structure repair: read the broken block with neighboring boundaries, patch only the unmatched/extra delimiter or tiny enclosing block, then run the relevant compiler/parser check before broadening scope. ` +
       `If you are tempted to rewrite a large region, do not append/regenerate it; use oldText to replace the exact existing bad block or delete_lines to remove the exact duplicate block. ` +
       `If the landed work made later intended text obsolete or duplicated, delete/adjust only that duplicate tail rather than rewriting the landed block. ` +
       `Remember read results may be partial windows rather than whole files. `
-    : `Use the captured progress below to continue from the last coherent point instead of starting over. `;
+    : `Use the captured progress below to continue from the last coherent point instead of starting over. ` +
+      `No complete write fragment was safely landed before the interruption, so the captured assistant/tool output remains an in-memory continuation prefix for the next auto-resume attempt. ` +
+      `Continue by emitting ONLY the missing suffix after that prefix; BurstCode will prepend the captured prefix to the resumed stream before parsing/executing the final tool call. ` +
+      `Do not repeat the already-streamed prefix, do not retry the same giant payload from the beginning, and prefer completing the current small hunk/chunk rather than starting a replacement payload. `;
   return (
     `[interrupted-generation] The previous assistant turn ${lead}. ` +
     continuation +
-    `If a partial propose_edit/tool JSON is shown, treat it as a draft only: re-read/retarget against the current file state and issue smaller complete propose_edit calls (prefer one file/hunk at a time). Do not assume a collect_context/read_file slice is the complete file unless the tool output explicitly covers line 1 through the file total or full:true was used.\n\n` +
+    `If a partial propose_edit/tool JSON is shown, treat it as a draft only: continue from its last coherent point, re-read/retarget against the current file state if it names a real target, and issue smaller complete propose_edit/write_file calls (prefer one file/hunk/chunk at a time). Do not assume a collect_context/read_file slice is the complete file unless the tool output explicitly covers line 1 through the file total or full:true was used.\n\n` +
     parts.join('\n\n')
   );
+}
+
+function buildInterruptedDraftAssistantMessage(
+  reason: 'cancelled' | 'timeout' | 'stream error',
+  assistantText: string,
+  toolCalls: Array<{ index: number; name: string; arguments: string }>
+): ChatMessage | null {
+  const parts: string[] = [];
+  const visible = assistantText.trim();
+  if (visible) {
+    parts.push(
+      `Interrupted partial assistant output before ${reason}. This is a DRAFT CONTINUATION PREFIX, not final text. Continue from its tail; do not restart it from the beginning:\n\n` +
+      clipMiddle(assistantText, CANCELLED_PROGRESS_TEXT_LIMIT)
+    );
+  }
+  for (const tc of toolCalls) {
+    const args = tc.arguments ?? '';
+    if (!tc.name && !args.trim()) continue;
+    parts.push(
+      `Interrupted partial ${tc.name || 'tool'} call #${tc.index} before ${reason}. ` +
+      `These arguments are an IN-MEMORY DRAFT PREFIX. Do not execute them verbatim and do not regenerate them from the beginning. ` +
+      `On automatic resume, BurstCode seeds the tool-call accumulator with this prefix before reading your next stream, so continue by outputting only the missing suffix needed to finish the current complete hunk/chunk:\n\n` +
+      '```json\n' + clipMiddle(args, CANCELLED_PROGRESS_ARG_LIMIT) + '\n```'
+    );
+  }
+  if (parts.length === 0) return null;
+  return { role: 'assistant', content: parts.join('\n\n') };
 }
 
 type SalvagedEditFragment = {
@@ -991,16 +1021,25 @@ export class AgentLoop {
         : 0;
       let resumeAttempt = 0;
       let streamOk = false;
+      let resumeAssistantPrefix = '';
+      let resumeReasoningPrefix = '';
+      let resumeToolCallPrefixes: Array<[number, { id?: string; name: string; arguments: string }]> = [];
       // Tracks propose_edit fragments already landed by the interruption-salvage
       // pass so the same fragment is not re-applied on every resume attempt of
       // this turn. Re-declared per outer iteration so a deliberate re-issue in a
       // later turn is never blocked.
       const salvagedInterruptedEdits = new Set<string>();
       while (!streamOk) {
-        // Reset per-attempt streaming state.
-        assistantText = '';
-        reasoningText = '';
+        // Reset per-attempt streaming state, then seed any non-landed partial
+        // output from the previous interrupted attempt. The seeded prefix is NOT
+        // re-streamed to the UI, but it is prepended before final tool parsing so
+        // the model can output only the missing suffix on auto-resume.
+        assistantText = resumeAssistantPrefix;
+        reasoningText = resumeReasoningPrefix;
         toolCallAccumulator.clear();
+        for (const [idx, value] of resumeToolCallPrefixes) {
+          toolCallAccumulator.set(idx, { ...value });
+        }
         preAnnounced.clear();
         argDeltaBuffers.clear();
         finishReason = undefined;
@@ -1147,6 +1186,12 @@ export class AgentLoop {
               interruptedToolCalls,
               salvage
             );
+            const interruptedDraft = buildInterruptedDraftAssistantMessage(
+              'cancelled',
+              assistantText,
+              interruptedToolCalls
+            );
+            if (interruptedDraft) messages.push(interruptedDraft);
             if (progressNote) messages.push({ role: 'user', content: progressNote });
             yield { type: 'done', payload: { reason: 'cancelled' } };
             return;
@@ -1238,6 +1283,12 @@ export class AgentLoop {
               interruptedToolCalls,
               salvage
             );
+            const interruptedDraft = buildInterruptedDraftAssistantMessage(
+              'cancelled',
+              assistantText,
+              interruptedToolCalls
+            );
+            if (interruptedDraft) messages.push(interruptedDraft);
             if (progressNote) messages.push({ role: 'user', content: progressNote });
             yield { type: 'done', payload: { reason: 'cancelled' } };
             return;
@@ -1276,7 +1327,32 @@ export class AgentLoop {
             interruptedToolCalls,
             salvage
           );
+          const interruptedDraft = buildInterruptedDraftAssistantMessage(
+            String(err).includes(`LLM stream timed out after ${STREAM_TIMEOUT_MS}ms`) ? 'timeout' : 'stream error',
+            assistantText,
+            interruptedToolCalls
+          );
+          if (interruptedDraft) messages.push(interruptedDraft);
           if (progressNote) messages.push({ role: 'user', content: progressNote });
+          if (salvage.count === 0) {
+            resumeAssistantPrefix = assistantText;
+            resumeReasoningPrefix = reasoningText;
+            resumeToolCallPrefixes = interruptedToolCalls.map((tc) => {
+              const current = toolCallAccumulator.get(tc.index);
+              return [
+                tc.index,
+                { id: current?.id, name: tc.name, arguments: tc.arguments }
+              ];
+            });
+          } else {
+            // Once any interrupted write has been salvaged to disk, it becomes the
+            // live baseline. Do not seed those tool arguments again or the next
+            // attempt may execute/review duplicate edits; the prompt will instead
+            // drive a narrow follow-up against the current file state.
+            resumeAssistantPrefix = '';
+            resumeReasoningPrefix = '';
+            resumeToolCallPrefixes = [];
+          }
           // Context-length errors cannot be fixed by retrying the same request.
           // Force-compress the persistent message array and retry via the outer
           // loop so the model gets a fresh (smaller) context window.

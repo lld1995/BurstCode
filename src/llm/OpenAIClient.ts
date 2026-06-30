@@ -315,6 +315,13 @@ interface VideoTaskResponse {
   video_url?: string;
   error?: { code?: string; message?: string };
   usage?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+interface ExtractedVideoResult {
+  url?: string;
+  data?: Buffer;
+  mimeType?: string;
 }
 
 /** Small helper: resolve after ms, abortable via signal. */
@@ -339,6 +346,83 @@ function normalizeVideoSize(size: string): string {
   if (value === '720p') return '1280x720';
   if (value === '1080p') return '1920x1080';
   return size || DEFAULT_VIDEO_RESOLUTION;
+}
+
+function normalizeVideoImageInput(imageUrl: string): unknown {
+  const value = imageUrl.trim();
+  const dataUrl = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i.exec(value);
+  if (dataUrl) {
+    return {
+      bytesBase64Encoded: dataUrl[2].replace(/\s+/g, ''),
+      mimeType: dataUrl[1]
+    };
+  }
+
+  // If the caller provided a raw base64 image string, send the Vertex-compatible
+  // object form instead of a bare string so BifrostLite can reliably map it to
+  // instances[0].image.
+  if (/^[a-z0-9+/=\s]{80,}$/i.test(value)) {
+    return {
+      bytesBase64Encoded: value.replace(/\s+/g, ''),
+      mimeType: 'image/png'
+    };
+  }
+
+  return value;
+}
+
+function tryDecodeBase64Video(value: string): ExtractedVideoResult | undefined {
+  const trimmed = value.trim();
+  const dataUrl = /^data:(video\/[a-z0-9.+-]+|application\/octet-stream);base64,([a-z0-9+/=\s]+)$/i.exec(trimmed);
+  if (dataUrl) {
+    return {
+      data: Buffer.from(dataUrl[2].replace(/\s+/g, ''), 'base64'),
+      mimeType: dataUrl[1]
+    };
+  }
+  if (/^[a-z0-9+/=\s]{80,}$/i.test(trimmed)) {
+    return {
+      data: Buffer.from(trimmed.replace(/\s+/g, ''), 'base64'),
+      mimeType: 'video/mp4'
+    };
+  }
+  return undefined;
+}
+
+function extractVideoResult(value: unknown, seen = new Set<unknown>()): ExtractedVideoResult | undefined {
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (/^https?:\/\//i.test(text)) return { url: text };
+    return tryDecodeBase64Video(text);
+  }
+  if (!value || typeof value !== 'object') return undefined;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+
+  const obj = value as Record<string, unknown>;
+  const preferredKeys = [
+    'url',
+    'video_url',
+    'videoUrl',
+    'uri',
+    'gcsUri',
+    'signedUrl',
+    'downloadUrl',
+    'videoBytes',
+    'video_bytes',
+    'videoBytesBase64',
+    'bytesBase64Encoded',
+    'base64'
+  ];
+  for (const key of preferredKeys) {
+    const found = extractVideoResult(obj[key], seen);
+    if (found) return found;
+  }
+  for (const v of Object.values(obj)) {
+    const found = extractVideoResult(v, seen);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 /** Generic JSON HTTP request (POST or GET) with Bearer auth. */
@@ -426,7 +510,9 @@ export async function generateVideo(
   const base = cfg.baseURL.replace(/\/+$/, '');
   const submitEndpoint = `${base}/videos`;
 
-  // Build request body — OpenAI standard format.
+  // Build request body — OpenAI-compatible video format.  BifrostLite accepts
+  // the first-frame image via the `image` field and translates it to
+  // Vertex AI `instances[0].image` for ZenMux/Seedance providers.
   const body: Record<string, unknown> = {
     model: cfg.model,
     prompt,
@@ -434,7 +520,7 @@ export async function generateVideo(
     size: normalizeVideoSize(cfg.resolution)
   };
   if (opts.imageUrl) {
-    body.image_url = opts.imageUrl;
+    body.image = normalizeVideoImageInput(opts.imageUrl);
   }
 
   // --- Step 1: submit the task ---
@@ -460,7 +546,6 @@ export async function generateVideo(
 
   for (let i = 0; i < maxAttempts; i++) {
     if (opts.signal?.aborted) throw new Error('aborted');
-    await sleep(intervalMs, opts.signal);
 
     const task = await httpJsonRequest<VideoTaskResponse>(
       pollUrl,
@@ -475,19 +560,29 @@ export async function generateVideo(
     opts.onProgress?.(`Video task ${videoId}: ${status} (${i + 1}/${maxAttempts})…`);
 
     if (status === 'completed') {
-      // Try direct URL from response first, then fall back to content endpoint.
-      const videoUrl = task.url || task.video_url;
-      if (videoUrl) {
+      // Try direct URL/base64 data from the completed task response first, then
+      // fall back to /videos/{id}/content. Some Vertex-compatible relays expose
+      // the final asset only inside nested operation response fields.
+      const extracted = extractVideoResult(task);
+      if (extracted?.data) {
+        opts.onProgress?.(`Video task ${videoId} completed; using embedded video data…`);
+        return {
+          data: extracted.data,
+          mimeType: extracted.mimeType || 'video/mp4',
+          videoUrl: pollUrl
+        };
+      }
+      if (extracted?.url) {
         opts.onProgress?.(`Video task ${videoId} completed; downloading video…`);
         const fetched = await downloadBytes(
-          videoUrl,
+          extracted.url,
           cfg.allowSelfSignedCerts,
           opts.signal
         );
         return {
           data: fetched.body,
-          mimeType: fetched.mimeType || 'video/mp4',
-          videoUrl
+          mimeType: fetched.mimeType || extracted.mimeType || 'video/mp4',
+          videoUrl: extracted.url
         };
       }
       // No URL in response — download from /videos/{id}/content (needs auth).
@@ -510,6 +605,9 @@ export async function generateVideo(
       throw new Error(`Video generation failed: ${errMsg}`);
     }
     // status is 'queued' or 'in_progress' — keep polling
+    if (i < maxAttempts - 1) {
+      await sleep(intervalMs, opts.signal);
+    }
   }
 
   const timeoutMinutes = Math.round((maxAttempts * intervalMs) / 60000);

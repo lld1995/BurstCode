@@ -194,15 +194,22 @@ const PROTOCOL = `WORKING PROTOCOL:
      pure UI confirmation; it does NOT gate compilation, testing, or your next turn.
   • write_file — for agent-generated scripts, temp files, or any file the agent will
     immediately execute or read back. Writes to disk instantly, no review step.
+    Default mode overwrites the target file. Use mode="append" / append=true ONLY
+    after reading the current tail of a partially-written file and only for the
+    strictly missing suffix; never resend bytes that are already on disk.
 
   LARGE / FAILED WRITES — mandatory recovery behavior:
     If a propose_edit or write_file attempt for a whole file / large fragment fails,
     is truncated, cannot parse JSON, or produces no landed change, DO NOT retry the
-    same single huge call. Split the work into multiple smaller ordered calls:
+    same single huge call and DO NOT discard coherent output just because it was not
+    applied to disk. Treat non-landed partial assistant/tool output as a draft: continue
+    from the last coherent point by converting the remaining intent into smaller
+    complete tool calls. Split the work into multiple smaller ordered calls:
       1. re-read the current file/tail first so you know what actually landed;
       2. apply one small hunk, function, section, or file chunk per call;
-      3. for write_file partial output, append/repair only the missing tail instead
-         of overwriting the whole file again;
+      3. for write_file partial output, use mode="append" only for a strictly
+         additive missing tail already present on disk; if nothing landed, write only
+         the next small complete chunk rather than regenerating the entire payload;
       4. verify after the chunks land. This is required so work can still reach disk
          when the model/tool output budget cannot carry one giant payload.
 

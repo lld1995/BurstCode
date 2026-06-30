@@ -203,6 +203,7 @@ export function buildTranscript(
         text.startsWith('[stuck-detector]') ||
         text.startsWith('[user-decision]') ||
         text.startsWith('[context-offload hint]') ||
+        text.startsWith('[interrupted-generation]') ||
         text.startsWith('Your previous response was cut off');
       if (!isInternal) {
         entries.push({
@@ -215,6 +216,15 @@ export function buildTranscript(
         });
       }
     } else if (m.role === 'assistant') {
+      // Internal interrupted-draft assistant messages are fed back to the model
+      // for continuation, but they are not final chat content and should not
+      // render as user-visible history bubbles.
+      const text = typeof m.content === 'string' ? m.content : '';
+      const isInterruptedDraft =
+        text.startsWith('Interrupted partial assistant output before ') ||
+        text.startsWith('Interrupted partial tool call #') ||
+        text.includes('IN-MEMORY DRAFT PREFIX');
+      if (isInterruptedDraft) continue;
       // Render reasoning_content (DeepSeek V4 field, or chain-of-thought
       // we extracted from <think>...</think> tags in Qwen3 / GLM / Kimi
       // output) as a separate collapsible entry that precedes the answer.
@@ -222,7 +232,6 @@ export function buildTranscript(
       if (typeof reasoning === 'string' && reasoning.trim().length > 0) {
         entries.push({ kind: 'reasoning', text: reasoning });
       }
-      const text = typeof m.content === 'string' ? m.content : '';
       if (text) entries.push({ kind: 'assistant', text });
       const calls =
         (m as unknown as { tool_calls?: Array<{ id?: string; function: { name: string; arguments: string } }> })

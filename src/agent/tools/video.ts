@@ -4,6 +4,12 @@ import { Tool, ToolContext, ToolResult } from './types';
 import { generateVideo, readVideoConfig } from '../../llm/OpenAIClient';
 import { Logger } from '../../util/Logger';
 
+export interface VideoFirstFrameAttachment {
+  dataUrl: string;
+  mimeType: string;
+  name?: string;
+}
+
 function workspaceRoot(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
@@ -24,7 +30,7 @@ function slugify(text: string): string {
  * falling back to the chat profile). The generated MP4 is written into the
  * workspace so the user can open / commit the result.
  */
-export function buildVideoTool(logger: Logger): Tool {
+export function buildVideoTool(logger: Logger, getDefaultFirstFrameImage?: () => VideoFirstFrameAttachment | undefined): Tool {
   return {
     name: 'generate_video',
     parallelSafe: false,
@@ -55,8 +61,13 @@ export function buildVideoTool(logger: Logger): Tool {
             imageUrl: {
               type: 'string',
               description:
-                'Optional reference image URL (http/https) or a workspace-relative path to an image file. ' +
+                'Optional first-frame/reference image URL (http/https), data URL, or workspace-relative image path. ' +
                 'When provided, the model generates an image-to-video (i2v) result; otherwise text-to-video (t2v).'
+            },
+            firstFrameImage: {
+              type: 'string',
+              description:
+                'Alias for imageUrl: optional first-frame image URL, data URL, or workspace-relative image path.'
             }
           },
           required: ['prompt']
@@ -79,39 +90,62 @@ export function buildVideoTool(logger: Logger): Tool {
         };
       }
 
-      // Resolve optional image reference (URL or local file → data URI).
+      // Resolve optional first-frame image reference (URL/data URL, local file, or pasted-chat image name).
       let imageUrl: string | undefined;
-      const rawImageUrl = args.imageUrl ? String(args.imageUrl).trim() : '';
+      let imageSource: 'argument' | 'pasted-chat-image' | undefined;
+      const fallback = getDefaultFirstFrameImage?.();
+      const rawImageUrl = String(args.imageUrl ?? args.firstFrameImage ?? '').trim();
       if (rawImageUrl) {
-        if (/^https?:\/\//i.test(rawImageUrl)) {
-          imageUrl = rawImageUrl;
+        if (
+          fallback?.dataUrl &&
+          /^data:image\//i.test(fallback.dataUrl) &&
+          fallback.name &&
+          rawImageUrl.replace(/^.*[\\/]/, '').toLowerCase() === fallback.name.toLowerCase()
+        ) {
+          imageUrl = fallback.dataUrl;
+          imageSource = 'pasted-chat-image';
+          ctx.emitProgress(`Using pasted chat image (${fallback.name}) as the first frame.`);
         } else {
-          // Treat as a workspace-relative file path → read & encode as data URI.
-          const root = workspaceRoot();
-          const absPath = path.isAbsolute(rawImageUrl)
-            ? rawImageUrl
-            : root
-            ? path.join(root, rawImageUrl)
-            : rawImageUrl;
-          try {
-            const uri = vscode.Uri.file(
-              process.platform === 'win32' ? absPath.replace(/\\/g, '/') : absPath
-            );
-            const buf = await vscode.workspace.fs.readFile(uri);
-            const ext = path.extname(absPath).toLowerCase();
-            const mime =
-              ext === '.png' ? 'image/png' :
-              ext === '.webp' ? 'image/webp' :
-              ext === '.gif' ? 'image/gif' :
-              'image/jpeg';
-            imageUrl = `data:${mime};base64,${Buffer.from(buf).toString('base64')}`;
-          } catch (err) {
-            return {
-              content: `generate_video: failed to read reference image ${rawImageUrl} — ${String((err as Error)?.message ?? err)}`,
-              isError: true
-            };
+          imageSource = 'argument';
+          if (/^(https?:|data:image\/)/i.test(rawImageUrl)) {
+            imageUrl = rawImageUrl;
+          } else {
+            // Treat as a workspace-relative file path → read & encode as data URI.
+            const root = workspaceRoot();
+            const absPath = path.isAbsolute(rawImageUrl)
+              ? rawImageUrl
+              : root
+              ? path.join(root, rawImageUrl)
+              : rawImageUrl;
+            try {
+              const uri = vscode.Uri.file(
+                process.platform === 'win32' ? absPath.replace(/\\/g, '/') : absPath
+              );
+              const buf = await vscode.workspace.fs.readFile(uri);
+              const ext = path.extname(absPath).toLowerCase();
+              const mime =
+                ext === '.png' ? 'image/png' :
+                ext === '.webp' ? 'image/webp' :
+                ext === '.gif' ? 'image/gif' :
+                'image/jpeg';
+              imageUrl = `data:${mime};base64,${Buffer.from(buf).toString('base64')}`;
+              ctx.emitProgress(`Using first-frame image file ${rawImageUrl} (${(buf.length / 1024).toFixed(1)} KB).`);
+            } catch (err) {
+              return {
+                content:
+                  `generate_video: failed to read first-frame image "${rawImageUrl}" as a workspace file — ${String((err as Error)?.message ?? err)}\n` +
+                  'If this is a pasted chat attachment, leave imageUrl/firstFrameImage empty or use the attachment filename exactly as shown.',
+                isError: true
+              };
+            }
           }
         }
+      } else if (fallback?.dataUrl && /^data:image\//i.test(fallback.dataUrl)) {
+        imageUrl = fallback.dataUrl;
+        imageSource = 'pasted-chat-image';
+        ctx.emitProgress(
+          `Using pasted chat image${fallback.name ? ` (${fallback.name})` : ''} as the first frame.`
+        );
       }
 
       ctx.emitProgress(`Generating video with ${cfg.model} …`);
@@ -182,8 +216,9 @@ export function buildVideoTool(logger: Logger): Tool {
       return {
         content:
           `Generated video saved to ${rel} (${(result.data.length / 1024 / 1024).toFixed(1)} MB, ${result.mimeType}).` +
+          (imageSource === 'pasted-chat-image' ? '\nFirst frame: pasted chat image.' : imageSource === 'argument' ? '\nFirst frame: image argument.' : '') +
           `\nSource URL: ${result.videoUrl}`,
-        meta: { path: uri.toString(), bytes: result.data.length, mimeType: result.mimeType }
+        meta: { path: uri.toString(), bytes: result.data.length, mimeType: result.mimeType, firstFrameImageSource: imageSource }
       };
     }
   };

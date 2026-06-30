@@ -476,7 +476,19 @@ export function salvageWriteFileArgs(raw: string): Record<string, unknown> | nul
     }
   }
   if (contentValue === undefined) return null;
-  return { path: pathValue, content: contentValue, __bc_truncatedSalvage: true };
+
+  const modeValue = partialParsed && typeof partialParsed.mode === 'string'
+    ? partialParsed.mode
+    : pickLooseStringField(raw, ['mode'])?.value;
+  const appendValue = partialParsed && typeof partialParsed.append === 'boolean'
+    ? partialParsed.append
+    : /"append"\s*:\s*true\b/.test(raw);
+  const salvaged: Record<string, unknown> = { path: pathValue, content: contentValue, __bc_truncatedSalvage: true };
+  if (modeValue === 'append' || appendValue) {
+    salvaged.mode = 'append';
+    salvaged.append = true;
+  }
+  return salvaged;
 }
 
 /**
@@ -495,12 +507,14 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string): T
       function: {
         name: 'write_file',
         description:
-          'Write (or overwrite) a file on disk immediately — no user review step, no diff UI. Use for agent-generated helper scripts, temp/scratch files, config stubs, and any file the agent needs to create and then immediately execute or read back. NOT for modifying the user\'s existing source files — use propose_edit for those so the user can review the diff. Parent directories are created automatically. Path may be workspace-relative or absolute. If writing a whole file / large content fails, is truncated, or cannot parse, DO NOT retry the same giant payload; read back the current file and split the write into smaller generated files/chunks or append/repair only the missing tail in follow-up calls.',
+          'Write or append a file on disk immediately — no user review step, no diff UI. Use for agent-generated helper scripts, temp/scratch files, config stubs, and any file the agent needs to create and then immediately execute or read back. NOT for modifying the user\'s existing source files — use propose_edit for those so the user can review the diff. Parent directories are created automatically. Path may be workspace-relative or absolute. Default mode overwrites the file. Set mode="append" (or append=true) ONLY when continuing a previously interrupted/partial write_file output after reading the current tail; do not resend already-written content. If writing a whole file / large content fails, is truncated, or cannot parse, DO NOT retry the same giant payload; read back the current file and split the write into smaller generated files/chunks or append/repair only the missing tail in follow-up calls.',
         parameters: {
           type: 'object',
           properties: {
             path: { type: 'string', description: 'Workspace-relative or absolute file path.' },
-            content: { type: 'string', description: 'Full file contents to write.' }
+            content: { type: 'string', description: 'Full file contents to write, or only the missing tail when mode="append".' },
+            mode: { type: 'string', enum: ['write', 'append'], description: 'Default "write" overwrites. Use "append" to continue an interrupted partial write_file after reading the file tail.' },
+            append: { type: 'boolean', description: 'Alias for mode="append". Use only to continue a partial write; never resend already-written bytes.' }
           },
           required: ['path', 'content']
         }
@@ -510,6 +524,7 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string): T
       const target = String(args.path ?? '').trim();
       if (!target) return { content: 'write_file: path is required', isError: true };
       const content = String(args.content ?? '');
+      const appendMode = args.mode === 'append' || args.append === true || args.append === 'true';
       const uri = resolveUri(target);
       const fsModule = await import('fs/promises');
       const nodePath = await import('path');
@@ -517,25 +532,31 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string): T
         await fsModule.mkdir(nodePath.dirname(uri.fsPath), { recursive: true });
         let existed = false;
         try { await fsModule.access(uri.fsPath); existed = true; } catch { existed = false; }
-        await fsModule.writeFile(uri.fsPath, content, 'utf8');
+        if (appendMode) {
+          await fsModule.appendFile(uri.fsPath, content, 'utf8');
+        } else {
+          await fsModule.writeFile(uri.fsPath, content, 'utf8');
+        }
         // Bind this write to the current session so a later rollback only
         // reverts/deletes files THIS session actually wrote.
         try { applier?.recordTouchedFile(uri, sessionId); } catch { /* non-fatal */ }
         const relPath = vscode.workspace.asRelativePath(uri);
         const truncationNote = args.__bc_truncatedSalvage
-          ? ' IMPORTANT: this write_file call was TRUNCATED mid-stream; the partial content that arrived was written to disk. Read the file back and append/repair only the missing tail in a smaller follow-up call.'
+          ? ' IMPORTANT: this write_file call was TRUNCATED mid-stream; the partial content that arrived was written to disk. Read the file back and append/repair only the missing tail in a smaller follow-up call using mode="append" when the tail is strictly additive.'
           : '';
+        const verb = appendMode ? 'Appended' : 'Written';
+        const suffix = appendMode ? ' (append mode)' : '';
         return {
-          content: `Written ${content.split(/\r?\n/).length} line(s) to ${relPath}.${truncationNote}`,
-          meta: { uri: uri.toString(), bytes: Buffer.byteLength(content, 'utf8'), created: !existed }
+          content: `${verb} ${content.split(/\r?\n/).length} line(s) to ${relPath}${suffix}.${truncationNote}`,
+          meta: { uri: uri.toString(), bytes: Buffer.byteLength(content, 'utf8'), created: !existed, mode: appendMode ? 'append' : 'write' }
         };
       } catch (err) {
         return {
           content:
             `write_file failed: ${String((err as Error).message ?? err)}. ` +
             `If this was a whole-file or large-content write, do not retry the same oversized payload. ` +
-            `Read the current file state, then split the work into smaller write_file/propose_edit calls ` +
-            `(for example separate files/chunks, or append/repair only the missing tail).`,
+            `Read the current file state/tail, then split the work into smaller write_file/propose_edit calls ` +
+            `(for write_file, use mode="append" only for the missing tail; otherwise repair the smallest incorrect block).`,
           isError: true
         };
       }

@@ -1896,7 +1896,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ...editTools,
       writeFileTool,
       buildImageTool(this.logger),
-      buildVideoTool(this.logger),
+      buildVideoTool(this.logger, () => opts.images?.[0]),
       ...buildShellTools({ askUser }),
       buildPlanTool(onPlanUpdate),
       ...buildLessonTools(this.lessons, (list) => {
@@ -2615,10 +2615,14 @@ setTimeout(() => {
   .image-chip button:hover { background: rgba(209,52,56,0.92); }
   .msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 0 20px; }
   .msg-image-thumb { width: 96px; height: 72px; border: 1px solid var(--vscode-panel-border); border-radius: 8px; object-fit: cover; background: var(--vscode-editorWidget-background); cursor: zoom-in; }
-  #imagePreviewOverlay { display: none; position: fixed; inset: 0; z-index: 120; background: rgba(0,0,0,0.72); align-items: center; justify-content: center; padding: 20px; }
+  #imagePreviewOverlay { display: none; position: fixed; inset: 0; z-index: 120; background: rgba(0,0,0,0.78); flex-direction: column; align-items: stretch; justify-content: stretch; padding: 14px; }
   #imagePreviewOverlay.active { display: flex; }
-  #imagePreviewOverlay img { max-width: 96vw; max-height: 86vh; border-radius: 8px; box-shadow: 0 12px 36px rgba(0,0,0,0.55); background: var(--vscode-editor-background); }
-  #imagePreviewOverlay button { position: absolute; top: 12px; right: 12px; width: 30px; height: 30px; border: 1px solid rgba(255,255,255,0.28); border-radius: 50%; background: rgba(0,0,0,0.55); color: #fff; cursor: pointer; font-size: 18px; line-height: 28px; }
+  .image-preview-toolbar { display: flex; justify-content: flex-end; align-items: center; gap: 6px; flex-shrink: 0; padding-bottom: 10px; }
+  .image-preview-toolbar button { height: 30px; min-width: 30px; border: 1px solid rgba(255,255,255,0.28); border-radius: 7px; background: rgba(0,0,0,0.55); color: #fff; cursor: pointer; font-size: 13px; line-height: 28px; padding: 0 9px; }
+  .image-preview-toolbar button:hover { background: rgba(255,255,255,0.16); }
+  #imagePreviewStage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; cursor: grab; }
+  #imagePreviewStage.dragging { cursor: grabbing; }
+  #imagePreviewOverlay img { max-width: 96vw; max-height: 82vh; border-radius: 8px; box-shadow: 0 12px 36px rgba(0,0,0,0.55); background: var(--vscode-editor-background); user-select: none; -webkit-user-drag: none; transform-origin: center center; will-change: transform; }
   .composer-toggles { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
   .toggle input { display: none; }
@@ -2627,6 +2631,13 @@ setTimeout(() => {
   .toggle input:checked + .track { background: var(--vscode-button-background); }
   .toggle input:checked + .track::after { transform: translateX(10px); }
   .toggle .txt { font-size: 0.95em; }
+
+  #attachImageInput { display: none; }
+  #attachImageBtn { width: 28px; height: 28px; padding: 0; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--vscode-descriptionForeground); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: background 0.15s, color 0.15s, border-color 0.15s, transform 0.1s; }
+  #attachImageBtn:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); border-color: var(--vscode-panel-border); }
+  #attachImageBtn:active:not(:disabled) { transform: scale(0.94); }
+  #attachImageBtn:disabled { cursor: not-allowed; opacity: 0.45; }
+  #attachImageBtn svg { width: 15px; height: 15px; display: block; }
 
   #sendBtn { width: 28px; height: 28px; padding: 0; border: none; border-radius: 7px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: background 0.15s, transform 0.1s; }
   #sendBtn:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
@@ -2803,6 +2814,10 @@ setTimeout(() => {
         <div id="attachments" class="attachments" aria-label="Image attachments"></div>
         <textarea id="input" rows="1" placeholder="Ask BurstCode..."></textarea>
       </div>
+      <input id="attachImageInput" type="file" accept="image/*" multiple aria-label="Select images">
+      <button id="attachImageBtn" type="button" title="Add images (supports multi-select and paste)" aria-label="Add images">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><circle cx="6" cy="6.2" r="1.1"/><path d="M4 11l2.6-2.8 2 2L10 8.7 12.5 11"/></svg>
+      </button>
       <button id="queueBtn" title="Queue message (Enter) — will be processed after current response" aria-label="Queue message">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg>
       </button>
@@ -2837,10 +2852,18 @@ setTimeout(() => {
 	    <div class="rb-spinner"></div>
 	    <div class="rb-label">Rolling back...</div>
 	  </div>
-	  <div id="imagePreviewOverlay" aria-label="Image preview">
-	    <button id="imagePreviewClose" type="button" title="Close preview" aria-label="Close preview">×</button>
-	    <img id="imagePreviewImg" alt="Image preview">
-	  </div>
+		  <div id="imagePreviewOverlay" aria-label="Image preview">
+		    <div class="image-preview-toolbar" role="toolbar" aria-label="Image preview controls">
+		      <button id="imagePreviewZoomOut" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+		      <button id="imagePreviewZoomIn" type="button" title="Zoom in" aria-label="Zoom in">＋</button>
+		      <button id="imagePreviewReset" type="button" title="Reset zoom and position" aria-label="Reset zoom and position">Reset</button>
+		      <button id="imagePreviewCopy" type="button" title="Copy image" aria-label="Copy image">Copy</button>
+		      <button id="imagePreviewClose" type="button" title="Close preview" aria-label="Close preview">×</button>
+		    </div>
+		    <div id="imagePreviewStage">
+		      <img id="imagePreviewImg" alt="Image preview" draggable="false">
+		    </div>
+		  </div>
 <script nonce="${nonce}">
 ${diagScript}
 const vscode = acquireVsCodeApi();
@@ -2849,11 +2872,18 @@ const log = document.getElementById('log');
 const input = document.getElementById('input');
 const attachmentsEl = document.getElementById('attachments');
 const imagePreviewOverlay = document.getElementById('imagePreviewOverlay');
+const imagePreviewStage = document.getElementById('imagePreviewStage');
 const imagePreviewImg = document.getElementById('imagePreviewImg');
+const imagePreviewZoomOut = document.getElementById('imagePreviewZoomOut');
+const imagePreviewZoomIn = document.getElementById('imagePreviewZoomIn');
+const imagePreviewReset = document.getElementById('imagePreviewReset');
+const imagePreviewCopy = document.getElementById('imagePreviewCopy');
 const imagePreviewClose = document.getElementById('imagePreviewClose');
 const rulesToggle = document.getElementById('rulesToggle');
 const skillsToggle = document.getElementById('skillsToggle');
 const mcpToggle = document.getElementById('mcpToggle');
+const attachImageInput = document.getElementById('attachImageInput');
+const attachImageBtn = document.getElementById('attachImageBtn');
 const sendBtn = document.getElementById('sendBtn');
 const queueBtn = document.getElementById('queueBtn');
 const newBtn = document.getElementById('newBtn');
@@ -5191,45 +5221,36 @@ window.addEventListener('message', (e) => {
       setStatus('continue', 'Auto-continuing ' + msg.payload.count + '/' + msg.payload.max + '...');
       break;
     }
-    case 'auto-resume': {
-      // Stream was interrupted mid-turn. Keep any streamed propose_edit /
-      // write_file preview visible instead of deleting it: the tool has not
-      // executed yet (partial JSON cannot be applied), but the preview is the
-      // only user-visible evidence of what the model had already written before
-      // the timeout. Mark running cards as interrupted, detach them from the
-      // live-stream routing maps, and let the retry create fresh cards.
-      clearEmptyState();
-      if (activeAssistantEl && activeAssistantEl.parentNode) {
-        activeAssistantEl.parentNode.removeChild(activeAssistantEl);
-      }
-      if (activeReasoningEl && activeReasoningEl.parentNode) {
-        activeReasoningEl.parentNode.removeChild(activeReasoningEl);
-      }
-      activeAssistantEl = null;
-      activeReasoningEl = null;
-      activeStreamingToolEl = null;
-      for (const [key, det] of Array.from(toolElements.entries())) {
-        if (det.dataset.running === 'true') {
-          det.dataset.running = 'false';
-          det.dataset.interrupted = 'true';
-          det.open = true;
-          const s = det.querySelector('summary');
-          if (s) s.textContent = '⚠ ' + (runningTools.get(key)?.name || det.dataset.toolName || '?') + ' · stream interrupted before execution';
-          toolElements.delete(key);
-          runningTools.delete(key);
+      case 'auto-resume': {
+        // Stream was interrupted mid-turn. When backend auto-resume can seed the
+        // next attempt with the partial tool args already received, keep the live
+        // tool preview and routing IDs intact so suffix deltas append to the same
+        // card. This matches the execution model: code prepends the in-memory
+        // prefix before parsing the final tool call; the UI should also display
+        // one continuing preview, not an interrupted duplicate plus a restarted one.
+        clearEmptyState();
+        activeAssistantEl = null;
+        activeReasoningEl = null;
+        for (const [, det] of Array.from(toolElements.entries())) {
+          if (det.dataset.running === 'true') {
+            det.dataset.resuming = 'true';
+            det.open = true;
+            const s = det.querySelector('summary');
+            const name = det.dataset.toolName || '?';
+            if (s) s.textContent = '⟳ ' + name + ' · stream interrupted, resuming...';
+          }
         }
+        const attempt = (msg.payload && msg.payload.attempt) || 1;
+        const max = (msg.payload && msg.payload.max) || 1;
+        const errText = (msg.payload && msg.payload.error) ? String(msg.payload.error) : 'stream interrupted';
+        const pill = document.createElement('div');
+        pill.className = 'iter-pill';
+        pill.innerHTML = '<span class="pill" title="' + escapeHtml(errText) + '">↻ auto-resume ' + attempt + '/' + max + '</span>';
+        log.appendChild(pill);
+        scrollToBottom();
+        setStatus('continue', 'Stream interrupted, resuming ' + attempt + '/' + max + '...');
+        break;
       }
-      const attempt = (msg.payload && msg.payload.attempt) || 1;
-      const max = (msg.payload && msg.payload.max) || 1;
-      const errText = (msg.payload && msg.payload.error) ? String(msg.payload.error) : 'stream interrupted';
-      const pill = document.createElement('div');
-      pill.className = 'iter-pill';
-      pill.innerHTML = '<span class="pill" title="' + escapeHtml(errText) + '">↻ auto-resume ' + attempt + '/' + max + '</span>';
-      log.appendChild(pill);
-      scrollToBottom();
-      setStatus('continue', 'Stream interrupted, resuming ' + attempt + '/' + max + '...');
-      break;
-    }
     case 'reasoning-delta': {
       const delta = String(msg.payload && msg.payload.text || '');
       if (!activeReasoningEl && delta.trim().length === 0) break;
@@ -5304,6 +5325,14 @@ window.addEventListener('message', (e) => {
       if (toolElements.has(existingKey)) {
         const existingDet = toolElements.get(existingKey);
         const existingSum = existingDet.querySelector('summary');
+        if (msg.payload.streaming) {
+          existingDet.dataset.running = 'true';
+          existingDet.dataset.streaming = 'true';
+          delete existingDet.dataset.resuming;
+          activeStreamingToolEl = existingDet;
+          if (existingSum) existingSum.textContent = '\u{1F527} ' + msg.payload.name + '(continuing streamed args...) \u00b7 running...';
+          break;
+        }
         if (!applyRichTool(existingDet, msg.payload.name, msg.payload.args, msg.payload.meta, null, false, false)) {
           if (existingSum) existingSum.textContent = '\u{1F527} ' + msg.payload.name + '(' + JSON.stringify(msg.payload.args).slice(0, 200) + ') \u00b7 running...';
         }
@@ -5823,18 +5852,101 @@ window.addEventListener('message', (e) => {
 		function updateInputPlaceholder() {
 		  input.placeholder = pastedImages.length > 0 ? 'Add a message (optional)...' : 'Ask BurstCode...';
 		}
+	let imagePreviewScale = 1;
+	let imagePreviewX = 0;
+	let imagePreviewY = 0;
+	let imagePreviewDrag = null;
+	function applyImagePreviewTransform() {
+	  imagePreviewImg.style.transform = 'translate(' + imagePreviewX + 'px, ' + imagePreviewY + 'px) scale(' + imagePreviewScale + ')';
+	}
+	function resetImagePreviewTransform() {
+	  imagePreviewScale = 1;
+	  imagePreviewX = 0;
+	  imagePreviewY = 0;
+	  imagePreviewDrag = null;
+	  imagePreviewStage.classList.remove('dragging');
+	  applyImagePreviewTransform();
+	}
+	function zoomImagePreview(delta, originX, originY) {
+	  const oldScale = imagePreviewScale;
+	  const nextScale = Math.max(0.2, Math.min(8, imagePreviewScale * delta));
+	  if (Math.abs(nextScale - oldScale) < 0.001) return;
+	  if (typeof originX === 'number' && typeof originY === 'number') {
+	    const rect = imagePreviewImg.getBoundingClientRect();
+	    const cx = rect.left + rect.width / 2;
+	    const cy = rect.top + rect.height / 2;
+	    imagePreviewX -= (originX - cx) * (nextScale / oldScale - 1);
+	    imagePreviewY -= (originY - cy) * (nextScale / oldScale - 1);
+	  }
+	  imagePreviewScale = nextScale;
+	  applyImagePreviewTransform();
+	}
 	function openImagePreview(src) {
 	  imagePreviewImg.src = src;
+	  resetImagePreviewTransform();
 	  imagePreviewOverlay.classList.add('active');
 	}
 	function closeImagePreview() {
 	  imagePreviewOverlay.classList.remove('active');
 	  imagePreviewImg.removeAttribute('src');
+	  resetImagePreviewTransform();
+	}
+	function flashImagePreviewButton(btn, label) {
+	  const old = btn.textContent;
+	  btn.textContent = label;
+	  setTimeout(() => { btn.textContent = old; }, 1200);
+	}
+	async function copyImagePreview() {
+	  const src = imagePreviewImg.src;
+	  if (!src) return;
+	  try {
+	    if (navigator.clipboard && window.ClipboardItem) {
+	      const blob = await (await fetch(src)).blob();
+	      await navigator.clipboard.write([new ClipboardItem({ [blob.type || 'image/png']: blob })]);
+	      flashImagePreviewButton(imagePreviewCopy, 'Copied');
+	      return;
+	    }
+	  } catch (_) { /* fall back to copying the data URL */ }
+	  try {
+	    await navigator.clipboard.writeText(src);
+	    flashImagePreviewButton(imagePreviewCopy, 'Copied URL');
+	  } catch (_) {
+	    flashImagePreviewButton(imagePreviewCopy, 'Failed');
+	  }
 	}
 	imagePreviewClose.addEventListener('click', closeImagePreview);
+	imagePreviewZoomOut.addEventListener('click', () => zoomImagePreview(1 / 1.25));
+	imagePreviewZoomIn.addEventListener('click', () => zoomImagePreview(1.25));
+	imagePreviewReset.addEventListener('click', resetImagePreviewTransform);
+	imagePreviewCopy.addEventListener('click', copyImagePreview);
 	imagePreviewOverlay.addEventListener('click', (e) => {
 	  if (e.target === imagePreviewOverlay) closeImagePreview();
 	});
+	imagePreviewStage.addEventListener('wheel', (e) => {
+	  if (!imagePreviewOverlay.classList.contains('active')) return;
+	  e.preventDefault();
+	  zoomImagePreview(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX, e.clientY);
+	}, { passive: false });
+	imagePreviewStage.addEventListener('pointerdown', (e) => {
+	  if (e.button !== 0) return;
+	  e.preventDefault();
+	  imagePreviewDrag = { pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, baseX: imagePreviewX, baseY: imagePreviewY };
+	  imagePreviewStage.classList.add('dragging');
+	  imagePreviewStage.setPointerCapture(e.pointerId);
+	});
+	imagePreviewStage.addEventListener('pointermove', (e) => {
+	  if (!imagePreviewDrag || imagePreviewDrag.pointerId !== e.pointerId) return;
+	  imagePreviewX = imagePreviewDrag.baseX + e.clientX - imagePreviewDrag.startX;
+	  imagePreviewY = imagePreviewDrag.baseY + e.clientY - imagePreviewDrag.startY;
+	  applyImagePreviewTransform();
+	});
+	function endImagePreviewDrag(e) {
+	  if (!imagePreviewDrag || imagePreviewDrag.pointerId !== e.pointerId) return;
+	  imagePreviewDrag = null;
+	  imagePreviewStage.classList.remove('dragging');
+	}
+	imagePreviewStage.addEventListener('pointerup', endImagePreviewDrag);
+	imagePreviewStage.addEventListener('pointercancel', endImagePreviewDrag);
 	function renderAttachments() {
 	  attachmentsEl.innerHTML = '';
 	  attachmentsEl.classList.toggle('visible', pastedImages.length > 0);
@@ -5905,9 +6017,29 @@ function readImageFile(file) {
     reader.readAsDataURL(file);
   });
 }
-	input.addEventListener('paste', (e) => {
-	  const dt = e.clipboardData;
-	  if (!dt) return;
+async function addImageFiles(files, sourceLabel) {
+  const raw = Array.from(files || []).filter((f) => f && /^image\//i.test(f.type || ''));
+  if (!raw.length) return;
+  const slots = Math.max(0, 8 - pastedImages.length);
+  if (slots <= 0) { addErrorMsg('⚠ 最多只能附加 8 张图片。'); return; }
+  const added = [];
+  for (const f of raw.slice(0, slots)) {
+    try { added.push(await readImageFile(f)); } catch (_) { /* skip unreadable files */ }
+  }
+  if (!added.length) return;
+  pastedImages.push(...added);
+  renderAttachments();
+  input.focus();
+  if (raw.length > slots) addErrorMsg('⚠ 最多只能附加 8 张图片，已添加前 ' + slots + ' 张。');
+}
+attachImageBtn.addEventListener('click', () => attachImageInput.click());
+attachImageInput.addEventListener('change', async () => {
+  await addImageFiles(attachImageInput.files, 'selected');
+  attachImageInput.value = '';
+});
+		input.addEventListener('paste', (e) => {
+		  const dt = e.clipboardData;
+		  if (!dt) return;
 
 	  // Read string clipboard data synchronously during the paste event. In VS Code
 	  // webviews, DataTransferItem.getAsString() can become unreliable once the
