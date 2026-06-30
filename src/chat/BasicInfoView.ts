@@ -183,6 +183,15 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
           title: 'Open Image Profile Settings',
           arguments: ['burstcode.llm.image']
         }
+      }),
+      new BasicNode('leaf', t('models.videoProfile'), {
+        description: t('models.videoProfile.desc'),
+        icon: 'device-camera-video',
+        command: {
+          command: 'workbench.action.openSettings',
+          title: 'Open Video Profile Settings',
+          arguments: ['burstcode.llm.video']
+        }
       })
     ];
 

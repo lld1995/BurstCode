@@ -1,5 +1,7 @@
 /**
  * Test runner entry point.
- * Imported by: node --require ./out/test/register-vscode-mock.js --test out/test/runTest.js
+ * Registers the vscode mock before importing tests that depend on vscode APIs.
  */
+import './register-vscode-mock';
 import './web.test';
+import './video.test';

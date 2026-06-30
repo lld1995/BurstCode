@@ -45,6 +45,8 @@ const EN: Dict = {
   'models.bgProfile.desc': 'inherit / baseURL / apiKey / model',
   'models.imageProfile': 'Image profile settings…',
   'models.imageProfile.desc': 'baseURL / apiKey / model / size',
+  'models.videoProfile': 'Video profile settings…',
+  'models.videoProfile.desc': 'baseURL / apiKey / model / resolution / duration',
 
   // Permissions group
   'perm.group': 'Permissions',
@@ -170,6 +172,8 @@ const ZH: Dict = {
   'models.bgProfile.desc': '继承 / baseURL / apiKey / 模型',
   'models.imageProfile': '图片配置…',
   'models.imageProfile.desc': 'baseURL / apiKey / 模型 / 尺寸',
+  'models.videoProfile': '视频配置…',
+  'models.videoProfile.desc': 'baseURL / apiKey / 模型 / 分辨率 / 时长',
 
   // Permissions group
   'perm.group': '权限',

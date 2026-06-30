@@ -26,6 +26,7 @@ import { Tool } from '../agent/tools/types';
 import { buildReadFileTool, buildWriteFileTool, buildCollectContextTool, listDirTool, grepSearchTool, workspaceOutlineTool } from '../agent/tools/core';
 import { readWebpageTool, webSearchTool } from '../agent/tools/web';
 import { buildImageTool } from '../agent/tools/image';
+import { buildVideoTool } from '../agent/tools/video';
 import { WorkspaceIndex } from '../context/WorkspaceIndex';
 import { buildSystemPrompt } from '../agent/prompts';
 import { buildLspTools } from '../agent/tools/lsp';
@@ -1895,6 +1896,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ...editTools,
       writeFileTool,
       buildImageTool(this.logger),
+      buildVideoTool(this.logger),
       ...buildShellTools({ askUser }),
       buildPlanTool(onPlanUpdate),
       ...buildLessonTools(this.lessons, (list) => {
@@ -4837,30 +4839,6 @@ function addUserMsg(text, messageIndex, checkpointRef, checkpointError, imageCou
       });
     });
     actions.appendChild(rollbackBtn);
-
-    const retryBtn = document.createElement('button');
-    retryBtn.type = 'button';
-    retryBtn.className = 'act retry-user-btn';
-    retryBtn.title = currentRef()
-      ? 'Retry from the state right before this prompt'
-      : checkpointError
-        ? 'No checkpoint for this prompt (' + checkpointError + ') — click to retry by truncating chat history only'
-        : 'No checkpoint captured for this prompt — click to retry by truncating chat history only';
-    retryBtn.setAttribute('aria-label', 'Retry this prompt');
-    if (!checkpointRef) retryBtn.dataset.chatOnly = 'true';
-    retryBtn.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8a5 5 0 1 0 1.5-3.5"/><path d="M3 3v3h3"/></svg><span>Retry</span>';
-    retryBtn.addEventListener('click', (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      // Read ref from dataset at click time so that async-created checkpoints
-      // (whose ref arrives via 'update-checkpoint-ref' after these buttons were
-      // first rendered) are correctly picked up.
-      vscode.postMessage({
-        type: 'rollback',
-        payload: { ref: currentRef(), messageIndex, prefill: true }
-      });
-    });
-    actions.appendChild(retryBtn);
   }
 
   if (actions.childElementCount > 0) el.appendChild(actions);

@@ -1,25 +1,17 @@
 /**
- * Preload script: register vscode mock into Node's module cache
+ * Preload script: register vscode mock into Node's module loader
  * before any test file imports it.
- * Usage: node --require ./out/test/register-vscode-mock.js ...
  */
 import * as path from 'path';
+import Module from 'module';
 
-// Register the mock under the name 'vscode' in require.cache
-// so that subsequent require('vscode') hits the cache.
 const mockPath = path.resolve(__dirname, 'vscode-mock.js');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const mock = require(mockPath);
 
-// Node resolves 'vscode' to a special virtual path in extension host.
-// Outside extension host there is no real vscode module; we inject ours
-// into the cache under every plausible key that require('vscode') might resolve to.
-require.cache['vscode'] = {
-  id: 'vscode',
-  filename: 'vscode',
-  loaded: true,
-  parent: null,
-  children: [],
-  paths: [],
-  exports: mock,
-} as unknown as NodeJS.Module;
+const moduleWithLoad = Module as unknown as { _load: (...args: unknown[]) => unknown };
+const originalLoad = moduleWithLoad._load;
+moduleWithLoad._load = function patchedLoad(...args: unknown[]) {
+  if (args[0] === 'vscode') return mock;
+  return originalLoad.apply(this, args);
+};

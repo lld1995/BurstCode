@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.117",
+  "version": "0.1.118",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -295,6 +295,42 @@
           "default": false,
           "order": 34,
           "description": "Image profile · skip TLS certificate verification for the image baseURL."
+        },
+        "burstcode.llm.video.model": {
+          "type": "string",
+          "default": "",
+          "order": 35,
+          "markdownDescription": "**Video profile** · model id used by the `generate_video` tool, e.g. `bytedance/doubao-seedance-2.0`, `sora-2`. Do not use text/chat models here. Called via OpenAI-compatible video endpoints (`POST /videos` relative to a `/v1` base URL). Leave empty to default to `seedance-1-0-pro-i2v`."
+        },
+        "burstcode.llm.video.baseURL": {
+          "type": "string",
+          "default": "",
+          "order": 36,
+          "description": "Video profile · OpenAI-compatible base URL for video generation. Usually ends with /v1. Leave empty to inherit from the chat profile."
+        },
+        "burstcode.llm.video.apiKey": {
+          "type": "string",
+          "default": "",
+          "order": 37,
+          "description": "Video profile · API key for the video endpoint. Leave empty to inherit from the chat profile."
+        },
+        "burstcode.llm.video.resolution": {
+          "type": "string",
+          "default": "1280x720",
+          "order": 38,
+          "description": "Video profile · default video size for OpenAI-compatible video endpoints (e.g. 1280x720, 720x1280, 1920x1080; 720p is also accepted and normalized)."
+        },
+        "burstcode.llm.video.duration": {
+          "type": "string",
+          "default": "5",
+          "order": 39,
+          "description": "Video profile · default video duration in seconds (e.g. 5, 10)."
+        },
+        "burstcode.llm.video.allowSelfSignedCerts": {
+          "type": "boolean",
+          "default": false,
+          "order": 40,
+          "description": "Video profile · skip TLS certificate verification for the video baseURL."
         },
         "burstcode.mcp.servers": {
           "type": "array",

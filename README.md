@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="media/readme/hero.svg" alt="BurstCode" width="120" height="120" />
+
 
 # BurstCode
 
@@ -10,10 +10,10 @@
 
 <table>
 <tr>
-<td align="center" width="25%"><img src="media/readme/precise.svg" width="56" height="56" alt="精准" /><br/><b>精准</b></td>
-<td align="center" width="25%"><img src="media/readme/fast.svg" width="56" height="56" alt="高速" /><br/><b>高速</b></td>
-<td align="center" width="25%"><img src="media/readme/cheap.svg" width="56" height="56" alt="省钱" /><br/><b>省钱</b></td>
-<td align="center" width="25%"><img src="media/readme/secure.svg" width="56" height="56" alt="安全" /><br/><b>安全</b></td>
+<td align="center" width="25%"><br/><b>精准</b></td>
+<td align="center" width="25%"><br/><b>高速</b></td>
+<td align="center" width="25%"><br/><b>省钱</b></td>
+<td align="center" width="25%"><br/><b>安全</b></td>
 </tr>
 </table>
 
@@ -67,26 +67,26 @@
 
 市面上的 Agent 类编码插件大多默认你会把代码发往托管的云端前沿模型，按 token 收费、还要交出源码。BurstCode 围绕四个核心理念重新设计 —— **精准、高速、省钱、安全**，并完全运行在你本地掌控的模型上。
 
-### <img src="media/readme/precise.svg" width="22" height="22" align="absmiddle" alt="" /> 精准 —— 改对，而不是改多
+###  精准 —— 改对，而不是改多
 
 - **理解 LSP，而非盲搜** —— 用语言服务（跳转定义、查引用、查实现、悬停类型）定位代码，重构能正确理解作用域与再导出，不会误伤同名符号。
 - **先审查再落地** —— 每次改动都以可逐块 Accept / Reject 的 diff 呈现，外加 Git 检查点随时整体回滚，改动可控、可追溯。
 - **长期记忆** —— 记录你的纠正与项目约定，越用越懂你的代码风格。
 
-### <img src="media/readme/fast.svg" width="22" height="22" align="absmiddle" alt="" /> 高速 —— 一次往返，做完该做的
+###  高速 —— 一次往返，做完该做的
 
 - **批量上下文收集** —— `collect_context` 在单次往返中并发执行读取 + grep + 目录列举 + 大纲，少绕路、少等待。
 - **并发子 Agent** —— 把隔离探索与并行编辑下放给拥有独立上下文窗口的专注子 Agent，互不阻塞。
 - **自主续跑** —— Agent 循环会规划、批量调用工具、卡住时自我纠正，并跨越 token 上限/流中断边界自动续跑，无需你反复催。
 
-### <img src="media/readme/cheap.svg" width="22" height="22" align="absmiddle" alt="" /> 省钱 —— 用最少的 token 完成任务
+###  省钱 —— 用最少的 token 完成任务
 
 - **上下文长度控制** —— 分区压缩历史对话、自动归档已完结话题，让上下文窗口始终精简，避免每次请求都拖着臃肿的上下文反复烧 token。
 - **请求频次控制** —— 一轮内并行批量调用工具、规划后再动手、卡住时自我纠正，把同一任务所需的 LLM 往返次数压到最低。
 - **重活下放子 Agent** —— 大范围检索与读文件交给隔离上下文的子 Agent，只回传精简摘要，主循环上下文不被原始文件内容撑爆。
 - **两套独立配置档** —— 聊天用快/大的模型，后台任务用更便宜的小模型，把算力花在刀刃上。
 
-### <img src="media/readme/secure.svg" width="22" height="22" align="absmiddle" alt="" /> 安全 —— 代码不出本机，改动可控可回滚
+###  安全 —— 代码不出本机，改动可控可回滚
 
 - **100% 本地优先** —— 除非*你*主动把端点指向远程，否则源码、提示词与上下文全程留在本机，**无云端账号、无遥测、无按 token 计费**。
 - **自带模型** —— Qwen-Coder、DeepSeek-Coder、Llama、Codestral……凡是你的服务在 `/v1/models` 暴露的都可用，模型与数据都在你掌控之内。

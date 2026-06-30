@@ -216,7 +216,8 @@ export async function generateImage(
 function downloadBytes(
   url: string,
   allowSelfSigned: boolean | undefined,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  apiKey?: string
 ): Promise<{ body: Buffer; mimeType: string }> {
   return new Promise((resolve, reject) => {
     let mod: typeof https | typeof import('http');
@@ -229,9 +230,12 @@ function downloadBytes(
     if (allowSelfSigned && url.startsWith('https:')) {
       reqOpts.agent = new https.Agent({ rejectUnauthorized: false });
     }
+    if (apiKey) {
+      reqOpts.headers = { Authorization: `Bearer ${apiKey}` };
+    }
     const req = mod.get(url, reqOpts, (resp) => {
       if (!resp.statusCode || resp.statusCode >= 400) {
-        reject(new Error(`Image download failed: HTTP ${resp.statusCode}`));
+        reject(new Error(`Download failed: HTTP ${resp.statusCode}`));
         resp.resume();
         return;
       }
@@ -240,7 +244,7 @@ function downloadBytes(
       resp.on('end', () =>
         resolve({
           body: Buffer.concat(chunks),
-          mimeType: String(resp.headers['content-type'] || 'image/png').split(';')[0].trim()
+          mimeType: String(resp.headers['content-type'] || 'application/octet-stream').split(';')[0].trim()
         })
       );
     });
@@ -249,6 +253,267 @@ function downloadBytes(
       signal.addEventListener('abort', () => req.destroy(new Error('aborted')), { once: true });
     }
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Video generation profile (Seedance async task API)                  */
+/* ------------------------------------------------------------------ */
+
+export interface VideoConfig {
+  baseURL: string;
+  apiKey: string;
+  model: string;
+  resolution: string;
+  duration: string;
+  allowSelfSignedCerts: boolean;
+}
+
+const DEFAULT_VIDEO_MODEL = 'seedance-1-0-pro-i2v';
+const DEFAULT_VIDEO_RESOLUTION = '1280x720';
+const DEFAULT_VIDEO_DURATION = '5';
+
+/**
+ * Resolve the video-generation profile. Each field falls back to the chat
+ * profile when left empty, mirroring the image profile behaviour.
+ */
+export function readVideoConfig(): VideoConfig {
+  const cfg = vscode.workspace.getConfiguration('burstcode.llm');
+  const chat = readLLMConfig();
+  const baseURL = (cfg.get<string>('video.baseURL') ?? '').trim();
+  const apiKey = cfg.get<string>('video.apiKey');
+  const model = (cfg.get<string>('video.model') ?? '').trim();
+  const resolution = (cfg.get<string>('video.resolution') ?? '').trim();
+  const duration = (cfg.get<string>('video.duration') ?? '').trim();
+  const allow = cfg.get<boolean>('video.allowSelfSignedCerts');
+  return {
+    baseURL: baseURL || chat.baseURL,
+    apiKey: typeof apiKey === 'string' && apiKey ? apiKey : chat.apiKey,
+    model: model || DEFAULT_VIDEO_MODEL,
+    resolution: resolution || DEFAULT_VIDEO_RESOLUTION,
+    duration: duration || DEFAULT_VIDEO_DURATION,
+    allowSelfSignedCerts:
+      typeof allow === 'boolean' ? allow : chat.allowSelfSignedCerts === true
+  };
+}
+
+export interface GeneratedVideo {
+  /** Raw video bytes downloaded from the direct URL or /videos/{id}/content. */
+  data: Buffer;
+  /** Reported MIME type, defaults to video/mp4. */
+  mimeType: string;
+  /** The direct video URL or content endpoint used to fetch the bytes. */
+  videoUrl: string;
+}
+
+interface VideoTaskResponse {
+  id: string;
+  model?: string;
+  status: 'queued' | 'in_progress' | 'completed' | 'failed' | string;
+  /** Direct video URL (OpenAI standard field). */
+  url?: string;
+  /** Alternative video URL field name used by some relays. */
+  video_url?: string;
+  error?: { code?: string; message?: string };
+  usage?: Record<string, unknown>;
+}
+
+/** Small helper: resolve after ms, abortable via signal. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error('aborted'));
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(t);
+        reject(new Error('aborted'));
+      },
+      { once: true }
+    );
+  });
+}
+
+function normalizeVideoSize(size: string): string {
+  const value = (size || '').trim().toLowerCase();
+  if (value === '480p') return '854x480';
+  if (value === '720p') return '1280x720';
+  if (value === '1080p') return '1920x1080';
+  return size || DEFAULT_VIDEO_RESOLUTION;
+}
+
+/** Generic JSON HTTP request (POST or GET) with Bearer auth. */
+function httpJsonRequest<T>(
+  url: string,
+  method: 'GET' | 'POST',
+  apiKey: string,
+  body: string | undefined,
+  allowSelfSigned: boolean | undefined,
+  signal?: AbortSignal
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let mod: typeof https | typeof import('http');
+    try {
+      mod = url.startsWith('https:') ? https : require('http');
+    } catch {
+      mod = https;
+    }
+    const reqOpts: https.RequestOptions = {
+      method,
+      headers: {
+        Authorization: `Bearer ${apiKey || 'no-key'}`,
+        'Content-Type': 'application/json'
+      }
+    };
+    if (allowSelfSigned && url.startsWith('https:')) {
+      (reqOpts as https.RequestOptions).agent = new https.Agent({
+        rejectUnauthorized: false
+      });
+    }
+    const req = mod.request(url, reqOpts, (resp) => {
+      const chunks: Buffer[] = [];
+      resp.on('data', (c: Buffer) => chunks.push(c));
+      resp.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        if (!resp.statusCode || resp.statusCode >= 400) {
+          reject(
+            new Error(
+              `HTTP ${resp.statusCode} from ${method} ${url}: ${text.slice(0, 500)}`
+            )
+          );
+          return;
+        }
+        try {
+          resolve(JSON.parse(text) as T);
+        } catch {
+          reject(new Error(`Invalid JSON response from ${method} ${url}: ${text.slice(0, 200)}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    if (signal) {
+      signal.addEventListener(
+        'abort',
+        () => req.destroy(new Error('aborted')),
+        { once: true }
+      );
+    }
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * Generate a video via the OpenAI-compatible video generation API
+ * (POST /videos → poll GET /videos/{id} → download).
+ *
+ * Supports text-to-video (t2v) and image-to-video (i2v) when `imageUrl`
+ * is provided.
+ */
+export async function generateVideo(
+  cfg: VideoConfig,
+  prompt: string,
+  opts: {
+    imageUrl?: string;
+    signal?: AbortSignal;
+    /** Emit human-readable progress for long-running video tasks. */
+    onProgress?: (msg: string) => void;
+    /** Test hook: override poll interval; production default is 5 seconds. */
+    pollIntervalMs?: number;
+    /** Test hook: override max polling attempts; production default is 60 minutes. */
+    maxAttempts?: number;
+  } = {}
+): Promise<GeneratedVideo> {
+  const base = cfg.baseURL.replace(/\/+$/, '');
+  const submitEndpoint = `${base}/videos`;
+
+  // Build request body — OpenAI standard format.
+  const body: Record<string, unknown> = {
+    model: cfg.model,
+    prompt,
+    seconds: parseInt(cfg.duration, 10) || 5,
+    size: normalizeVideoSize(cfg.resolution)
+  };
+  if (opts.imageUrl) {
+    body.image_url = opts.imageUrl;
+  }
+
+  // --- Step 1: submit the task ---
+  const submitBody = JSON.stringify(body);
+  const submitResp = await httpJsonRequest<{ id: string; status?: string }>(
+    submitEndpoint,
+    'POST',
+    cfg.apiKey,
+    submitBody,
+    cfg.allowSelfSignedCerts,
+    opts.signal
+  );
+  const videoId = submitResp.id;
+  if (!videoId) {
+    throw new Error('Video task submission returned no video id.');
+  }
+  opts.onProgress?.(`Video task ${videoId} submitted; polling status…`);
+
+  // --- Step 2: poll until terminal state ---
+  const pollUrl = `${base}/videos/${videoId}`;
+  const intervalMs = opts.pollIntervalMs ?? 5000;
+  const maxAttempts = opts.maxAttempts ?? Math.ceil((60 * 60 * 1000) / intervalMs);
+
+  for (let i = 0; i < maxAttempts; i++) {
+    if (opts.signal?.aborted) throw new Error('aborted');
+    await sleep(intervalMs, opts.signal);
+
+    const task = await httpJsonRequest<VideoTaskResponse>(
+      pollUrl,
+      'GET',
+      cfg.apiKey,
+      undefined,
+      cfg.allowSelfSignedCerts,
+      opts.signal
+    );
+
+    const status = String(task.status || 'unknown');
+    opts.onProgress?.(`Video task ${videoId}: ${status} (${i + 1}/${maxAttempts})…`);
+
+    if (status === 'completed') {
+      // Try direct URL from response first, then fall back to content endpoint.
+      const videoUrl = task.url || task.video_url;
+      if (videoUrl) {
+        opts.onProgress?.(`Video task ${videoId} completed; downloading video…`);
+        const fetched = await downloadBytes(
+          videoUrl,
+          cfg.allowSelfSignedCerts,
+          opts.signal
+        );
+        return {
+          data: fetched.body,
+          mimeType: fetched.mimeType || 'video/mp4',
+          videoUrl
+        };
+      }
+      // No URL in response — download from /videos/{id}/content (needs auth).
+      const contentUrl = `${pollUrl}/content`;
+      opts.onProgress?.(`Video task ${videoId} completed; downloading video content…`);
+      const fetched = await downloadBytes(
+        contentUrl,
+        cfg.allowSelfSignedCerts,
+        opts.signal,
+        cfg.apiKey
+      );
+      return {
+        data: fetched.body,
+        mimeType: fetched.mimeType || 'video/mp4',
+        videoUrl: contentUrl
+      };
+    }
+    if (status === 'failed') {
+      const errMsg = task.error?.message || 'unknown error';
+      throw new Error(`Video generation failed: ${errMsg}`);
+    }
+    // status is 'queued' or 'in_progress' — keep polling
+  }
+
+  const timeoutMinutes = Math.round((maxAttempts * intervalMs) / 60000);
+  throw new Error(`Video generation timed out after ${timeoutMinutes} minutes of polling.`);
 }
 
 export function readLLMConfig(): LLMConfig {
