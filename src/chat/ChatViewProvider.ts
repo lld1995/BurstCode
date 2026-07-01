@@ -1731,8 +1731,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (images.length > 0 && !activeModelSupportsVision) {
       // Avoid sending image_url parts to text-only models/gateways. The user may
       // still be doing first-frame video generation: buildVideoTool receives the
-      // pasted image out-of-band and can use it automatically when invoked.
-      vscode.window.showInformationMessage(`BurstCode: current model "${activeModel}" is not vision-capable; not sending images to the chat LLM. Video generation can still use the first pasted image as first frame.`);
+      // pasted images out-of-band and can use them automatically as first/last
+      // frames when invoked.
+      vscode.window.showInformationMessage(`BurstCode: current model "${activeModel}" is not vision-capable; not sending images to the chat LLM. Video generation can still use pasted images as first/last frames.`);
       this.broadcastModels();
     }
 
@@ -1765,8 +1766,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const messageIndex = session.messages.length;
     const attachmentNote = images.length > 0
       ? sendImagesToLlm
-        ? `[Attached image${images.length === 1 ? '' : 's'}: ${images.map((img, idx) => img.name || `image ${idx + 1}`).join(', ')}. If the user asks to generate a video from the pasted/attached image, call generate_video without imageUrl/firstFrameImage; it will automatically use the first attached image as the first frame.]`
-        : `[Attached image${images.length === 1 ? '' : 's'}: ${images.map((img, idx) => img.name || `image ${idx + 1}`).join(', ')}. The current chat model is not vision-capable, so BurstCode did not send the image bytes to the LLM. If the user asks to generate a video from the pasted/attached image, call generate_video without imageUrl/firstFrameImage; it will automatically use the first attached image as the first frame.]`
+        ? `[Attached image${images.length === 1 ? '' : 's'}: ${images.map((img, idx) => img.name || `image ${idx + 1}`).join(', ')}. If the user asks to generate a video from the pasted/attached image, call generate_video without imageUrl/firstFrameImage/lastFrameImage; it will automatically use the first attached image as the first frame and, when multiple images are attached, the last attached image as the last frame.]`
+        : `[Attached image${images.length === 1 ? '' : 's'}: ${images.map((img, idx) => img.name || `image ${idx + 1}`).join(', ')}. The current chat model is not vision-capable, so BurstCode did not send the image bytes to the LLM. If the user asks to generate a video from the pasted/attached image, call generate_video without imageUrl/firstFrameImage/lastFrameImage; it will automatically use the first attached image as the first frame and, when multiple images are attached, the last attached image as the last frame.]`
       : '';
     const userContent: Extract<ChatMessage, { role: 'user' }>['content'] = images.length > 0
       ? [
@@ -1934,7 +1935,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ...editTools,
       writeFileTool,
       buildImageTool(this.logger),
-      buildVideoTool(this.logger, () => opts.images?.[0]),
+      buildVideoTool(this.logger, () => opts.images),
       ...buildShellTools({ askUser }),
       buildPlanTool(onPlanUpdate),
       ...buildLessonTools(this.lessons, (list) => {

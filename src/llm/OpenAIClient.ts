@@ -490,14 +490,16 @@ function httpJsonRequest<T>(
  * Generate a video via the OpenAI-compatible video generation API
  * (POST /videos → poll GET /videos/{id} → download).
  *
- * Supports text-to-video (t2v) and image-to-video (i2v) when `imageUrl`
- * is provided.
+ * Supports text-to-video (t2v), image-to-video (i2v) when `imageUrl`
+ * is provided, and first/last-frame generation when `lastFrameImageUrl`
+ * is also provided.
  */
 export async function generateVideo(
   cfg: VideoConfig,
   prompt: string,
   opts: {
     imageUrl?: string;
+    lastFrameImageUrl?: string;
     signal?: AbortSignal;
     /** Emit human-readable progress for long-running video tasks. */
     onProgress?: (msg: string) => void;
@@ -511,8 +513,9 @@ export async function generateVideo(
   const submitEndpoint = `${base}/videos`;
 
   // Build request body — OpenAI-compatible video format.  BifrostLite accepts
-  // the first-frame image via the `image` field and translates it to
-  // Vertex AI `instances[0].image` for ZenMux/Seedance providers.
+  // the first-frame image via the `image` field and the last/end frame via
+  // `last_frame`, then translates them to Vertex AI `instances[0].image` and
+  // `instances[0].lastFrame` for ZenMux/Seedance providers.
   const body: Record<string, unknown> = {
     model: cfg.model,
     prompt,
@@ -521,6 +524,9 @@ export async function generateVideo(
   };
   if (opts.imageUrl) {
     body.image = normalizeVideoImageInput(opts.imageUrl);
+  }
+  if (opts.lastFrameImageUrl) {
+    body.last_frame = normalizeVideoImageInput(opts.lastFrameImageUrl);
   }
 
   // --- Step 1: submit the task ---

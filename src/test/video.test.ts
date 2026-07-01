@@ -168,6 +168,76 @@ describe('generateVideo OpenAI-compatible flow', () => {
     }
   });
 
+  test('sends optional first and last frames using image and last_frame fields', async () => {
+    const seen: Array<{ method?: string; url?: string; auth?: string; body?: unknown }> = [];
+    const videoBytes = Buffer.from('fake-first-last-frame-mp4-bytes');
+
+    const server = http.createServer(async (req, res) => {
+      if (req.method === 'POST' && req.url === '/v1/videos') {
+        const raw = await readBody(req);
+        seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: JSON.parse(raw) });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'vid_first_last', object: 'video', status: 'queued' }));
+        return;
+      }
+
+      if (req.method === 'GET' && req.url === '/v1/videos/vid_first_last') {
+        seen.push({ method: req.method, url: req.url, auth: req.headers.authorization });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'vid_first_last', object: 'video', status: 'completed' }));
+        return;
+      }
+
+      if (req.method === 'GET' && req.url === '/v1/videos/vid_first_last/content') {
+        seen.push({ method: req.method, url: req.url, auth: req.headers.authorization });
+        res.writeHead(200, { 'content-type': 'video/mp4' });
+        res.end(videoBytes);
+        return;
+      }
+
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end(`${req.method} ${req.url}`);
+    });
+
+    const port = await listen(server);
+    try {
+      const cfg: VideoConfig = {
+        baseURL: `http://127.0.0.1:${port}/v1`,
+        apiKey: 'test-key',
+        model: 'bytedance/doubao-seedance-2.0',
+        resolution: '1280x720',
+        duration: '5',
+        allowSelfSignedCerts: false
+      };
+
+      const result = await generateVideo(cfg, '从首帧过渡到尾帧', {
+        imageUrl: 'data:image/png;base64,Zmlyc3Q=',
+        lastFrameImageUrl: 'data:image/jpeg;base64,bGFzdA==',
+        pollIntervalMs: 1,
+        maxAttempts: 2
+      });
+
+      assert.equal(result.mimeType, 'video/mp4');
+      assert.deepEqual(result.data, videoBytes);
+      assert.deepEqual(seen[0].body, {
+        model: 'bytedance/doubao-seedance-2.0',
+        prompt: '从首帧过渡到尾帧',
+        seconds: 5,
+        size: '1280x720',
+        image: {
+          bytesBase64Encoded: 'Zmlyc3Q=',
+          mimeType: 'image/png'
+        },
+        last_frame: {
+          bytesBase64Encoded: 'bGFzdA==',
+          mimeType: 'image/jpeg'
+        }
+      });
+    } finally {
+      await close(server);
+    }
+  });
+
   test('uses nested completed result URL before falling back to /content', async () => {
     const seen: Array<{ method?: string; url?: string; auth?: string; body?: unknown }> = [];
     const videoBytes = Buffer.from('nested-url-mp4-bytes');
