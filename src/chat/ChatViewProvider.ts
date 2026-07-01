@@ -5054,15 +5054,12 @@ function updateSendButton() {
     sendBtn.title = 'Send (Enter)';
     sendBtn.setAttribute('aria-label', 'Send');
   } else {
-    if (input.value.trim().length > 0) {
-      sendBtn.dataset.mode = 'send';
-      sendBtn.title = 'Queue message (Enter)';
-      sendBtn.setAttribute('aria-label', 'Queue message');
-    } else {
-      sendBtn.dataset.mode = 'stop';
-      sendBtn.title = 'Stop (Esc)';
-      sendBtn.setAttribute('aria-label', 'Stop');
-    }
+    // Keep the primary action as Stop while a run is in progress. Queueing has
+    // its own dedicated button, so typing in the composer must not turn Stop
+    // back into Send/Queue.
+    sendBtn.dataset.mode = 'stop';
+    sendBtn.title = 'Stop (Esc)';
+    sendBtn.setAttribute('aria-label', 'Stop');
   }
 }
 
@@ -6269,18 +6266,9 @@ attachImageInput.addEventListener('change', async () => {
 sendBtn.addEventListener('click', () => {
   const text = input.value.trim();
   if (busy) {
-    // While a run is in progress, do NOT turn the normal send action into Stop
-    // when the composer contains text. Queue the text instead so the user can
-    // keep chatting during the current response. Empty composer still acts as Stop.
-    if (!text && pastedImages.length === 0) {
-      vscode.postMessage({ type: 'cancel' });
-      return;
-    }
-    if (!text) return;
-    vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked } });
-    input.value = '';
-    autosizeInput();
-    updateQueueButton();
+    // While a run is in progress, the primary button is always Stop. Queueing is
+    // handled by the dedicated queue button (or Enter shortcut below).
+    vscode.postMessage({ type: 'cancel' });
     return;
   }
   if (!text && pastedImages.length === 0) return;

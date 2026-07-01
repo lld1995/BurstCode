@@ -2,7 +2,7 @@
     "name":  "burstcode-local-alerts",
     "displayName":  "BurstCode Local Alerts Companion",
     "description":  "Local UI companion for BurstCode Remote SSH sound and taskbar attention alerts.",
-    "version":  "0.1.123",
+    "version":  "0.1.124",
     "publisher":  "burstcode",
     "engines":  {
                     "vscode":  "^1.106.0"
