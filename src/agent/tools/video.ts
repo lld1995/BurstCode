@@ -43,7 +43,10 @@ export function buildVideoTool(logger: Logger, getDefaultFirstFrameImage?: () =>
           'Generate a video from a text prompt using the configured video model ' +
           '(burstcode.llm.video, falls back to the chat endpoint). Video models are called ' +
           'through an OpenAI-compatible video API and the generated MP4 is saved into the ' +
-          'workspace. Use when the user asks to create / generate a video, animation, or motion clip.',
+          'workspace. Use when the user asks to create / generate a video, animation, or motion clip. ' +
+          'If the current chat turn includes a pasted/attached image and the user asks for first-frame ' +
+          'or image-to-video generation, call this tool even without imageUrl; BurstCode will automatically ' +
+          'use the first pasted image as the first frame.',
         parameters: {
           type: 'object',
           properties: {
@@ -62,12 +65,14 @@ export function buildVideoTool(logger: Logger, getDefaultFirstFrameImage?: () =>
               type: 'string',
               description:
                 'Optional first-frame/reference image URL (http/https), data URL, or workspace-relative image path. ' +
-                'When provided, the model generates an image-to-video (i2v) result; otherwise text-to-video (t2v).'
+                'When provided, the model generates an image-to-video (i2v) result; otherwise text-to-video (t2v). ' +
+                'Leave empty when the user pasted/attached an image in the current chat turn; the tool will use it automatically.'
             },
             firstFrameImage: {
               type: 'string',
               description:
-                'Alias for imageUrl: optional first-frame image URL, data URL, or workspace-relative image path.'
+                'Alias for imageUrl: optional first-frame image URL, data URL, or workspace-relative image path. ' +
+                'Leave empty to use the first pasted/attached image from the current chat turn.'
             }
           },
           required: ['prompt']

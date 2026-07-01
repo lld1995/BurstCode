@@ -1352,7 +1352,15 @@ export class OpenAIClient {
       if (Array.isArray(value)) {
         return value
           .map((part) => {
-            if (part && typeof part === 'object' && 'text' in part) return String((part as { text?: unknown }).text ?? '');
+            if (part && typeof part === 'object') {
+              const p = part as { type?: unknown; text?: unknown; image_url?: { url?: unknown } };
+              if (p.type === 'text') return String(p.text ?? '');
+              if (p.type === 'image_url') {
+                const url = typeof p.image_url?.url === 'string' ? p.image_url.url : '';
+                const mime = /^data:([^;,]+)[;,]/i.exec(url)?.[1] || 'image';
+                return `[attached image omitted from Gemini text-tool prompt: ${mime}; use the surrounding text note if a tool should consume the pasted image]`;
+              }
+            }
             return JSON.stringify(part);
           })
           .join('\n');

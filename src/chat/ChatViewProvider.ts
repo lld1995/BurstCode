@@ -11,6 +11,7 @@ import {
   LLMConfig,
   readLLMConfig,
   readChatProfile,
+  readVideoConfig,
   setChatModel,
   addChatModel,
   removeChatModel,
@@ -173,6 +174,11 @@ function emptyLive(): SessionLive {
   };
 }
 
+interface QueuedUserMessage {
+  id: string;
+  text: string;
+}
+
 interface RunContext {
   sessionId: string;
   session: Session;
@@ -181,7 +187,7 @@ interface RunContext {
   /** Pending askUser promise — resolved by the webview message. */
   pendingAsk?: { resolve: (value: string) => void; id: string; spec: PendingAskSnap };
   /** User messages sent while the agent was already running — drained by AgentLoop at each iteration boundary. */
-  queuedUserMessages: string[];
+  queuedUserMessages: QueuedUserMessage[];
 }
 
 /** Workspace-state key for the persisted browser-style open-tab working set. */
@@ -746,11 +752,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const cached = getCachedFetchedModels(this.context.globalState, chat.baseURL);
     // Determine vision support: prefer the capability flag from /v1/models cache,
     // then fall back to the name-pattern heuristic.
+    // Determine vision support: OR the gateway capability flag with the
+    // local name-pattern heuristic. Many gateways omit capabilities metadata
+    // entirely (returning supportsVision=false meaning "unknown", not "no"),
+    // so the heuristic must still get a vote.
     const cachedEntry = cached?.models.find((m) => m.id === activeModel);
-    const supportsVision =
-      cachedEntry !== undefined
-        ? cachedEntry.supportsVision
-        : modelSupportsVision(activeModel);
+    const supportsVision = !!cachedEntry?.supportsVision || modelSupportsVision(activeModel);
+    const video = readVideoConfig();
     this.post({
       type: 'models',
       payload: {
@@ -763,7 +771,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           model: defaultModel,
           models: chat.models.slice()
         },
-        fetched: cached
+        fetched: cached,
+        video: {
+          resolution: video.resolution
+        }
       }
     });
   }
@@ -945,8 +956,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (sid && this.runs.has(sid)) {
           if (text.trim()) {
             const ctx = this.runs.get(sid)!;
-            ctx.queuedUserMessages.push(text);
-            this.post({ type: 'queued-user-message', payload: { text } });
+            const id = `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            ctx.queuedUserMessages.push({ id, text });
+            this.post({ type: 'queued-user-message', payload: { id, text } });
           }
           break;
         }
@@ -964,6 +976,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'cancel-session': {
         const sid = String((msg.payload as { id?: string })?.id ?? '').trim();
         if (sid) this.cancelSession(sid);
+        break;
+      }
+      case 'undo-queued-user-message': {
+        const id = String((msg.payload as { id?: string })?.id ?? '').trim();
+        const sid = this.currentSession?.id;
+        const ctx = sid ? this.runs.get(sid) : undefined;
+        const idx = id && ctx ? ctx.queuedUserMessages.findIndex((q) => q.id === id) : -1;
+        const removed = idx >= 0;
+        if (removed && ctx) ctx.queuedUserMessages.splice(idx, 1);
+        this.post({ type: 'queued-user-message-undone', payload: { id, removed } });
         break;
       }
       case 'close-tab': {
@@ -1698,13 +1720,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const activeModel = this.llmConfigForSession(session).model;
-    if (images.length > 0 && !modelSupportsVision(activeModel)) {
-      // Do NOT block here. Many OpenAI-compatible gateways expose multimodal
-      // models with generic IDs (for example "openai/gpt-5.5") and either omit
-      // or delay capability metadata from /v1/models. Let the provider validate
-      // the actual multimodal request instead of silently discarding user images.
-      vscode.window.showInformationMessage(`BurstCode: current model "${activeModel}" is not explicitly marked as vision-capable; sending images anyway.`);
+    const llmProfile = this.llmConfigForSession(session);
+    const activeModel = llmProfile.model;
+    const cached = getCachedFetchedModels(this.context.globalState, llmProfile.baseURL);
+    const cachedEntry = cached?.models.find((m) => m.id === activeModel);
+    // OR the gateway flag with the local heuristic: gateways often omit
+    // capability metadata, so a cached false may just mean "unknown".
+    const activeModelSupportsVision = !!cachedEntry?.supportsVision || modelSupportsVision(activeModel);
+    const sendImagesToLlm = images.length > 0 && activeModelSupportsVision;
+    if (images.length > 0 && !activeModelSupportsVision) {
+      // Avoid sending image_url parts to text-only models/gateways. The user may
+      // still be doing first-frame video generation: buildVideoTool receives the
+      // pasted image out-of-band and can use it automatically when invoked.
+      vscode.window.showInformationMessage(`BurstCode: current model "${activeModel}" is not vision-capable; not sending images to the chat LLM. Video generation can still use the first pasted image as first frame.`);
       this.broadcastModels();
     }
 
@@ -1735,13 +1763,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this.ensureSystemMessageSlot(session);
     const messageIndex = session.messages.length;
+    const attachmentNote = images.length > 0
+      ? sendImagesToLlm
+        ? `[Attached image${images.length === 1 ? '' : 's'}: ${images.map((img, idx) => img.name || `image ${idx + 1}`).join(', ')}. If the user asks to generate a video from the pasted/attached image, call generate_video without imageUrl/firstFrameImage; it will automatically use the first attached image as the first frame.]`
+        : `[Attached image${images.length === 1 ? '' : 's'}: ${images.map((img, idx) => img.name || `image ${idx + 1}`).join(', ')}. The current chat model is not vision-capable, so BurstCode did not send the image bytes to the LLM. If the user asks to generate a video from the pasted/attached image, call generate_video without imageUrl/firstFrameImage; it will automatically use the first attached image as the first frame.]`
+      : '';
     const userContent: Extract<ChatMessage, { role: 'user' }>['content'] = images.length > 0
       ? [
           ...(userText.trim() ? [{ type: 'text' as const, text: userText }] : []),
-          ...images.map((img) => ({
-            type: 'image_url' as const,
-            image_url: { url: img.dataUrl }
-          }))
+          { type: 'text' as const, text: attachmentNote },
+          ...(sendImagesToLlm
+            ? images.map((img) => ({
+                type: 'image_url' as const,
+                image_url: { url: img.dataUrl }
+              }))
+            : [])
         ]
       : userText;
     session.messages.push({ role: 'user', content: userContent });
@@ -1925,7 +1961,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       maxPrematureStopContinues: agentCfg.get<number>('maxPrematureStopContinues') ?? 2,
       askUser,
       systemPrompt,
-      drainQueuedUserMessages: () => ctx.queuedUserMessages.splice(0)
+      drainQueuedUserMessages: () => ctx.queuedUserMessages.splice(0).map((q) => q.text)
     });
 
     let doneReason: string | undefined;
@@ -2415,7 +2451,10 @@ setTimeout(() => {
   .msg.user .user-actions .act.copied { color: var(--vscode-charts-green, #2ea043); border-color: color-mix(in srgb, var(--vscode-charts-green, #2ea043) 30%, transparent); background: color-mix(in srgb, var(--vscode-charts-green, #2ea043) 10%, transparent); }
   .msg.user .user-actions .act svg { width: 12px; height: 12px; flex-shrink: 0; }
   .msg.user.queued { border-left-color: var(--vscode-charts-yellow, #cca700); opacity: 0.82; }
-  .msg.user.queued .queued-badge { display: inline-block; font-size: 0.7em; padding: 1px 6px; border-radius: 3px; background: color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 18%, transparent); color: var(--vscode-charts-yellow, #cca700); margin-left: 6px; vertical-align: middle; white-space: nowrap; font-weight: 600; }
+  .msg.user.queued .body { flex: 1 1 auto; }
+  .msg.user.queued .queued-badge { display: inline-flex; align-items: center; align-self: flex-start; flex: 0 0 auto; font-size: 0.7em; line-height: 1; min-height: 16px; padding: 1px 6px; border-radius: 3px; background: color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 18%, var(--vscode-editor-background)); color: var(--vscode-charts-yellow, #cca700); margin-left: 6px; white-space: nowrap; font-weight: 600; }
+  .msg.user.queued .queued-undo { align-self: flex-start; flex: 0 0 auto; margin-left: 2px; padding: 1px 6px; min-height: 18px; border-radius: 4px; border: 1px solid transparent; background: transparent; color: var(--vscode-descriptionForeground); cursor: pointer; font: inherit; font-size: 0.72em; line-height: 1; white-space: nowrap; }
+  .msg.user.queued .queued-undo:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
   #queueBtn { width: 28px; height: 28px; padding: 0; border: none; border-radius: 7px; background: var(--vscode-charts-yellow, #cca700); color: #000; cursor: pointer; display: none; align-items: center; justify-content: center; flex-shrink: 0; transition: opacity 0.15s, transform 0.1s; }
   #queueBtn.show { display: flex; }
   #queueBtn:hover { opacity: 0.82; }
@@ -4118,6 +4157,9 @@ function escapeHtml(s) {
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 }
+function cssAttrEscape(s) {
+  return (window.CSS && typeof window.CSS.escape === 'function') ? window.CSS.escape(String(s)) : String(s);
+}
 
 // ---- Rich tool-call rendering --------------------------------------------
 // propose_edit / write_file render as a diff/code editor, read_file /
@@ -4540,12 +4582,21 @@ function renderMarkdown(src) {
   const codeBlocks = [];
   let text = String(src);
   // Fenced code blocks. Allow unterminated trailing block (during streaming).
-  // Per CommonMark, a fence may be indented up to 3 spaces; that prefix is
-  // then stripped from every content line so XML / YAML / etc. nested inside
-  // a list item don't render with phantom leading whitespace before each line.
-  text = text.replace(/(^|\\n)([ \\t]{0,3})\`\`\`([a-zA-Z0-9_+\-.#]*)\\n([\\s\\S]*?)(?:\\n[ \\t]{0,3}\`\`\`|$)/g, (m, lead, indent, lang, code) => {
+  // Also tolerate compact one-line fences such as a json language tag followed
+  // by a short JSON object and the closing fence on the same line; users often
+  // paste short JSON samples that way, and CommonMark's stricter newline form
+  text = text.replace(/(^|\\n)([ \\t]{0,3})(\`{3,})([a-zA-Z0-9_+\-.#]*)[ \\t]+([^\\n]*?)[ \\t]*\`{3,}(?=\\n|$)/g, (m, lead, indent, fence, lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push({ lang: (lang || '').trim(), code });
+    return lead + '\\u0000CODEBLOCK' + idx + '\\u0000';
+  });
+  // Per CommonMark, a fence may be indented up to 3 spaces and can use 3+
+  // backticks; that prefix is then stripped from every content line so XML /
+  // YAML / etc. nested inside a list item don't render with phantom leading
+  // whitespace before each line.
+  text = text.replace(/(^|\\n)([ \\t]{0,3})(\`{3,})([a-zA-Z0-9_+\-.#]*)\\n([\\s\\S]*?)(?:\\n[ \\t]{0,3}\`{3,}|$)/g, (m, lead, indent, fence, lang, code) => {
     if (indent && indent.length > 0) {
-      const dedent = new RegExp('^[ \\\\t]{0,' + indent.length + '}', 'gm');
+      const dedent = new RegExp('^[ \\t]{0,' + indent.length + '}', 'gm');
       code = code.replace(dedent, '');
     }
     const idx = codeBlocks.length;
@@ -5002,9 +5053,15 @@ function updateSendButton() {
     sendBtn.title = 'Send (Enter)';
     sendBtn.setAttribute('aria-label', 'Send');
   } else {
-    sendBtn.dataset.mode = 'stop';
-    sendBtn.title = 'Stop (Esc)';
-    sendBtn.setAttribute('aria-label', 'Stop');
+    if (input.value.trim().length > 0) {
+      sendBtn.dataset.mode = 'send';
+      sendBtn.title = 'Queue message (Enter)';
+      sendBtn.setAttribute('aria-label', 'Queue message');
+    } else {
+      sendBtn.dataset.mode = 'stop';
+      sendBtn.title = 'Stop (Esc)';
+      sendBtn.setAttribute('aria-label', 'Stop');
+    }
   }
 }
 
@@ -5148,6 +5205,8 @@ window.addEventListener('message', (e) => {
       clearEmptyState();
       const qEl = document.createElement('div');
       qEl.className = 'msg user queued';
+      const qId = msg.payload && msg.payload.id ? String(msg.payload.id) : '';
+      if (qId) qEl.dataset.queuedId = qId;
       const qGutter = document.createElement('span');
       qGutter.className = 'gutter';
       qGutter.textContent = '>';
@@ -5157,11 +5216,40 @@ window.addEventListener('message', (e) => {
       const qBadge = document.createElement('span');
       qBadge.className = 'queued-badge';
       qBadge.textContent = 'queued';
+      const qUndo = document.createElement('button');
+      qUndo.className = 'queued-undo';
+      qUndo.type = 'button';
+      qUndo.textContent = 'Undo';
+      qUndo.title = 'Remove this queued message before it is sent to the LLM';
+      qUndo.addEventListener('click', () => {
+        if (!qId) return;
+        qUndo.disabled = true;
+        qUndo.textContent = 'Undoing…';
+        vscode.postMessage({ type: 'undo-queued-user-message', payload: { id: qId } });
+      });
       qEl.appendChild(qGutter);
       qEl.appendChild(qBody);
       qEl.appendChild(qBadge);
+      qEl.appendChild(qUndo);
       log.appendChild(qEl);
       scrollToBottom();
+      break;
+    }
+    case 'queued-user-message-undone': {
+      const id = msg.payload && msg.payload.id ? String(msg.payload.id) : '';
+      if (!id) break;
+      const qEl = log.querySelector('[data-queued-id="' + cssAttrEscape(id) + '"]');
+      if (!qEl) break;
+      if (msg.payload && msg.payload.removed) {
+        qEl.remove();
+      } else {
+        const btn = qEl.querySelector('.queued-undo');
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = 'Sent';
+          btn.title = 'This queued message has already been sent to the LLM';
+        }
+      }
       break;
     }
     case 'update-checkpoint-ref': {
@@ -5760,11 +5848,12 @@ window.addEventListener('message', (e) => {
       break;
     }
     case 'models': {
-      const payload = msg.payload || { chat: { baseURL: '', model: '', models: [] }, active: { model: '' }, fetched: null };
+      const payload = msg.payload || { chat: { baseURL: '', model: '', models: [] }, active: { model: '' }, fetched: null, video: { resolution: '1280x720' } };
       const newChat = payload.chat || { baseURL: '', model: '', models: [] };
       const oldBaseURL = modelsState.chat.baseURL;
       modelsState.chat = newChat;
       modelsState.active = payload.active || { model: modelsState.chat.model || '' };
+      modelsState.video = payload.video || modelsState.video || { resolution: '1280x720' };
       const cached = payload.fetched && Array.isArray(payload.fetched.models) ? payload.fetched : null;
       if (oldBaseURL !== newChat.baseURL) {
         // baseURL changed — discard any in-flight state and seed from the
@@ -6011,10 +6100,66 @@ function modelEntrySupportsVision(entry) {
   if (entry && typeof entry === 'object' && typeof entry.supportsVision === 'boolean') return entry.supportsVision;
   return modelSupportsVisionJS(modelEntryId(entry));
 }
+function normalizeVideoResolutionJS(size) {
+  const value = String(size || '').trim().toLowerCase();
+  if (value === '480p') return { width: 854, height: 480, label: '854x480' };
+  if (value === '720p') return { width: 1280, height: 720, label: '1280x720' };
+  if (value === '1080p') return { width: 1920, height: 1080, label: '1920x1080' };
+  const m = /^([1-9][0-9]{1,4})x([1-9][0-9]{1,4})$/.exec(value);
+  if (m) {
+    const width = Math.min(8192, Math.max(16, parseInt(m[1], 10)));
+    const height = Math.min(8192, Math.max(16, parseInt(m[2], 10)));
+    return { width, height, label: width + 'x' + height };
+  }
+  return { width: 1280, height: 720, label: '1280x720' };
+}
+function resizeImageDataUrlToVideoResolution(dataUrl, mimeType) {
+  const target = normalizeVideoResolutionJS(modelsState.video && modelsState.video.resolution);
+  return new Promise((resolve) => {
+    if (!dataUrl || !/^data:image\\//i.test(dataUrl)) { resolve({ dataUrl, mimeType, resized: false, target }); return; }
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = target.width;
+        canvas.height = target.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) { resolve({ dataUrl, mimeType, resized: false, target }); return; }
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(img, 0, 0, target.width, target.height);
+        const outMime = /^image\\/jpe?g$/i.test(String(mimeType || '')) ? 'image/jpeg' : 'image/png';
+        const out = canvas.toDataURL(outMime, outMime === 'image/jpeg' ? 0.92 : undefined);
+        resolve({ dataUrl: out, mimeType: outMime, resized: true, target });
+      } catch (_) {
+        resolve({ dataUrl, mimeType, resized: false, target });
+      }
+    };
+    img.onerror = () => resolve({ dataUrl, mimeType, resized: false, target });
+    img.src = dataUrl;
+  });
+}
+async function normalizeFirstFrameAttachment(img) {
+  const resized = await resizeImageDataUrlToVideoResolution(img.dataUrl, img.mimeType || 'image/png');
+  return {
+    dataUrl: resized.dataUrl,
+    mimeType: resized.mimeType || img.mimeType || 'image/png',
+    name: img.name || 'pasted image',
+    originalMimeType: img.mimeType,
+    videoResolution: resized.target.label,
+    resizedToVideoResolution: !!resized.resized
+  };
+}
 function readImageFile(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve({ dataUrl: String(reader.result || ''), mimeType: file.type || 'image/png', name: file.name || 'pasted image' });
+    reader.onload = async () => {
+      try {
+        resolve(await normalizeFirstFrameAttachment({ dataUrl: String(reader.result || ''), mimeType: file.type || 'image/png', name: file.name || 'pasted image' }));
+      } catch (err) {
+        reject(err);
+      }
+    };
     reader.onerror = () => reject(reader.error || new Error('Failed to read image'));
     reader.readAsDataURL(file);
   });
@@ -6064,66 +6209,79 @@ attachImageInput.addEventListener('change', async () => {
 	    }
 	  });
 
-	  const imageFromDataUrl = (dataUrl, name) => {
-	    const m = /^data:(image\\/[a-z0-9.+-]+);base64,/i.exec(dataUrl || '');
-	    if (!m) return null;
-	    return { dataUrl, mimeType: m[1], name: name || 'pasted image' };
-	  };
-	  const extractDataUrlImages = (text) => {
-	    const out = [];
-	    const re = new RegExp('data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=\\r\\n]+', 'ig');
-	    let m;
-	    while ((m = re.exec(String(text || '')))) {
-	      const img = imageFromDataUrl(m[0].replace(/[\\r\\n]/g, ''), 'pasted image');
-	      if (img) out.push(img);
-	    }
-	    return out;
-	  };
-	  const inlineImages = [...extractDataUrlImages(htmlText), ...extractDataUrlImages(plainText)];
+          const imageFromDataUrl = (dataUrl, name) => {
+            const m = /^data:(image\\/[a-z0-9.+-]+);base64,/i.exec(dataUrl || '');
+            if (!m) return null;
+            return { dataUrl, mimeType: m[1], name: name || 'pasted image' };
+          };
+          const extractDataUrlImages = (text) => {
+            const out = [];
+            const re = new RegExp('data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=\\r\\n]+', 'ig');
+            let m;
+            while ((m = re.exec(String(text || '')))) {
+              const img = imageFromDataUrl(m[0].replace(/[\\r\\n]/g, ''), 'pasted image');
+              if (img) out.push(img);
+            }
+            return out;
+          };
+          const inlineImages = [...extractDataUrlImages(htmlText), ...extractDataUrlImages(plainText)];
 
-	  // If there are no image files and no embedded data:image URLs, let the
-	  // browser perform a completely normal text paste. This preserves multiline
-	  // paste, selection replacement, undo behavior, and IME/browser quirks.
-	  if (rawFiles.length === 0 && inlineImages.length === 0) return;
-	  e.preventDefault();
+          // If there are no image files and no embedded data:image URLs, let the
+          // browser perform a completely normal text paste. This preserves multiline
+          // paste, selection replacement, undo behavior, and IME/browser quirks.
+          if (rawFiles.length === 0 && inlineImages.length === 0) return;
+          e.preventDefault();
 
-	  const insertTextAtCursor = (text) => {
-	    const s = String(text || '');
-	    if (!s) return false;
-	    const start = input.selectionStart || 0;
-	    const end = input.selectionEnd || start;
-	    const value = input.value || '';
-	    input.value = value.slice(0, start) + s + value.slice(end);
-	    const pos = start + s.length;
-	    try { input.setSelectionRange(pos, pos); } catch (_) {}
-	    autosizeInput();
-	    input.dispatchEvent(new Event('input', { bubbles: true }));
-	    return true;
-	  };
+          const insertTextAtCursor = (text) => {
+            const s = String(text || '');
+            if (!s) return false;
+            const start = input.selectionStart || 0;
+            const end = input.selectionEnd || start;
+            const value = input.value || '';
+            input.value = value.slice(0, start) + s + value.slice(end);
+            const pos = start + s.length;
+            try { input.setSelectionRange(pos, pos); } catch (_) {}
+            autosizeInput();
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            return true;
+          };
 
-	  (async () => {
-	    const images = inlineImages.slice();
-	    for (const f of rawFiles) {
-	      try { images.push(await readImageFile(f)); } catch (_) { /* skip */ }
-	    }
-	    if (!images.length) {
-	      insertTextAtCursor(plainText);
-	      return;
-	    }
-	    const slots = Math.max(0, 8 - pastedImages.length);
-	    if (slots <= 0) { addErrorMsg('⚠ 最多只能附加 8 张图片。'); return; }
-	    pastedImages.push(...images.slice(0, slots));
-	    renderAttachments();
-	  })();
-	});
+          (async () => {
+            const images = [];
+            for (const img of inlineImages) {
+              try { images.push(await normalizeFirstFrameAttachment(img)); } catch (_) { /* skip */ }
+            }
+            for (const f of rawFiles) {
+              try { images.push(await readImageFile(f)); } catch (_) { /* skip */ }
+            }
+            if (!images.length) {
+              insertTextAtCursor(plainText);
+              return;
+            }
+            const slots = Math.max(0, 8 - pastedImages.length);
+            if (slots <= 0) { addErrorMsg('⚠ 最多只能附加 8 张图片。'); return; }
+            pastedImages.push(...images.slice(0, slots));
+            renderAttachments();
+          })();
+        });
 
 sendBtn.addEventListener('click', () => {
+  const text = input.value.trim();
   if (busy) {
-    // While a run is in progress the button acts as Stop.
-    vscode.postMessage({ type: 'cancel' });
+    // While a run is in progress, do NOT turn the normal send action into Stop
+    // when the composer contains text. Queue the text instead so the user can
+    // keep chatting during the current response. Empty composer still acts as Stop.
+    if (!text && pastedImages.length === 0) {
+      vscode.postMessage({ type: 'cancel' });
+      return;
+    }
+    if (!text) return;
+    vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked } });
+    input.value = '';
+    autosizeInput();
+    updateQueueButton();
     return;
   }
-  const text = input.value.trim();
   if (!text && pastedImages.length === 0) return;
   if (pastedImages.length > 0 && !currentModelSupportsVision) {
     // Soft warning only — the user may be on a gateway that supports vision
@@ -6174,7 +6332,10 @@ input.addEventListener('keydown', (e) => {
 });
 
 // Show/hide queue button when text changes while busy.
-input.addEventListener('input', updateQueueButton);
+input.addEventListener('input', () => {
+  updateQueueButton();
+  updateSendButton();
+});
 
 // ============== Model picker ==============
 // Single chat profile only. Background profile is managed via Settings UI
@@ -6182,7 +6343,8 @@ input.addEventListener('input', updateQueueButton);
 const modelsState = {
   chat: { baseURL: '', model: '', models: [] },
   active: { model: '', supportsVision: false },
-  fetched: { loading: false, models: null, error: null, fetchedAt: 0 }
+  fetched: { loading: false, models: null, error: null, fetchedAt: 0 },
+  video: { resolution: '1280x720' }
 };
 
 function positionModelPicker() {
