@@ -44,6 +44,8 @@ export function buildVideoTool(logger: Logger, getDefaultFrameImages?: () => Vid
           '(burstcode.llm.video, falls back to the chat endpoint). Video models are called ' +
           'through an OpenAI-compatible video API and the generated MP4 is saved into the ' +
           'workspace. Use when the user asks to create / generate a video, animation, or motion clip. ' +
+          'After a successful generation, respond to the user with the result and stop — do NOT call ' +
+          'generate_video again unless the user explicitly asks for a new or different video. ' +
           'If the current chat turn includes pasted/attached images and the user asks for first-frame, last-frame, ' +
           'or image-to-video generation, call this tool even without imageUrl/firstFrameImage/lastFrameImage; ' +
           'BurstCode will automatically use the first pasted image as the first frame and, when multiple images ' +
@@ -259,7 +261,9 @@ export function buildVideoTool(logger: Logger, getDefaultFrameImages?: () => Vid
           `Generated video saved to ${rel} (${(result.data.length / 1024 / 1024).toFixed(1)} MB, ${result.mimeType}).` +
           (imageSource === 'pasted-chat-image' ? '\nFirst frame: pasted chat image.' : imageSource === 'argument' ? '\nFirst frame: image argument.' : '') +
           (lastFrameImageSource === 'pasted-chat-image' ? '\nLast frame: pasted chat image.' : lastFrameImageSource === 'argument' ? '\nLast frame: image argument.' : '') +
-          `\nSource URL: ${result.videoUrl}`,
+          `\nSource URL: ${result.videoUrl}` +
+          '\n\n✅ Video generation complete. You are done — give your final answer to the user now. ' +
+          'Do NOT call generate_video again unless the user explicitly asks for a new or different video.',
         meta: { path: uri.toString(), bytes: result.data.length, mimeType: result.mimeType, firstFrameImageSource: imageSource, lastFrameImageSource }
       };
     }

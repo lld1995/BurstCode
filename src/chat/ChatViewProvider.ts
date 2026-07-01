@@ -389,6 +389,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    */
   private readonly runs = new Map<string, RunContext>();
   /**
+   * Per-session cache of the most recently pasted/attached images, so a
+   * follow-up turn (e.g. "regenerate with a better prompt") can reuse the
+   * same first/last-frame image without the user re-pasting it. In-memory
+   * only — not persisted to workspaceState to avoid bloating storage with
+   * large base64 data URLs. Cleared on session delete.
+   */
+  private readonly videoFrameImagesBySession = new Map<string, ChatImageAttachment[]>();
+  /**
    * Browser-style "open tab" working set. Distinct from the history list:
    * history is every persisted session, openTabIds is the subset the user
    * has explicitly pulled into the foreground tab strip. Closing a tab
@@ -877,6 +885,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     if (choice !== 'Delete') return;
     await this.sessions.delete(id);
+    this.videoFrameImagesBySession.delete(id);
     // Also evict from the tab working set so we don't leave an orphan tab
     // pointing at a now-deleted session.
     if (this.openTabIds.delete(id)) {
@@ -1715,6 +1724,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Only block when THIS session is already running. Other sessions can
     // run concurrently in the background.
     const session = this.ensureSessionForUserText(userText || (images.length ? '[image]' : ''));
+    // Remember the pasted images for this session so a later turn (e.g.
+    // "regenerate with a better prompt") can reuse them as first/last video
+    // frames without the user re-pasting the image.
+    if (images.length > 0) this.videoFrameImagesBySession.set(session.id, images);
     if (this.runs.has(session.id)) {
       vscode.window.showWarningMessage('BurstCode: this session already has a request running.');
       return;
@@ -1764,11 +1777,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this.ensureSystemMessageSlot(session);
     const messageIndex = session.messages.length;
+    const storedFrameImages = this.videoFrameImagesBySession.get(session.id) ?? [];
     const attachmentNote = images.length > 0
       ? sendImagesToLlm
         ? `[Attached image${images.length === 1 ? '' : 's'}: ${images.map((img, idx) => img.name || `image ${idx + 1}`).join(', ')}. If the user asks to generate a video from the pasted/attached image, call generate_video without imageUrl/firstFrameImage/lastFrameImage; it will automatically use the first attached image as the first frame and, when multiple images are attached, the last attached image as the last frame.]`
         : `[Attached image${images.length === 1 ? '' : 's'}: ${images.map((img, idx) => img.name || `image ${idx + 1}`).join(', ')}. The current chat model is not vision-capable, so BurstCode did not send the image bytes to the LLM. If the user asks to generate a video from the pasted/attached image, call generate_video without imageUrl/firstFrameImage/lastFrameImage; it will automatically use the first attached image as the first frame and, when multiple images are attached, the last attached image as the last frame.]`
-      : '';
+      : storedFrameImages.length > 0
+        ? `[A previous image in this conversation is still available for video generation. If you call generate_video without imageUrl/firstFrameImage/lastFrameImage, it will automatically reuse the previous image as the first frame${storedFrameImages.length > 1 ? ' and the last image as the last frame' : ''}.]`
+        : '';
     const userContent: Extract<ChatMessage, { role: 'user' }>['content'] = images.length > 0
       ? [
           ...(userText.trim() ? [{ type: 'text' as const, text: userText }] : []),
@@ -1780,7 +1796,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               }))
             : [])
         ]
-      : userText;
+      : attachmentNote
+        ? [
+            ...(userText.trim() ? [{ type: 'text' as const, text: userText }] : []),
+            { type: 'text' as const, text: attachmentNote }
+          ]
+        : userText;
     session.messages.push({ role: 'user', content: userContent });
     // Tag any edits this run queues with the turn that produced them, so a
     // later rollback to an EARLIER turn only discards this turn's edits and
@@ -1935,7 +1956,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ...editTools,
       writeFileTool,
       buildImageTool(this.logger),
-      buildVideoTool(this.logger, () => opts.images),
+      buildVideoTool(this.logger, () => images.length > 0 ? images : this.videoFrameImagesBySession.get(session.id)),
       ...buildShellTools({ askUser }),
       buildPlanTool(onPlanUpdate),
       ...buildLessonTools(this.lessons, (list) => {
