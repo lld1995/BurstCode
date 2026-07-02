@@ -319,8 +319,9 @@ After receiving a collect_context / read_file result, follow these rules:
     add the missing remainder, patch the smallest incorrect block, or delete
     duplicated/trailing content introduced by overlap. If a broad rewrite seems
     necessary, first re-read the exact current range plus a small margin, then use
-    oldText to replace the exact existing bad block or delete_lines to remove the
-    exact duplicate block.
+    oldText to replace the exact existing bad block, replace_lines with the
+    readVersion/expectedReadVersion token for a just-read large block, or
+    delete_lines with expectedReadVersion to remove the exact duplicate block.
   - Files / patterns that returned useful content: do NOT re-read the same range.
   - Entries that returned empty / error results: DISCARD them — treat that
     content as if it never existed. Do NOT reference or repeat it.

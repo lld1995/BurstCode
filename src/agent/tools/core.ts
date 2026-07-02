@@ -138,9 +138,15 @@ export function buildReadFileTool(applier?: HunkApplier, sessionId?: string): To
         }
       }
 
+      const readText = rawLines.join('\n');
+      const readVersion = applier?.recordReadSnapshot(uri, readText);
+      const readVersionNote = readVersion
+        ? `\n# readVersion: ${readVersion} (pass as expectedReadVersion to replace_lines/delete_lines after this read so line drift can be detected and re-anchored)`
+        : '';
+
       return {
-        content: `# ${vscode.workspace.asRelativePath(uri)} (lines ${start}-${end} of ${total})${pendingNote}\n${lines.join('\n')}${hunkMap}`,
-        meta: { uri: uri.toString(), totalLines: total, start, end, hasReviewPendingEdits: pendingContent !== undefined }
+        content: `# ${vscode.workspace.asRelativePath(uri)} (lines ${start}-${end} of ${total})${pendingNote}${readVersionNote}\n${lines.join('\n')}${hunkMap}`,
+        meta: { uri: uri.toString(), totalLines: total, start, end, hasReviewPendingEdits: pendingContent !== undefined, readVersion }
       };
     }
   };

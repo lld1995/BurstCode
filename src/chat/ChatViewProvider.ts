@@ -992,9 +992,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const sid = this.currentSession?.id;
         const ctx = sid ? this.runs.get(sid) : undefined;
         const idx = id && ctx ? ctx.queuedUserMessages.findIndex((q) => q.id === id) : -1;
-        const removed = idx >= 0;
-        if (removed && ctx) ctx.queuedUserMessages.splice(idx, 1);
-        this.post({ type: 'queued-user-message-undone', payload: { id, removed } });
+        const removedMessage = idx >= 0 && ctx ? ctx.queuedUserMessages.splice(idx, 1)[0] : undefined;
+        const removed = !!removedMessage;
+        this.post({ type: 'queued-user-message-undone', payload: { id, removed, text: removedMessage?.text ?? '' } });
         break;
       }
       case 'close-tab': {
@@ -3254,9 +3254,18 @@ function scheduleScrollToBottom(force) {
     // content didn't" race caused by async layout.
     requestAnimationFrame(() => {
       const h1 = log.scrollHeight;
-      if (h1 > h0) log.scrollTop = h1;
-      else if (didForce || autoScroll) log.scrollTop = log.scrollHeight;
-      autoScroll = isLogAtBottom();
+      if (h1 > h0) {
+        log.scrollTop = h1;
+        // Content grew between the two passes — the user didn't scroll up,
+        // the content just arrived faster than we could scroll. Keep
+        // autoScroll unchanged so streaming continues to follow the bottom.
+        // Setting autoScroll=false here would stop auto-scrolling for the
+        // rest of the stream, causing the final text to never scroll into
+        // view.
+      } else {
+        if (didForce || autoScroll) log.scrollTop = log.scrollHeight;
+        autoScroll = isLogAtBottom();
+      }
     });
   });
 }
@@ -4306,6 +4315,16 @@ function tcSummaryHtml(name, args, meta, isError, done) {
     const edits = tcProposePreviewEdits(a, meta);
     for (const e of edits) {
       if (e && e.path) files.push(tcBaseName(e.path));
+      if (e && e.__lineRangePending) {
+        if (e.__operation === 'replace_lines') {
+          const repl = String(e.newText == null ? '' : e.newText);
+          adds += repl === '' ? 0 : repl.split('\\n').filter((_, idx, arr) => !(idx === arr.length - 1 && repl.endsWith('\\n'))).length;
+        }
+        if (Number.isFinite(Number(e.endLine)) && Number.isFinite(Number(e.startLine)) && Number(e.startLine) <= Number(e.endLine)) {
+          dels += Number(e.endLine) - Number(e.startLine) + 1;
+        }
+        continue;
+      }
       const rows = tcLineDiff(e && e.oldText, e && e.newText, e && e.startLine);
       for (const r of rows) { if (r.kind === 'add') adds++; else if (r.kind === 'del') dels++; }
     }
@@ -4344,6 +4363,18 @@ function tcSummaryHtml(name, args, meta, isError, done) {
 function tcProposePreviewEdits(args, meta) {
   if (meta && Array.isArray(meta.previewEdits) && meta.previewEdits.length) return meta.previewEdits;
   const a = args || {};
+  const op = String(a.operation || a.mode || a.action || '').toLowerCase().replaceAll(' ', '_').replaceAll('-', '_');
+  if (op === 'delete_lines' || op === 'replace_lines') {
+    const ranges = Array.isArray(a.ranges) && a.ranges.length ? a.ranges : (a.path ? [a] : []);
+    return ranges.map((r) => ({
+      path: (r && r.path) || a.path,
+      startLine: r && r.startLine,
+      endLine: r && r.endLine,
+      newText: op === 'replace_lines' ? String((r && r.newText) == null ? (a.newText == null ? '' : a.newText) : r.newText) : '',
+      __lineRangePending: true,
+      __operation: op
+    }));
+  }
   return Array.isArray(a.edits) ? a.edits : (a.path ? [a] : []);
 }
 
@@ -4364,7 +4395,16 @@ function tcRichBody(name, args, meta, result, isError) {
     const edits = tcProposePreviewEdits(a, meta);
     if (!edits.length) return null;
     for (const e of edits) {
-      const rows = tcLineDiff(e && e.oldText, e && e.newText, e && e.startLine);
+      let rows;
+      if (e && e.__lineRangePending) {
+        const opLabel = e.__operation === 'replace_lines' ? '按行号替换' : '按行号删除';
+        rows = [{ kind: 'ctx', oldNo: null, newNo: e && e.startLine, text: opLabel + '：' + (e && e.startLine) + '-' + (e && e.endLine) + '（执行后会从磁盘补全删除内容并渲染最终 diff）' }];
+        if (e.__operation === 'replace_lines' && e.newText) {
+          rows = rows.concat(String(e.newText).split('\\n').map((t, i) => ({ kind: 'add', oldNo: null, newNo: (e.startLine || 1) + i, text: t })));
+        }
+      } else {
+        rows = tcLineDiff(e && e.oldText, e && e.newText, e && e.startLine);
+      }
       let adds = 0, dels = 0;
       let firstChange = 0;
       for (const r of rows) {
@@ -4653,7 +4693,7 @@ function renderMarkdown(src) {
       const label = escapeHtml(fileDisplayLabel(fp.path, fp.line, fp.end));
       return '<a class="file-link" href="#" data-file-path="' + escapeHtml(fp.path) + '" data-file-line="' + fp.line + '" title="' + escapeHtml(fp.path + (fp.line ? ':' + fp.line : '')) + '"><code>' + label + '</code></a>';
     }
-    const sym = /^([A-Za-z_$][\w$.]*)\(\s*\)$/.exec(raw.trim());
+    const sym = new RegExp('^([A-Za-z_$][A-Za-z0-9_$.]*)[(][)]$').exec(raw.trim());
     if (sym) {
       return '<a class="symbol-link" href="#" data-symbol-name="' + escapeHtml(sym[1]) + '" title="Go to: ' + escapeHtml(sym[1]) + '"><code>' + escapeHtml(raw) + '</code></a>';
     }
@@ -4822,8 +4862,9 @@ function applyInline(s) {  // [label](file:path:line) — primary file link form
   s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
   s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
   // Italic * or _ (avoid touching word_with_underscores by requiring non-word boundary)
-  s = s.replace(/(^|[^*\\w])\\*([^*\\n]+)\\*(?=[^*\\w]|$)/g, '$1<em>$2</em>');
-  s = s.replace(/(^|[^_\\w])_([^_\\n]+)_(?=[^_\\w]|$)/g, '$1<em>$2</em>');
+  const NL = String.fromCharCode(10);
+  s = s.replace(new RegExp('(^|[^*A-Za-z0-9_])[*]([^*' + NL + ']+)[*](?=[^*A-Za-z0-9_]|$)', 'g'), '$1<em>$2</em>');
+  s = s.replace(new RegExp('(^|[^_A-Za-z0-9_])_([^_' + NL + ']+)_(?=[^_A-Za-z0-9_]|$)', 'g'), '$1<em>$2</em>');
   return s;
 }
 
@@ -5260,7 +5301,17 @@ window.addEventListener('message', (e) => {
       const qEl = log.querySelector('[data-queued-id="' + cssAttrEscape(id) + '"]');
       if (!qEl) break;
       if (msg.payload && msg.payload.removed) {
+        const restoredText = (typeof msg.payload.text === 'string') ? msg.payload.text : '';
         qEl.remove();
+        if (restoredText) {
+          const current = input.value || '';
+          input.value = current.trim().length > 0 ? current + String.fromCharCode(10) + restoredText : restoredText;
+          autosizeInput();
+          updateQueueButton();
+          input.focus();
+          const len = input.value.length;
+          try { input.setSelectionRange(len, len); } catch (_) { /* not focused yet */ }
+        }
       } else {
         const btn = qEl.querySelector('.queued-undo');
         if (btn) {
@@ -5836,6 +5887,7 @@ window.addEventListener('message', (e) => {
       activeStreamingToolEl = null;
       runningTools.clear();
       setStatus('error', 'Error');
+      forceScrollToBottom();
       break;
     case 'done': {
       setBusy(false);
@@ -5864,6 +5916,27 @@ window.addEventListener('message', (e) => {
       }
       runningTools.clear();
       setStatus(errorish ? 'error' : 'done', labels[reason] || ('Done (' + reason + ')'));
+      // Flush any pending markdown render for the in-flight assistant bubble.
+      // In the normal flow, assistant-message already rendered synchronously
+      // and set activeAssistantEl=null. But if the run was cancelled before
+      // assistant-message arrived, the last assistant-delta's scheduleRender
+      // rAF may not have fired yet — flush it now so the partial text is
+      // visible immediately.
+      if (activeAssistantEl && activeAssistantEl.dataset.renderPending === 'true') {
+        delete activeAssistantEl.dataset.renderPending;
+        if (activeAssistantEl.isConnected) {
+          const raw = activeAssistantEl.dataset.raw || '';
+          const mdEl = activeAssistantEl.querySelector('.md');
+          if (mdEl) {
+            mdEl.innerHTML = renderMarkdown(raw);
+            bindCodeCopy(mdEl);
+          }
+        }
+      }
+      // Ensure the final output is scrolled into view. During rapid streaming
+      // the two-pass scroll can fall behind the growing content; force a
+      // final scroll so the last text is always visible when the run ends.
+      forceScrollToBottom();
       break;
     }
     case 'models': {
@@ -6184,7 +6257,7 @@ function readImageFile(file) {
   });
 }
 async function addImageFiles(files, sourceLabel) {
-  const raw = Array.from(files || []).filter((f) => f && /^image\//i.test(f.type || ''));
+  const raw = Array.from(files || []).filter((f) => f && String(f.type || '').indexOf('image/') === 0);
   if (!raw.length) return;
   const slots = Math.max(0, 8 - pastedImages.length);
   if (slots <= 0) { addErrorMsg('⚠ 最多只能附加 8 张图片。'); return; }
