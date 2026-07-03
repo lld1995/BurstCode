@@ -502,6 +502,48 @@ export function salvageWriteFileArgs(raw: string): Record<string, unknown> | nul
  * before/after whole-file snapshot in the normal pending review UI so Reject can
  * restore the previous file state (or delete a newly-created file).
  */
+
+/**
+ * Check if a file path is git-ignored by running `git check-ignore`.
+ * Returns true if git says the path is ignored, false otherwise (including
+ * when git is unavailable or the path is not in a git repo).
+ */
+function gitCheckIgnored(cwd: string, relPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    cp.execFile('git', ['check-ignore', '--quiet', relPath], {
+      cwd,
+      windowsHide: true,
+      encoding: 'utf8',
+    }, (err) => {
+      // git check-ignore --quiet: exit 0 = ignored, non-zero = not ignored or error
+      resolve(!err);
+    });
+  });
+}
+
+/**
+ * Determine whether a write_file target should enter the pending review UI.
+ * Uses `git check-ignore` to respect the project's .gitignore rules —
+ * any path the project's .gitignore excludes is automatically skipped.
+ * Always excludes .burstcode/ and .git/ (internal infrastructure) regardless.
+ * If git is unavailable (no repo / git not installed), only the internal
+ * exclusions apply; everything else is treated as user source code.
+ */
+async function isReviewableWritePath(uri: vscode.Uri): Promise<boolean> {
+  const ws = vscode.workspace.getWorkspaceFolder(uri);
+  if (!ws) return false;
+  const rel = vscode.workspace.asRelativePath(uri, false).replace(/\\/g, '/');
+  if (!rel) return false;
+  // Always exclude internal/special directories that git check-ignore
+  // won't catch (.git is implicitly ignored by git itself).
+  if (rel === '.burstcode' || rel.startsWith('.burstcode/')) return false;
+  if (rel === '.git' || rel.startsWith('.git/')) return false;
+  // Primary: use git check-ignore for accurate .gitignore-based filtering.
+  const ignored = await gitCheckIgnored(ws.uri.fsPath, rel);
+  if (ignored) return false;
+  return true;
+}
+
 export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string, turnIndex?: number): Tool {
   return {
     name: 'write_file',
@@ -548,8 +590,10 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string, tu
         const modifiedContent = await fsModule.readFile(uri.fsPath, 'utf8');
         // Bind this write to the current session and show it in the normal
         // pending review UI so Reject can restore the captured pre-write state.
+        // Skip review for paths that are git-ignored (per the project's .gitignore)
+        // or internal infrastructure (.burstcode, .git) — these are not user source.
         try {
-          if (applier && originalContent !== modifiedContent) {
+          if (applier && originalContent !== modifiedContent && await isReviewableWritePath(uri)) {
             await applier.queueExternalFileChange(
               uri,
               originalContent,
