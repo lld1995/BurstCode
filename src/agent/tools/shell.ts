@@ -211,31 +211,50 @@ async function findGitRoot(cwd: string): Promise<string | null> {
 }
 
 /**
+ * Snapshot of the working-tree state before a shell command runs.
+ * `ref` is a git ref (stash-create sha or HEAD) for diffing tracked files.
+ * `untracked` is the set of untracked, non-ignored file paths that existed
+ * BEFORE the command — so we can avoid queuing pre-existing untracked files
+ * (e.g. .vsix build output) as "new" changes every time run_shell runs.
+ */
+interface BaselineSnapshot {
+  ref: string;
+  untracked: Set<string>;
+}
+
+/**
  * Create a baseline reference for detecting file changes made by a shell
  * command. Uses `git stash create` to snapshot the current working-tree
  * state (including uncommitted changes) WITHOUT modifying the working tree.
  * Falls back to HEAD when there are no local changes to stash.
+ * Also captures the set of untracked files so we can distinguish files the
+ * command CREATED from files that were already lying around untracked.
  * Returns null if not in a git repo or git is unavailable.
  */
-async function createGitBaseline(gitRoot: string): Promise<string | null> {
+async function createGitBaseline(gitRoot: string): Promise<BaselineSnapshot | null> {
   const stashSha = await gitCmd(gitRoot, ['stash', 'create']);
-  if (stashSha?.trim()) return stashSha.trim();
-  const head = await gitCmd(gitRoot, ['rev-parse', 'HEAD']);
-  return head?.trim() || null;
+  const ref = stashSha?.trim() || (await gitCmd(gitRoot, ['rev-parse', 'HEAD']))?.trim() || null;
+  if (!ref) return null;
+  // Snapshot untracked files BEFORE the command so we can diff them later.
+  const untrackedOutput = await gitCmd(gitRoot, ['ls-files', '--others', '--exclude-standard']);
+  const untracked = new Set<string>();
+  if (untrackedOutput) for (const p of untrackedOutput.split('\n')) if (p.trim()) untracked.add(p.trim());
+  return { ref, untracked };
 }
 
 /**
  * Detect file changes between the git baseline and the current working tree
- * using `git diff --name-only` and `git ls-files --others`. Only files that
- * git reports as changed are examined — no workspace-wide scanning, so no
- * false positives from untouched files.
+ * using `git diff --name-only` (for tracked files) and `git ls-files --others`
+ * (for new untracked files). Only files that git reports as changed AND that
+ * were not already untracked before the command are examined — no
+ * workspace-wide scanning, so no false positives from untouched files.
  */
-async function collectGitChanges(gitRoot: string, baselineRef: string, applier?: HunkApplier): Promise<ShellFileChange[]> {
+async function collectGitChanges(gitRoot: string, baseline: BaselineSnapshot, applier?: HunkApplier): Promise<ShellFileChange[]> {
   const changes: ShellFileChange[] = [];
 
-  // Modified/deleted tracked files
-  const diffOutput = await gitCmd(gitRoot, ['diff', '--name-only', baselineRef]);
-  // New untracked files (not gitignored)
+  // Modified/deleted tracked files — only files that changed since the baseline.
+  const diffOutput = await gitCmd(gitRoot, ['diff', '--name-only', baseline.ref]);
+  // New untracked files (not gitignored) — we'll filter out pre-existing ones.
   const untrackedOutput = await gitCmd(gitRoot, ['ls-files', '--others', '--exclude-standard']);
 
   const allPaths = new Set<string>();
@@ -243,6 +262,9 @@ async function collectGitChanges(gitRoot: string, baselineRef: string, applier?:
   if (untrackedOutput) for (const p of untrackedOutput.split('\n')) if (p.trim()) allPaths.add(p.trim());
 
   for (const relPath of allPaths) {
+    // Skip untracked files that already existed before the command ran —
+    // they are NOT changes caused by this shell command.
+    if (baseline.untracked.has(relPath)) continue;
     const absPath = path.join(gitRoot, relPath);
     const uri = vscode.Uri.file(absPath);
     const key = uri.toString();
@@ -251,7 +273,7 @@ async function collectGitChanges(gitRoot: string, baselineRef: string, applier?:
 
     // Original content from the git baseline (null if the file didn't exist).
     const gitPath = relPath.replace(/\\/g, '/');
-    const originalContent = await gitCmd(gitRoot, ['show', `${baselineRef}:${gitPath}`]);
+    const originalContent = await gitCmd(gitRoot, ['show', `${baseline.ref}:${gitPath}`]);
 
     // Modified content from the working tree (null if the file was deleted).
     let modifiedContent: string | null = null;
@@ -396,7 +418,7 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
       // after the command — no workspace-wide file scanning.
       const shellCwd = cwd ?? workspaceRoot() ?? process.cwd();
       const gitRoot = deps.applier ? await findGitRoot(shellCwd) : null;
-      const baselineRef = gitRoot ? await createGitBaseline(gitRoot) : null;
+      const baseline = gitRoot ? await createGitBaseline(gitRoot) : null;
 
       // ---- Spawn ---------------------------------------------------------
       const plan = planSpawn(shellKind, command);
@@ -633,8 +655,8 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
           sections.push(`## stdout${stdoutLabel}\n${stdoutTrunc.text || '(empty)'}`);
           sections.push(`## stderr${stderrLabel}\n${stderrTrunc.text || '(empty)'}`);
 
-          const reviewChanges = (deps.applier && gitRoot && baselineRef)
-            ? await collectGitChanges(gitRoot, baselineRef, deps.applier)
+          const reviewChanges = (deps.applier && gitRoot && baseline)
+            ? await collectGitChanges(gitRoot, baseline, deps.applier)
             : [];
           if (deps.applier && reviewChanges.length > 0) {
             try {
