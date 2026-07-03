@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.127",
+  "version": "0.1.128",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -519,8 +519,8 @@
         },
         "burstcode.agent.subagentTaskTimeoutMs": {
           "type": "number",
-          "default": 180000,
-          "description": "Hard timeout in milliseconds for each launched sub-agent task before it is cancelled and returned as partial/timeout."
+          "default": 1800000,
+          "description": "Hard timeout in milliseconds for each launched sub-agent task before it is cancelled and returned as partial/timeout. Values below 1800000 are clamped to 30 minutes."
         },
         "burstcode.agent.enableWriteSubagents": {
           "type": "boolean",

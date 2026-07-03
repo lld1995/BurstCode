@@ -164,7 +164,7 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
       }
 
       const completed = results.filter(Boolean);
-      const hasError = completed.some((r) => /\] (?:error|rejected|completed_with_errors)/.test(r));
+      const hasError = completed.some((r) => /\] (?:error|rejected|partial|completed_with_errors)/.test(r));
       return {
         content: completed.join('\n\n'),
         isError: hasError,
@@ -215,7 +215,7 @@ async function runTask(
   ];
   const taskTokenSource = new vscode.CancellationTokenSource();
   const parentSub = cancellation.onCancellationRequested(() => taskTokenSource.cancel());
-  const timeoutMs = Math.max(30_000, Math.floor(options.taskTimeoutMs || 0));
+  const timeoutMs = Math.max(1_800_000, Math.floor(options.taskTimeoutMs || 0));
   const timeout = setTimeout(() => taskTokenSource.cancel(), timeoutMs);
   const agent = new AgentLoop(options.clientFactory(), tools, options.applier, options.logger, {
     contextWindow: options.contextWindow,
@@ -373,12 +373,14 @@ function scopeWriteTools(tools: Tool[], allowedFiles: string[]): Tool[] {
     return {
       ...tool,
       execute: async (args, ctx) => {
-        const rawEdits = Array.isArray(args.edits) ? args.edits : [];
+        const paths = extractProposeEditPaths(args);
         const denied: string[] = [];
-        for (const edit of rawEdits) {
-          if (!edit || typeof edit !== 'object') continue;
-          const p = String((edit as Record<string, unknown>).path ?? '').trim();
-          if (!p || !allowed.has(normalizePathForCompare(p))) denied.push(p || '(missing path)');
+        if (paths.length === 0) {
+          denied.push('(missing path)');
+        } else {
+          for (const p of paths) {
+            if (!allowed.has(normalizePathForCompare(p))) denied.push(p);
+          }
         }
         if (denied.length > 0) {
           return {
@@ -390,6 +392,44 @@ function scopeWriteTools(tools: Tool[], allowedFiles: string[]): Tool[] {
       }
     } satisfies Tool;
   });
+}
+
+const PROPOSE_EDIT_PATH_KEYS = ['path', 'file', 'filePath', 'filename', 'fileName', 'target', 'targetFile', 'uri'];
+const PROPOSE_EDIT_ARRAY_KEYS = ['edits', 'hunks', 'changes', 'files'];
+const PROPOSE_EDIT_RANGE_ARRAY_KEYS = ['ranges', 'deletions', 'deleteRanges', 'replacements', 'replaceRanges'];
+
+function pickPathValue(record: Record<string, unknown>): string | undefined {
+  for (const key of PROPOSE_EDIT_PATH_KEYS) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function extractProposeEditPaths(args: unknown): string[] {
+  if (!args || typeof args !== 'object') return [];
+  const record = args as Record<string, unknown>;
+  const topLevelPath = pickPathValue(record);
+  const paths: string[] = [];
+  const addPath = (value: string | undefined) => {
+    const p = String(value ?? '').trim();
+    if (p) paths.push(p);
+  };
+
+  for (const key of [...PROPOSE_EDIT_ARRAY_KEYS, ...PROPOSE_EDIT_RANGE_ARRAY_KEYS]) {
+    const value = record[key];
+    if (!Array.isArray(value)) continue;
+    for (const item of value) {
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        addPath(pickPathValue(item as Record<string, unknown>) ?? topLevelPath);
+      } else {
+        addPath(topLevelPath);
+      }
+    }
+  }
+
+  if (paths.length === 0) addPath(topLevelPath);
+  return [...new Set(paths)];
 }
 
 function normalizePathForCompare(input: string): string {

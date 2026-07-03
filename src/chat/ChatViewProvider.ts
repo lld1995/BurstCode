@@ -1931,7 +1931,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const lspTools = buildLspTools(bridge, this.depGuard);
     const editTools = buildEditTools(this.applier, askUser, session.id, messageIndex);
     const mcpTools = opts.useMcp === false ? [] : await buildMcpTools(this.logger);
-    const subagentTaskTimeoutMs = Math.max(30_000, agentCfg.get<number>('subagentTaskTimeoutMs') ?? 180_000);
+    const subagentTaskTimeoutMs = Math.max(1_800_000, agentCfg.get<number>('subagentTaskTimeoutMs') ?? 1_800_000);
     const subagentTool = buildSubagentTool({
       clientFactory: () => new OpenAIClient(llmCfg, this.logger),
       logger: this.logger,
@@ -1957,7 +1957,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       writeFileTool,
       buildImageTool(this.logger),
       buildVideoTool(this.logger, () => images.length > 0 ? images : this.videoFrameImagesBySession.get(session.id)),
-      ...buildShellTools({ askUser }),
+      ...buildShellTools({ askUser, applier: this.applier, sessionId: session.id, turnIndex: messageIndex }),
       buildPlanTool(onPlanUpdate),
       ...buildLessonTools(this.lessons, (list) => {
         // Lessons are read into the system prompt at run START. Mid-run

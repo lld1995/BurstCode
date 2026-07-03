@@ -431,6 +431,99 @@ export class HunkApplier implements vscode.Disposable {
   }
 
   /**
+   * Queue already-applied whole-file disk changes for the normal pending review
+   * UI. Used by write_file and run_shell: the file is already in its modified
+   * state on disk, but Reject should restore the captured pre-change content
+   * (or delete a newly-created file) exactly like propose_edit hunks do.
+   */
+  async queueExternalFileChange(
+    uri: vscode.Uri,
+    originalContent: string | null,
+    modifiedContent: string | null,
+    summary: string,
+    sessionId = this.currentSessionId,
+    turnIndex = this.currentTurnIndex
+  ): Promise<void> {
+    this.latestSummary = summary;
+    await this.ensureCycleInit(summary);
+    await this.withFileLock(uri.toString(), async () => {
+      const key = uri.toString();
+      const original = originalContent ?? '';
+      const modified = modifiedContent ?? '';
+      const existingEntry = this.pending.get(key);
+      let entry: PendingFile;
+      let newlyQueued = false;
+      if (existingEntry) {
+        entry = existingEntry;
+        entry.lastSummary = summary;
+        // A whole-file snapshot supersedes still-pending hunks for the same
+        // session/turn. Keeping them would double-apply edits when Reject
+        // recomposes original + non-rejected hunks.
+        entry.hunks = entry.hunks.filter((h) =>
+          h.status !== 'pending' ||
+          h.sessionId !== (sessionId ?? '') ||
+          h.turnIndex !== turnIndex
+        );
+      } else {
+        const proposedUri = this.diffPreview.registerProposed(uri, original);
+        entry = {
+          uri,
+          proposedUri,
+          originalContent: original,
+          modifiedContent: original,
+          hunks: [],
+          eol: inferEol(original || modified),
+          isNewFile: originalContent === null,
+          lastSummary: summary,
+          turnIndex,
+          sessionId
+        };
+        this.pending.set(key, entry);
+        newlyQueued = true;
+      }
+
+      const originalLineCount = splitLogicalLines(entry.originalContent).length;
+      entry.hunks.push({
+        id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        fileUri: uri,
+        hunk: {
+          startLine: 1,
+          endLine: Math.max(1, originalLineCount),
+          newText: modified
+        },
+        status: 'pending',
+        sessionId: sessionId ?? '',
+        turnIndex
+      });
+      entry.modifiedContent = modified;
+      this.recordTouchedFile(uri, sessionId, turnIndex);
+      this.codeLensProvider.refresh();
+
+      const diffOpenSessionKey = sessionId ?? '';
+      if (newlyQueued && !this.diffOpenedForSessions.has(diffOpenSessionKey)) {
+        this.diffOpenedForSessions.add(diffOpenSessionKey);
+        try {
+          await this.openDiffForEntry(entry);
+        } catch (err) {
+          this.logger.warn('Failed to open external-change diff editor', String(err));
+        }
+      }
+    });
+    this.emitState();
+  }
+
+  async queueExternalFileChanges(
+    changes: Array<{ uri: vscode.Uri; originalContent: string | null; modifiedContent: string | null }>,
+    summary: string,
+    sessionId = this.currentSessionId,
+    turnIndex = this.currentTurnIndex
+  ): Promise<void> {
+    for (const change of changes) {
+      await this.queueExternalFileChange(change.uri, change.originalContent, change.modifiedContent, summary, sessionId, turnIndex);
+    }
+  }
+
+  /**
    * Queue line-based edits for user review. Non-blocking: returns immediately.
    *
    * Multiple calls accumulate hunks per file. If a new hunk's range overlaps
@@ -1933,6 +2026,10 @@ function leadingWs(line: string): string {
  * in `text`. Lines that don't start with fromPrefix are left untouched.
  * EOL style (\n vs \r\n) is preserved.
  */
+function inferEol(text: string): '\r\n' | '\n' {
+  return text.includes('\r\n') ? '\r\n' : '\n';
+}
+
 function reindentTextPrefix(text: string, fromPrefix: string, toPrefix: string): string {
   if (fromPrefix === toPrefix) return text;
   if (fromPrefix === '') {

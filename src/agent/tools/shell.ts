@@ -4,6 +4,7 @@ import * as path from 'path';
 import { TextDecoder } from 'util';
 import { Tool, ToolContext, ToolResult } from './types';
 import { AskUserFn } from './edits';
+import { HunkApplier } from '../../edits/HunkApplier';
 
 type ShellKind = 'auto' | 'cmd' | 'powershell' | 'pwsh' | 'bash' | 'sh';
 
@@ -179,12 +180,70 @@ function truncate(text: string, maxBytes: number): { text: string; truncated: bo
   return { text: buf.toString('utf8'), truncated: true };
 }
 
+const SHELL_REVIEW_MAX_FILE_BYTES = 2 * 1024 * 1024;
+
+async function snapshotWorkspaceTextFiles(): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const files = await vscode.workspace.findFiles(
+    '**/*',
+    '{**/node_modules/**,**/.git/**,**/.burstcode/checkpoints/**,**/dist/**,**/out/**,**/*.vsix}'
+  );
+  await Promise.all(files.map(async (uri) => {
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.type !== vscode.FileType.File || stat.size > SHELL_REVIEW_MAX_FILE_BYTES) return;
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      if (bytes.includes(0)) return;
+      out.set(uri.toString(), Buffer.from(bytes).toString('utf8'));
+    } catch {
+      // Best effort only; shell execution must not fail because snapshotting did.
+    }
+  }));
+  return out;
+}
+
+async function collectWorkspaceTextFileChanges(before: Map<string, string>): Promise<Array<{ uri: vscode.Uri; originalContent: string | null; modifiedContent: string | null }>> {
+  const files = await vscode.workspace.findFiles(
+    '**/*',
+    '{**/node_modules/**,**/.git/**,**/.burstcode/checkpoints/**,**/dist/**,**/out/**,**/*.vsix}'
+  );
+  const afterUris = new Set(files.map((u) => u.toString()));
+  const changes: Array<{ uri: vscode.Uri; originalContent: string | null; modifiedContent: string | null }> = [];
+
+  for (const uri of files) {
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.type !== vscode.FileType.File || stat.size > SHELL_REVIEW_MAX_FILE_BYTES) continue;
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      if (bytes.includes(0)) continue;
+      const modifiedContent = Buffer.from(bytes).toString('utf8');
+      const key = uri.toString();
+      const originalContent = before.has(key) ? before.get(key)! : null;
+      if (originalContent !== modifiedContent) changes.push({ uri, originalContent, modifiedContent });
+    } catch {
+      // Ignore files that disappeared while scanning; deletions are handled below
+      // for files that were present in the pre-command snapshot.
+    }
+  }
+
+  for (const [key, originalContent] of before) {
+    if (!afterUris.has(key)) {
+      changes.push({ uri: vscode.Uri.parse(key), originalContent, modifiedContent: null });
+    }
+  }
+
+  return changes;
+}
+
 const ALLOW_ONCE = 'Allow once';
 const ALLOW_ALWAYS = 'Allow for this session';
 const DENY = 'Deny';
 
 export interface ShellToolDeps {
   askUser: AskUserFn;
+  applier?: HunkApplier;
+  sessionId?: string;
+  turnIndex?: number;
 }
 
 /**
@@ -211,7 +270,7 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
       function: {
         name: 'run_shell',
         description:
-          'Execute a shell command and return stdout, stderr, exit code. Use for build/test/lint/run scripts or environment probes (node -v, git status). User approval gate unless auto-approved. See PROTOCOL step 11 for safety rules.',
+          'Execute a shell command and return stdout, stderr, exit code. Use for build/test/lint/run scripts or environment probes (node -v, git status). User approval gate unless auto-approved. Any text file changes under the workspace are queued into the pending review UI so Reject can restore the pre-command state.',
         parameters: {
           type: 'object',
           properties: {
@@ -294,6 +353,8 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
           };
         }
       }
+
+      const beforeFiles = deps.applier ? await snapshotWorkspaceTextFiles() : new Map<string, string>();
 
       // ---- Spawn ---------------------------------------------------------
       const plan = planSpawn(shellKind, command);
@@ -479,7 +540,7 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
           });
         });
 
-        proc.on('close', (code, signal) => {
+        proc.on('close', async (code, signal) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
@@ -530,6 +591,23 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
           sections.push(`## stdout${stdoutLabel}\n${stdoutTrunc.text || '(empty)'}`);
           sections.push(`## stderr${stderrLabel}\n${stderrTrunc.text || '(empty)'}`);
 
+          const reviewChanges = deps.applier
+            ? await collectWorkspaceTextFileChanges(beforeFiles)
+            : [];
+          if (deps.applier && reviewChanges.length > 0) {
+            try {
+              await deps.applier.queueExternalFileChanges(
+                reviewChanges,
+                `run_shell: ${command.slice(0, 80)}`,
+                deps.sessionId,
+                deps.turnIndex
+              );
+              sections.push(`## pending review\nQueued ${reviewChanges.length} changed file(s) for Accept/Reject review.`);
+            } catch (err) {
+              sections.push(`## pending review\nFailed to queue shell file changes for review: ${String((err as Error).message ?? err)}`);
+            }
+          }
+
           resolve({
             content: sections.join('\n\n'),
             isError: timedOut || cancelled || forcedExit || (typeof code === 'number' && code !== 0),
@@ -545,7 +623,8 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
               stdoutBytes: Buffer.byteLength(stdout, 'utf8'),
               stderrBytes: Buffer.byteLength(stderr, 'utf8'),
               stdoutTruncated: stdoutTrunc.truncated,
-              stderrTruncated: stderrTrunc.truncated
+              stderrTruncated: stderrTrunc.truncated,
+              pendingReviewFiles: reviewChanges.length
             }
           });
         });

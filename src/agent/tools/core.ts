@@ -498,22 +498,20 @@ export function salvageWriteFileArgs(raw: string): Record<string, unknown> | nul
 }
 
 /**
- * Direct-write tool: writes content to disk immediately without queueing for
- * user review. Use for agent-generated scripts, temp files, and any file that
- * the agent will immediately read back or execute itself. For edits to
- * existing source files that belong to the user, prefer propose_edit so the
- * user can review and accept the diff.
+ * Direct-write tool: writes content to disk immediately, then queues the
+ * before/after whole-file snapshot in the normal pending review UI so Reject can
+ * restore the previous file state (or delete a newly-created file).
  */
 export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string, turnIndex?: number): Tool {
   return {
     name: 'write_file',
-    parallelSafe: true,
+    parallelSafe: false,
     schema: {
       type: 'function',
       function: {
         name: 'write_file',
         description:
-          'Write or append a file on disk immediately — no user review step, no diff UI. Use for agent-generated helper scripts, temp/scratch files, config stubs, and any file the agent needs to create and then immediately execute or read back. NOT for modifying the user\'s existing source files — use propose_edit for those so the user can review the diff. Parent directories are created automatically. Path may be workspace-relative or absolute. Default mode overwrites the file. Set mode="append" (or append=true) ONLY when continuing a previously interrupted/partial write_file output after reading the current tail; do not resend already-written content. If writing a whole file / large content fails, is truncated, or cannot parse, DO NOT retry the same giant payload; read back the current file and split the write into smaller generated files/chunks or append/repair only the missing tail in follow-up calls.',
+          'Write or append a file on disk immediately, then queue the before/after file snapshot for user review in the pending edits UI. Reject restores the previous content or deletes a newly-created file; Accept keeps the already-written content. Use for agent-generated helper scripts, temp files, config stubs, and any file the agent needs to create and then immediately execute or read back. Parent directories are created automatically. Default mode overwrites the file. Set mode="append" (or append=true) ONLY when continuing a previously interrupted/partial write_file output after reading the current tail; do not resend already-written content. If writing a whole file / large content fails, is truncated, cannot parse, or produces no landed change, DO NOT retry the same giant payload; read back the current file and split the work into smaller generated files/chunks or append/repair only the missing tail in follow-up calls.',
         parameters: {
           type: 'object',
           properties: {
@@ -537,15 +535,31 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string, tu
       try {
         await fsModule.mkdir(nodePath.dirname(uri.fsPath), { recursive: true });
         let existed = false;
-        try { await fsModule.access(uri.fsPath); existed = true; } catch { existed = false; }
+        let originalContent: string | null = null;
+        try {
+          originalContent = await fsModule.readFile(uri.fsPath, 'utf8');
+          existed = true;
+        } catch { existed = false; }
         if (appendMode) {
           await fsModule.appendFile(uri.fsPath, content, 'utf8');
         } else {
           await fsModule.writeFile(uri.fsPath, content, 'utf8');
         }
-        // Bind this write to the current session so a later rollback only
-        // reverts/deletes files THIS session actually wrote.
-        try { applier?.recordTouchedFile(uri, sessionId, turnIndex); } catch { /* non-fatal */ }
+        const modifiedContent = await fsModule.readFile(uri.fsPath, 'utf8');
+        // Bind this write to the current session and show it in the normal
+        // pending review UI so Reject can restore the captured pre-write state.
+        try {
+          if (applier) {
+            await applier.queueExternalFileChange(
+              uri,
+              originalContent,
+              modifiedContent,
+              appendMode ? 'write_file append' : 'write_file write',
+              sessionId,
+              turnIndex
+            );
+          }
+        } catch { /* non-fatal: disk write already succeeded */ }
         const relPath = vscode.workspace.asRelativePath(uri);
         const truncationNote = args.__bc_truncatedSalvage
           ? ' IMPORTANT: this write_file call was TRUNCATED mid-stream; the partial content that arrived was written to disk. Read the file back and append/repair only the missing tail in a smaller follow-up call using mode="append" when the tail is strictly additive.'
@@ -554,7 +568,7 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string, tu
         const suffix = appendMode ? ' (append mode)' : '';
         return {
           content: `${verb} ${content.split(/\r?\n/).length} line(s) to ${relPath}${suffix}.${truncationNote}`,
-          meta: { uri: uri.toString(), bytes: Buffer.byteLength(content, 'utf8'), created: !existed, mode: appendMode ? 'append' : 'write' }
+          meta: { uri: uri.toString(), bytes: Buffer.byteLength(content, 'utf8'), created: !existed, mode: appendMode ? 'append' : 'write', pendingReview: Boolean(applier) }
         };
       } catch (err) {
         return {
