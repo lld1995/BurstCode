@@ -182,69 +182,91 @@ function truncate(text: string, maxBytes: number): { text: string; truncated: bo
 
 const SHELL_REVIEW_MAX_FILE_BYTES = 2 * 1024 * 1024;
 
-interface ShellReviewSnapshot {
-  content: string;
-  size: number;
-  mtime: number;
+interface ShellFileChange {
+  uri: vscode.Uri;
+  originalContent: string | null;
+  modifiedContent: string | null;
 }
 
-async function snapshotWorkspaceTextFiles(applier?: HunkApplier): Promise<Map<string, ShellReviewSnapshot>> {
-  const out = new Map<string, ShellReviewSnapshot>();
-  const files = await vscode.workspace.findFiles(
-    '**/*',
-    '{**/node_modules/**,**/.git/**,**/.burstcode/**,**/dist/**,**/out/**,**/*.vsix}'
-  );
-  await Promise.all(files.map(async (uri) => {
-    try {
-      const key = uri.toString();
-      // Do not let files that were already in the pending review set before the
-      // command get re-queued as "shell changes". They already have their own
-      // before/after baseline and queuing them again creates false positives.
-      if (applier?.hasPendingForPath(key)) return;
-      const stat = await vscode.workspace.fs.stat(uri);
-      if (stat.type !== vscode.FileType.File || stat.size > SHELL_REVIEW_MAX_FILE_BYTES) return;
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      if (bytes.includes(0)) return;
-      out.set(key, { content: Buffer.from(bytes).toString('utf8'), size: stat.size, mtime: stat.mtime });
-    } catch {
-      // Best effort only; shell execution must not fail because snapshotting did.
-    }
-  }));
-  return out;
+/**
+ * Run a git command and return stdout as a string (null on any error).
+ * Uses a generous maxBuffer so `git show` of large text files doesn't fail.
+ */
+function gitCmd(cwd: string, args: string[]): Promise<string | null> {
+  return new Promise((resolve) => {
+    cp.execFile('git', args, { cwd, maxBuffer: 50 * 1024 * 1024, windowsHide: true, encoding: 'utf8' }, (err, stdout) => {
+      if (err) resolve(null);
+      else resolve(stdout);
+    });
+  });
 }
 
-async function collectWorkspaceTextFileChanges(before: Map<string, ShellReviewSnapshot>, applier?: HunkApplier): Promise<Array<{ uri: vscode.Uri; originalContent: string | null; modifiedContent: string | null }>> {
-  const files = await vscode.workspace.findFiles(
-    '**/*',
-    '{**/node_modules/**,**/.git/**,**/.burstcode/**,**/dist/**,**/out/**,**/*.vsix}'
-  );
-  const afterUris = new Set(files.map((u) => u.toString()));
-  const changes: Array<{ uri: vscode.Uri; originalContent: string | null; modifiedContent: string | null }> = [];
+/**
+ * Find the git repository root for the given directory.
+ * Returns null if not inside a git repo.
+ */
+async function findGitRoot(cwd: string): Promise<string | null> {
+  const root = await gitCmd(cwd, ['rev-parse', '--show-toplevel']);
+  return root?.trim() || null;
+}
 
-  for (const uri of files) {
+/**
+ * Create a baseline reference for detecting file changes made by a shell
+ * command. Uses `git stash create` to snapshot the current working-tree
+ * state (including uncommitted changes) WITHOUT modifying the working tree.
+ * Falls back to HEAD when there are no local changes to stash.
+ * Returns null if not in a git repo or git is unavailable.
+ */
+async function createGitBaseline(gitRoot: string): Promise<string | null> {
+  const stashSha = await gitCmd(gitRoot, ['stash', 'create']);
+  if (stashSha?.trim()) return stashSha.trim();
+  const head = await gitCmd(gitRoot, ['rev-parse', 'HEAD']);
+  return head?.trim() || null;
+}
+
+/**
+ * Detect file changes between the git baseline and the current working tree
+ * using `git diff --name-only` and `git ls-files --others`. Only files that
+ * git reports as changed are examined — no workspace-wide scanning, so no
+ * false positives from untouched files.
+ */
+async function collectGitChanges(gitRoot: string, baselineRef: string, applier?: HunkApplier): Promise<ShellFileChange[]> {
+  const changes: ShellFileChange[] = [];
+
+  // Modified/deleted tracked files
+  const diffOutput = await gitCmd(gitRoot, ['diff', '--name-only', baselineRef]);
+  // New untracked files (not gitignored)
+  const untrackedOutput = await gitCmd(gitRoot, ['ls-files', '--others', '--exclude-standard']);
+
+  const allPaths = new Set<string>();
+  if (diffOutput) for (const p of diffOutput.split('\n')) if (p.trim()) allPaths.add(p.trim());
+  if (untrackedOutput) for (const p of untrackedOutput.split('\n')) if (p.trim()) allPaths.add(p.trim());
+
+  for (const relPath of allPaths) {
+    const absPath = path.join(gitRoot, relPath);
+    const uri = vscode.Uri.file(absPath);
+    const key = uri.toString();
+    // Skip files already pending in the review UI — they have their own baseline.
+    if (applier?.hasPendingForPath(key)) continue;
+
+    // Original content from the git baseline (null if the file didn't exist).
+    const gitPath = relPath.replace(/\\/g, '/');
+    const originalContent = await gitCmd(gitRoot, ['show', `${baselineRef}:${gitPath}`]);
+
+    // Modified content from the working tree (null if the file was deleted).
+    let modifiedContent: string | null = null;
     try {
-      const key = uri.toString();
-      if (applier?.hasPendingForPath(key) && !before.has(key)) continue;
       const stat = await vscode.workspace.fs.stat(uri);
       if (stat.type !== vscode.FileType.File || stat.size > SHELL_REVIEW_MAX_FILE_BYTES) continue;
-      const previous = before.get(key);
-      // Fast path: unchanged metadata means the command did not touch this file.
-      // This avoids reading/re-queuing thousands of stable files after every build.
-      if (previous && previous.size === stat.size && previous.mtime === stat.mtime) continue;
       const bytes = await vscode.workspace.fs.readFile(uri);
-      if (bytes.includes(0)) continue;
-      const modifiedContent = Buffer.from(bytes).toString('utf8');
-      const originalContent = previous ? previous.content : null;
-      if (originalContent !== modifiedContent) changes.push({ uri, originalContent, modifiedContent });
+      if (bytes.includes(0)) continue; // skip binary
+      modifiedContent = Buffer.from(bytes).toString('utf8');
     } catch {
-      // Ignore files that disappeared while scanning; deletions are handled below
-      // for files that were present in the pre-command snapshot.
+      modifiedContent = null; // file was deleted
     }
-  }
 
-  for (const [key, snapshot] of before) {
-    if (!afterUris.has(key) && !applier?.hasPendingForPath(key)) {
-      changes.push({ uri: vscode.Uri.parse(key), originalContent: snapshot.content, modifiedContent: null });
+    if (originalContent !== modifiedContent) {
+      changes.push({ uri, originalContent, modifiedContent });
     }
   }
 
@@ -370,7 +392,11 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
         }
       }
 
-      const beforeFiles = deps.applier ? await snapshotWorkspaceTextFiles(deps.applier) : new Map<string, ShellReviewSnapshot>();
+      // Record a git baseline (stash-create or HEAD) so we can diff precisely
+      // after the command — no workspace-wide file scanning.
+      const shellCwd = cwd ?? workspaceRoot() ?? process.cwd();
+      const gitRoot = deps.applier ? await findGitRoot(shellCwd) : null;
+      const baselineRef = gitRoot ? await createGitBaseline(gitRoot) : null;
 
       // ---- Spawn ---------------------------------------------------------
       const plan = planSpawn(shellKind, command);
@@ -607,8 +633,8 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
           sections.push(`## stdout${stdoutLabel}\n${stdoutTrunc.text || '(empty)'}`);
           sections.push(`## stderr${stderrLabel}\n${stderrTrunc.text || '(empty)'}`);
 
-          const reviewChanges = deps.applier
-            ? await collectWorkspaceTextFileChanges(beforeFiles, deps.applier)
+          const reviewChanges = (deps.applier && gitRoot && baselineRef)
+            ? await collectGitChanges(gitRoot, baselineRef, deps.applier)
             : [];
           if (deps.applier && reviewChanges.length > 0) {
             try {
