@@ -231,16 +231,16 @@ export class HunkApplier implements vscode.Disposable {
       if (pendingCount > 0) {
         files++;
         hunks += pendingCount;
+        fileList.push({
+          uri: f.uri.toString(),
+          path: this.workspaceRelative(f.uri),
+          name: path.basename(f.uri.fsPath),
+          pendingHunks: pendingCount,
+          acceptedHunks: acceptedCount,
+          rejectedHunks: rejectedCount,
+          isNewFile: f.isNewFile
+        });
       }
-      fileList.push({
-        uri: f.uri.toString(),
-        path: this.workspaceRelative(f.uri),
-        name: path.basename(f.uri.fsPath),
-        pendingHunks: pendingCount,
-        acceptedHunks: acceptedCount,
-        rejectedHunks: rejectedCount,
-        isNewFile: f.isNewFile
-      });
     }
     // Stable order: files with pending hunks first, then by path.
     fileList.sort((a, b) => {
