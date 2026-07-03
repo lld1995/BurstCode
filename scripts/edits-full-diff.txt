@@ -1,0 +1,231 @@
+﻿diff --git a/src/agent/tools/edits.ts b/src/agent/tools/edits.ts
+index 8c89bfa..bb99b2d 100644
+--- a/src/agent/tools/edits.ts
++++ b/src/agent/tools/edits.ts
+@@ -333,27 +333,28 @@ function splitPreviewLines(text: string): string[] {
+   return normalized.split('\n');
+ }
+ 
+-async function buildDeletionPreviewEdits(files: ProposedEditFile[]): Promise<Array<Record<string, unknown>>> {
++async function buildLineRangePreviewEdits(files: ProposedEditFile[]): Promise<Array<Record<string, unknown>>> {
+   const preview: Array<Record<string, unknown>> = [];
+   for (const f of files) {
+-    const deletionHunks = f.hunks.filter(
+-      (h) => h.oldText === undefined && h.newText === '' && h.startLine <= h.endLine
++    const lineRangeHunks = f.hunks.filter(
++      (h) => h.oldText === undefined && Number.isFinite(h.startLine) && Number.isFinite(h.endLine)
+     );
+-    if (deletionHunks.length === 0) continue;
++    if (lineRangeHunks.length === 0) continue;
+     try {
+       const uri = resolveToolPath(f.path);
+       const bytes = await vscode.workspace.fs.readFile(uri);
+       const text = Buffer.from(bytes).toString('utf8');
+       const lines = splitPreviewLines(text);
+-      for (const h of deletionHunks) {
++      for (const h of lineRangeHunks) {
++        const isInsertion = h.startLine === h.endLine + 1;
+         const startIdx = Math.max(0, h.startLine - 1);
+-        const endIdx = Math.max(startIdx, h.endLine);
++        const endIdx = isInsertion ? startIdx : Math.max(startIdx, h.endLine);
+         preview.push({
+           path: f.path,
+           startLine: h.startLine,
+           endLine: h.endLine,
+-          oldText: lines.slice(startIdx, endIdx).join('\n'),
+-          newText: ''
++          oldText: isInsertion ? '' : lines.slice(startIdx, endIdx).join('\n'),
++          newText: h.newText
+         });
+       }
+     } catch {
+@@ -427,32 +428,37 @@ export function buildEditTools(
+         name: 'propose_edit',
+         description:
+           "Apply edits to one or more files IMMEDIATELY — they land on disk as soon as this tool returns and the user can compile / run with them right away. The changes are ALSO staged for user review; Accept simply marks them as finalized, while Reject rolls the affected hunks back to the original content. Use this for modifications to the user's existing source files. For agent-generated scripts or temp files you'll execute immediately, use write_file instead. If a whole-file / large-fragment edit fails, is truncated, cannot parse, or lands nothing, DO NOT retry the same giant payload — re-read the current file and split the work into smaller ordered propose_edit calls, one hunk/function/section at a time, so each piece can land independently.\n\n" +
+-          "FAST DELETE-LINES MODE: when the intended edit is ONLY deleting whole line ranges, set operation='delete_lines' and pass either {path,startLine,endLine} for one range or {ranges:[{path,startLine,endLine}, ...]} for batches. Do NOT pass oldText/newText in this mode; propose_edit internally emits line-range deletion hunks with newText:'' and no oldText, avoiding the empty-oldText trap.\n\n" +
++          "FAST LINE-RANGE MODES: when the intended edit is a whole-line range and re-emitting oldText would be too large, set operation='delete_lines' or operation='replace_lines'. For delete_lines, pass either {path,startLine,endLine} or {ranges:[{path,startLine,endLine}, ...]} and do NOT pass oldText/newText. For replace_lines, pass either {path,startLine,endLine,newText} or {ranges:[{path,startLine,endLine,newText}, ...]}. When the range came from a recent read_file/collect_context result, also pass its readVersion as expectedReadVersion; then propose_edit extracts the old lines from the server-side snapshot and re-anchors the range if another session shifted the file. Final review metadata is hydrated from disk so the rendered diff still shows the removed lines. Without expectedReadVersion, line-range modes are exact-coordinate fallback only and are not drift-tolerant.\n\n" +
+           "RECOMMENDED FORM (anchor-based, robust to line drift): supply 'oldText' = the EXACT contiguous lines you want to replace (whitespace-exact, full lines). 'newText' is what they become. The applier locates oldText in the file's current view and rewrites the line range for you, so stale line numbers no longer corrupt edits. If oldText appears multiple times, set 'startLine' to the 1-indexed line where the intended match starts as a tie-breaker, OR add more context lines to oldText to make it unique.\n\n" +
+           "FALLBACK FORM (line-range, used when oldText is omitted): supply 1-indexed inclusive [startLine, endLine] matching the on-disk content you see via read_file (propose_edit writes eagerly, so read_file already shows the live post-edit state; the `pending hunks` footnote is just metadata — not a separate layer). To INSERT without replacing in this form, set startLine = endLine + 1 and end newText with a newline.\n\n" +
+           "CREATING A NEW FILE: set path to the new file path (parent dirs auto-created), startLine=1, endLine=0, omit oldText, and put the full file contents in newText. Do NOT stuff new code into an unrelated existing file just because the target doesn't exist yet — propose_edit handles file creation natively.\n\n" +
+-          "You may call propose_edit multiple times within a turn (and across turns) to refine the queued change set. Later hunks that fully contain earlier pending hunks replace them (last-write-wins); partially-overlapping hunks are REJECTED with a clear error so you can retarget. After any fragment has landed, treat the live file as the baseline: do not append or regenerate a broad replacement for the same area. If you need to fix overlap/duplication, re-read the exact current range and use oldText to replace the concrete bad block or delete_lines to remove the duplicate block. The user accepts/rejects via a chat banner or per-hunk CodeLenses; Accept is a status-only flip (the on-disk bytes don't change), while Reject rewinds to the pre-edit snapshot. When you receive a [user-decision] notice, re-read the affected file — a Reject may have rolled content back.",
++          "You may call propose_edit multiple times within a turn (and across turns) to refine the queued change set. Later hunks that fully contain earlier pending hunks replace them (last-write-wins); partially-overlapping hunks are REJECTED with a clear error so you can retarget. After any fragment has landed, treat the live file as the baseline: do not append or regenerate a broad replacement for the same area. If you need to fix overlap/duplication, re-read the exact current range and use oldText to replace the concrete bad block, replace_lines for a just-read large block, or delete_lines to remove the duplicate block. The user accepts/rejects via a chat banner or per-hunk CodeLenses; Accept is a status-only flip (the on-disk bytes don't change), while Reject rewinds to the pre-edit snapshot. When you receive a [user-decision] notice, re-read the affected file — a Reject may have rolled content back.",
+         parameters: {
+           type: 'object',
+           properties: {
+             summary: { type: 'string', description: 'One-paragraph human summary.' },
+             operation: {
+               type: 'string',
+-              enum: ['edit', 'delete_lines'],
+-              description: "Optional mode selector. Use 'delete_lines' for pure line-range deletion with path/startLine/endLine or ranges[]. Omit or use 'edit' for normal edits[]."
++              enum: ['edit', 'delete_lines', 'replace_lines'],
++              description: "Optional mode selector. Use 'delete_lines' for pure line-range deletion, 'replace_lines' for whole-line replacement by line number, or omit/use 'edit' for normal edits[]."
+             },
+-            path: { type: 'string', description: "Single-file shortcut for operation='delete_lines', or fallback path for edits[]." },
+-            startLine: { type: 'number', description: "Single-range shortcut for operation='delete_lines'. 1-indexed inclusive first line to delete." },
+-            endLine: { type: 'number', description: "Single-range shortcut for operation='delete_lines'. 1-indexed inclusive last line to delete." },
++            path: { type: 'string', description: "Single-file shortcut for operation='delete_lines'/'replace_lines', or fallback path for edits[]." },
++            startLine: { type: 'number', description: "Single-range shortcut for operation='delete_lines'/'replace_lines'. 1-indexed inclusive first line." },
++            endLine: { type: 'number', description: "Single-range shortcut for operation='delete_lines'/'replace_lines'. 1-indexed inclusive last line." },
+             ranges: {
+               type: 'array',
+-              description: "Batch form for operation='delete_lines'. Each range deletes whole lines and must include path/startLine/endLine.",
++              description: "Batch form for operation='delete_lines' or operation='replace_lines'. Each range must include path/startLine/endLine; replace_lines ranges must also include newText.",
+               items: {
+                 type: 'object',
+                 properties: {
+                   path: { type: 'string' },
+                   startLine: { type: 'number' },
+-                  endLine: { type: 'number' }
++                  endLine: { type: 'number' },
++                  newText: { type: 'string', description: "Replacement text for operation='replace_lines'. Omit for delete_lines." },
++                  expectedReadVersion: {
++                    type: 'string',
++                    description: 'Optional read snapshot token returned by read_file/collect_context; lets line-range edits detect/re-anchor drift.'
++                  }
+                 },
+                 required: ['path', 'startLine', 'endLine']
+               }
+@@ -468,6 +474,11 @@ export function buildEditTools(
+                     description:
+                       "RECOMMENDED. Exact contiguous lines to replace, whitespace-exact and aligned to whole lines. When set, startLine/endLine become hints (only used to disambiguate non-unique matches). Omit only when creating a new file or when you genuinely want pure line-range mode."
+                   },
++                  expectedReadVersion: {
++                    type: 'string',
++                    description:
++                      "Optional read snapshot token returned in a prior read_file/collect_context result. For replace_lines/delete_lines it lets the applier detect line drift and re-anchor the range without echoing oldText."
++                  },
+                   startLine: {
+                     type: 'number',
+                     description:
+@@ -580,22 +591,27 @@ export function buildEditTools(
+       } else {
+         rawEdits = [];
+       }
+-      // Delete-lines convenience mode: keep a single public write tool, but let
+-      // the caller explicitly choose a safe line-deletion shape that never
+-      // carries oldText. This avoids adding another tool while preventing the
+-      // common oldText:"" footgun.
++      // Explicit line-range convenience modes: keep a single public write tool,
++      // but let the caller choose safe range-only shapes that never carry
++      // oldText. delete_lines omits newText; replace_lines requires it. Both
++      // are useful for large just-read ranges where repeating oldText would be
++      // slow or too large, and the final UI preview is hydrated from disk below.
+       const operation = String(
+         argsRecord.operation ?? argsRecord.mode ?? argsRecord.action ?? ''
+       ).toLowerCase().replace(/[\s-]+/g, '_');
+       const rawRangesCandidate =
+         (argsRecord as Record<string, unknown>).ranges ??
+         (argsRecord as Record<string, unknown>).deletions ??
+-        (argsRecord as Record<string, unknown>).deleteRanges;
++        (argsRecord as Record<string, unknown>).deleteRanges ??
++        (argsRecord as Record<string, unknown>).replacements ??
++        (argsRecord as Record<string, unknown>).replaceRanges;
+       const wantsDeleteLines =
+-        ['delete_lines', 'delete', 'delete_range', 'delete_ranges', 'remove_lines'].includes(operation) ||
+-        Array.isArray(rawRangesCandidate);
++        ['delete_lines', 'delete', 'delete_range', 'delete_ranges', 'remove_lines'].includes(operation);
++      const wantsReplaceLines =
++        ['replace_lines', 'replace_range', 'replace_ranges', 'line_replace', 'line_range_replace'].includes(operation);
+       let synthesizedDeleteLines = false;
+-      if (rawEdits.length === 0 && wantsDeleteLines) {
++      let synthesizedReplaceLines = false;
++      if (rawEdits.length === 0 && (wantsDeleteLines || wantsReplaceLines)) {
+         const rawRanges = Array.isArray(rawRangesCandidate) && rawRangesCandidate.length > 0
+           ? rawRangesCandidate
+           : [argsRecord];
+@@ -613,14 +629,20 @@ export function buildEditTools(
+             'targetFile',
+             'uri'
+           ]) ?? topLevelPath;
++          const replacement = wantsReplaceLines
++            ? pickFirstString(r, ['newText', 'new_text', 'replacement', 'code', 'content', 'text'])
++            : undefined;
++          const expectedReadVersion = pickFirstString(r, ['expectedReadVersion', 'readVersion', 'read_version', 'snapshot', 'snapshotId', 'snapshot_id']);
+           return {
+             ...(rangePath ? { [rangePath.key]: rangePath.value } : {}),
+             startLine: r.startLine ?? r.start ?? r.fromLine ?? r.from,
+             endLine: r.endLine ?? r.end ?? r.toLine ?? r.to,
+-            newText: ''
++            newText: wantsReplaceLines ? (replacement?.value ?? '') : '',
++            ...(expectedReadVersion ? { [expectedReadVersion.key]: expectedReadVersion.value } : {})
+           };
+         });
+-        synthesizedDeleteLines = true;
++        synthesizedDeleteLines = wantsDeleteLines;
++        synthesizedReplaceLines = wantsReplaceLines;
+       }
+       // Flattened-single-edit fallback: the model FREQUENTLY emits a single
+       // edit's fields at the TOP LEVEL with no wrapping array at all —
+@@ -639,7 +661,9 @@ export function buildEditTools(
+             ...(topNewText ? { [topNewText.key]: topNewText.value } : {}),
+             ...(topOldText ? { [topOldText.key]: topOldText.value } : {}),
+             ...(argsRecord.startLine !== undefined ? { startLine: argsRecord.startLine } : {}),
+-            ...(argsRecord.endLine !== undefined ? { endLine: argsRecord.endLine } : {})
++            ...(argsRecord.endLine !== undefined ? { endLine: argsRecord.endLine } : {}),
++            ...(argsRecord.expectedReadVersion !== undefined ? { expectedReadVersion: argsRecord.expectedReadVersion } : {}),
++            ...(argsRecord.readVersion !== undefined ? { readVersion: argsRecord.readVersion } : {})
+           }];
+           synthesizedFromTopLevel = true;
+         }
+@@ -695,11 +719,13 @@ export function buildEditTools(
+           );
+           continue;
+         }
++        const expectedReadVersionPicked = pickFirstString(e, ['expectedReadVersion', 'readVersion', 'read_version', 'snapshot', 'snapshotId', 'snapshot_id']);
+         const entry = grouped.get(path) ?? { path, hunks: [] };
+         entry.hunks.push({
+           startLine: Number.isFinite(startLineRaw) ? startLineRaw : 0,
+           endLine: Number.isFinite(endLineRaw) ? endLineRaw : 0,
+           newText,
++          ...(expectedReadVersionPicked ? { expectedReadVersion: expectedReadVersionPicked.value } : {}),
+           ...(hasOldText ? { oldText: oldTextPicked!.value } : {})
+         });
+         grouped.set(path, entry);
+@@ -720,7 +746,7 @@ export function buildEditTools(
+             : `all ${editsField.length} edit(s) were skipped: ${skipReasons.join('; ')}`;
+         return { content: `no edits provided: ${diagnosis}. Re-emit propose_edit with a valid 'edits' array.`, isError: true };
+       }
+-      const deletionPreviewEdits = await buildDeletionPreviewEdits(files);
++      const lineRangePreviewEdits = await buildLineRangePreviewEdits(files);
+       try {
+         await applier.proposeEdits(files, summary, sessionId, turnIndex);
+       } catch (err) {
+@@ -738,13 +764,13 @@ export function buildEditTools(
+             `fragment(s) below failed and were skipped (the rest of the same call still landed):\n${message}\n` +
+             `RECOVERY REQUIRED — before making another edit, inspect the current file state: read the whole affected file with read_file when it is reasonably sized; if it is too large or appears corrupted/garbled, restore it from git/checkpoint first. Then write a short revised plan and switch strategy instead of repeating the same failing edit shape. ` +
+             `If the failure looks like missing/wrong braces, brackets, parentheses, tags, or quotes, treat it as a syntax-structure repair: read the smallest block that includes the broken delimiter plus neighboring function/class boundaries, patch only the unmatched/extra delimiter or tiny enclosing block, and run the relevant compiler/parser check before any broader rewrite. ` +
+-            `Re-issue ONLY the failed fragment(s) above: re-read the relevant current range because landed fragments may have shifted line numbers, then submit smaller hunks with precise oldText / non-overlapping ranges, use delete_lines for exact duplicate blocks, or use a temporary scripted replacement for controlled broad changes. ` +
++            `Re-issue ONLY the failed fragment(s) above: re-read the relevant current range because landed fragments may have shifted line numbers, then submit smaller hunks with precise oldText / non-overlapping ranges, use replace_lines for a just-read large block, use delete_lines for exact duplicate blocks, or use a temporary scripted replacement for controlled broad changes. ` +
+             `Do NOT regenerate or append a broad replacement for code that already landed; that creates duplicate code and file bloat. ` +
+-            `Prefer the oldText form so line drift no longer matters.\n` +
++            `Prefer the oldText form unless you intentionally chose replace_lines/delete_lines for an exact just-read range.\n` +
+             `Do NOT re-submit any fragment or file that was not named above — those are already staged and need no further action from you.` +
+             diagnosticsNote,
+           isError: true,
+-          meta: deletionPreviewEdits.length ? { previewEdits: deletionPreviewEdits } : undefined
++          meta: lineRangePreviewEdits.length ? { previewEdits: lineRangePreviewEdits } : undefined
+         };
+       }
+       const diagnosticsNote = await buildPostEditDiagnosticsNote(files);
+@@ -762,6 +788,11 @@ export function buildEditTools(
+           "operation='delete_lines' was converted into normal line-range deletion hunks with newText:'' and no oldText"
+         );
+       }
++      if (synthesizedReplaceLines) {
++        aliasNotes.push(
++          "operation='replace_lines' was converted into normal line-range replacement hunks with no oldText"
++        );
++      }
+       if (aliasedPathKey) {
+         aliasNotes.push(`per-edit field 'path' was sent as '${aliasedPathKey}'`);
+       }
+@@ -777,7 +808,7 @@ export function buildEditTools(
+         meta: {
+           files: files.map((f) => f.path),
+           summary,
+-          ...(deletionPreviewEdits.length ? { previewEdits: deletionPreviewEdits } : {})
++          ...(lineRangePreviewEdits.length ? { previewEdits: lineRangePreviewEdits } : {})
+         }
+       };
+     }

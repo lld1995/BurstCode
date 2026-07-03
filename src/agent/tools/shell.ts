@@ -182,19 +182,30 @@ function truncate(text: string, maxBytes: number): { text: string; truncated: bo
 
 const SHELL_REVIEW_MAX_FILE_BYTES = 2 * 1024 * 1024;
 
-async function snapshotWorkspaceTextFiles(): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
+interface ShellReviewSnapshot {
+  content: string;
+  size: number;
+  mtime: number;
+}
+
+async function snapshotWorkspaceTextFiles(applier?: HunkApplier): Promise<Map<string, ShellReviewSnapshot>> {
+  const out = new Map<string, ShellReviewSnapshot>();
   const files = await vscode.workspace.findFiles(
     '**/*',
-    '{**/node_modules/**,**/.git/**,**/.burstcode/checkpoints/**,**/dist/**,**/out/**,**/*.vsix}'
+    '{**/node_modules/**,**/.git/**,**/.burstcode/**,**/dist/**,**/out/**,**/*.vsix}'
   );
   await Promise.all(files.map(async (uri) => {
     try {
+      const key = uri.toString();
+      // Do not let files that were already in the pending review set before the
+      // command get re-queued as "shell changes". They already have their own
+      // before/after baseline and queuing them again creates false positives.
+      if (applier?.hasPendingForPath(key)) return;
       const stat = await vscode.workspace.fs.stat(uri);
       if (stat.type !== vscode.FileType.File || stat.size > SHELL_REVIEW_MAX_FILE_BYTES) return;
       const bytes = await vscode.workspace.fs.readFile(uri);
       if (bytes.includes(0)) return;
-      out.set(uri.toString(), Buffer.from(bytes).toString('utf8'));
+      out.set(key, { content: Buffer.from(bytes).toString('utf8'), size: stat.size, mtime: stat.mtime });
     } catch {
       // Best effort only; shell execution must not fail because snapshotting did.
     }
@@ -202,23 +213,28 @@ async function snapshotWorkspaceTextFiles(): Promise<Map<string, string>> {
   return out;
 }
 
-async function collectWorkspaceTextFileChanges(before: Map<string, string>): Promise<Array<{ uri: vscode.Uri; originalContent: string | null; modifiedContent: string | null }>> {
+async function collectWorkspaceTextFileChanges(before: Map<string, ShellReviewSnapshot>, applier?: HunkApplier): Promise<Array<{ uri: vscode.Uri; originalContent: string | null; modifiedContent: string | null }>> {
   const files = await vscode.workspace.findFiles(
     '**/*',
-    '{**/node_modules/**,**/.git/**,**/.burstcode/checkpoints/**,**/dist/**,**/out/**,**/*.vsix}'
+    '{**/node_modules/**,**/.git/**,**/.burstcode/**,**/dist/**,**/out/**,**/*.vsix}'
   );
   const afterUris = new Set(files.map((u) => u.toString()));
   const changes: Array<{ uri: vscode.Uri; originalContent: string | null; modifiedContent: string | null }> = [];
 
   for (const uri of files) {
     try {
+      const key = uri.toString();
+      if (applier?.hasPendingForPath(key) && !before.has(key)) continue;
       const stat = await vscode.workspace.fs.stat(uri);
       if (stat.type !== vscode.FileType.File || stat.size > SHELL_REVIEW_MAX_FILE_BYTES) continue;
+      const previous = before.get(key);
+      // Fast path: unchanged metadata means the command did not touch this file.
+      // This avoids reading/re-queuing thousands of stable files after every build.
+      if (previous && previous.size === stat.size && previous.mtime === stat.mtime) continue;
       const bytes = await vscode.workspace.fs.readFile(uri);
       if (bytes.includes(0)) continue;
       const modifiedContent = Buffer.from(bytes).toString('utf8');
-      const key = uri.toString();
-      const originalContent = before.has(key) ? before.get(key)! : null;
+      const originalContent = previous ? previous.content : null;
       if (originalContent !== modifiedContent) changes.push({ uri, originalContent, modifiedContent });
     } catch {
       // Ignore files that disappeared while scanning; deletions are handled below
@@ -226,9 +242,9 @@ async function collectWorkspaceTextFileChanges(before: Map<string, string>): Pro
     }
   }
 
-  for (const [key, originalContent] of before) {
-    if (!afterUris.has(key)) {
-      changes.push({ uri: vscode.Uri.parse(key), originalContent, modifiedContent: null });
+  for (const [key, snapshot] of before) {
+    if (!afterUris.has(key) && !applier?.hasPendingForPath(key)) {
+      changes.push({ uri: vscode.Uri.parse(key), originalContent: snapshot.content, modifiedContent: null });
     }
   }
 
@@ -354,7 +370,7 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
         }
       }
 
-      const beforeFiles = deps.applier ? await snapshotWorkspaceTextFiles() : new Map<string, string>();
+      const beforeFiles = deps.applier ? await snapshotWorkspaceTextFiles(deps.applier) : new Map<string, ShellReviewSnapshot>();
 
       // ---- Spawn ---------------------------------------------------------
       const plan = planSpawn(shellKind, command);
@@ -592,7 +608,7 @@ export function buildShellTools(deps: ShellToolDeps): Tool[] {
           sections.push(`## stderr${stderrLabel}\n${stderrTrunc.text || '(empty)'}`);
 
           const reviewChanges = deps.applier
-            ? await collectWorkspaceTextFileChanges(beforeFiles)
+            ? await collectWorkspaceTextFileChanges(beforeFiles, deps.applier)
             : [];
           if (deps.applier && reviewChanges.length > 0) {
             try {

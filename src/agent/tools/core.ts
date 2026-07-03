@@ -549,7 +549,7 @@ export function buildWriteFileTool(applier?: HunkApplier, sessionId?: string, tu
         // Bind this write to the current session and show it in the normal
         // pending review UI so Reject can restore the captured pre-write state.
         try {
-          if (applier) {
+          if (applier && originalContent !== modifiedContent) {
             await applier.queueExternalFileChange(
               uri,
               originalContent,

@@ -1,0 +1,146 @@
+﻿diff --git a/src/edits/HunkApplier.ts b/src/edits/HunkApplier.ts
+index 145ab91..8e03aed 100644
+--- a/src/edits/HunkApplier.ts
++++ b/src/edits/HunkApplier.ts
+@@ -8,6 +8,15 @@ export interface ProposedHunk {
+   startLine: number; // 1-indexed inclusive
+   endLine: number;   // 1-indexed inclusive
+   newText: string;
++  /**
++   * Optional content-version token returned by read_file / collect_context.
++   * For line-range hunks that intentionally omit oldText (replace_lines /
++   * delete_lines), HunkApplier uses this token to look up the server-side read
++   * snapshot, extracts the originally-read lines, and re-resolves them against
++   * the file's current view. This lets line-range edits survive line drift from
++   * other sessions without making the LLM echo a huge oldText block.
++   */
++  expectedReadVersion?: string;
+   /**
+    * Optional string anchor. When set, HunkApplier resolves this exact
+    * sequence of lines against the file's current view (modifiedContent if
+@@ -172,6 +181,14 @@ export class HunkApplier implements vscode.Disposable {
+    * N and later, not files from earlier successful prompts in the same chat.
+    */
+   private readonly sessionTouchedByTurn = new Map<string, Map<number, Set<string>>>();
++  /**
++   * Server-side snapshots captured by read_file / collect_context. These are
++   * intentionally not sent back through the LLM except as a short token; when a
++   * later replace_lines/delete_lines call includes the token, we can recover the
++   * originally-read text and re-anchor the line range if another session shifted
++   * the file in the meantime.
++   */
++  private readonly readSnapshots = new Map<string, { uri: string; content: string; createdAt: number }>();
+   /**
+    * Sessions that have already had an automatic diff editor opened while they
+    * still have pending edits. This must be per-session (not one global boolean):
+@@ -289,6 +306,31 @@ export class HunkApplier implements vscode.Disposable {
+     turnSet.add(rel);
+   }
+ 
++  recordReadSnapshot(uri: vscode.Uri, content: string): string {
++    const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
++    this.readSnapshots.set(token, { uri: uri.toString(), content, createdAt: Date.now() });
++    // Keep the cache bounded; stale snapshots are only useful for immediate follow-up edits.
++    const maxAgeMs = 30 * 60 * 1000;
++    const maxEntries = 200;
++    const now = Date.now();
++    for (const [k, v] of this.readSnapshots) {
++      if (now - v.createdAt > maxAgeMs) this.readSnapshots.delete(k);
++    }
++    while (this.readSnapshots.size > maxEntries) {
++      const oldest = this.readSnapshots.keys().next().value;
++      if (!oldest) break;
++      this.readSnapshots.delete(oldest);
++    }
++    return token;
++  }
++
++  private getReadSnapshot(token: string | undefined, uri: vscode.Uri): string | undefined {
++    if (!token) return undefined;
++    const snapshot = this.readSnapshots.get(token);
++    if (!snapshot || snapshot.uri !== uri.toString()) return undefined;
++    return snapshot.content;
++  }
++
+   /**
+    * The workspace-relative POSIX paths the given session has written so far.
+    * Returns an empty array for sessions that haven't touched anything yet.
+@@ -566,30 +608,50 @@ export class HunkApplier implements vscode.Disposable {
+     // flow through the unchanged classification + translation block below.
+     const hunkErrors: string[] = [];
+ 
+-    // Stage 1 — resolve oldText anchors per hunk. For any hunk that supplies
+-    // `oldText`, locate that exact line sequence in the file's current view
+-    // (modifiedContent for pending files, else disk content) and rewrite
+-    // (startLine, endLine) to match. A resolution failure drops ONLY that
+-    // fragment instead of failing the whole file.
++    // Stage 1 — resolve content anchors per hunk. For oldText hunks, the model
++    // supplied the anchor explicitly. For replace_lines/delete_lines hunks that
++    // carry expectedReadVersion, recover the originally-read line range from the
++    // server-side snapshot and use it as an implicit anchor; this preserves the
++    // low-token line-range API while detecting/rebasing drift from other sessions.
+     let preloaded: { content: string; eol: string; isNewFile: boolean } | undefined;
+     let viewContent: string | undefined = existingEntry?.modifiedContent;
+-    const needsOldText = f.hunks.some((h) => h.oldText !== undefined);
+-    if (needsOldText && viewContent === undefined) {
++    const needsContentAnchor = f.hunks.some((h) => h.oldText !== undefined || h.expectedReadVersion !== undefined);
++    if (needsContentAnchor && viewContent === undefined) {
+       preloaded = await this.loadOriginal(uri);
+       viewContent = preloaded.content;
+     }
+     const resolvedHunks: ProposedHunk[] = [];
+     f.hunks.forEach((h, i) => {
+-      if (h.oldText === undefined) {
+-        resolvedHunks.push(h);
++      let anchored = h;
++      if (h.oldText === undefined && h.expectedReadVersion !== undefined) {
++        const snapshot = this.getReadSnapshot(h.expectedReadVersion, uri);
++        if (snapshot === undefined) {
++          hunkErrors.push(
++            `hunk[${i}] (${f.path}): expectedReadVersion is missing/stale for line-range edit — re-read the target range or use oldText`
++          );
++          return;
++        }
++        const oldText = extractSnapshotLineRange(snapshot, h.startLine, h.endLine);
++        if (oldText === undefined) {
++          hunkErrors.push(
++            `hunk[${i}] (${f.path}): expectedReadVersion does not cover lines ${h.startLine}-${h.endLine} — re-read the exact target range`
++          );
++          return;
++        }
++        anchored = { ...h, oldText };
++      }
++      if (anchored.oldText === undefined) {
++        resolvedHunks.push(anchored);
+         return;
+       }
+       if (viewContent === undefined) {
+-        hunkErrors.push(`hunk[${i}] (${f.path}): oldText anchor requires a readable file view`);
++        hunkErrors.push(`hunk[${i}] (${f.path}): content anchor requires a readable file view`);
+         return;
+       }
+       try {
+-        resolvedHunks.push(resolveOldTextHunk(h, viewContent, f.path));
++        const resolved = resolveOldTextHunk(anchored, viewContent, f.path);
++        const { expectedReadVersion: _expectedReadVersion, oldText: _oldText, ...lineOnly } = resolved;
++        resolvedHunks.push(lineOnly);
+       } catch (err) {
+         hunkErrors.push(err instanceof Error ? err.message : String(err));
+       }
+@@ -1622,6 +1684,16 @@ function applyHunkToText(text: string, h: ProposedHunk, eol: string): string {
+   return result.join(eol);
+ }
+ 
++function extractSnapshotLineRange(snapshotContent: string, startLine: number, endLine: number): string | undefined {
++  if (!Number.isFinite(startLine) || !Number.isFinite(endLine) || startLine < 1) return undefined;
++  const isInsertion = startLine === endLine + 1;
++  if (isInsertion) return '';
++  if (startLine > endLine) return undefined;
++  const lines = splitLogicalLines(snapshotContent);
++  if (endLine > lines.length) return undefined;
++  return lines.slice(startLine - 1, endLine).join('\n');
++}
++
+ /**
+  * Compute a `vscode.Range` that covers the entire document, from (0, 0)
+  * to the end of the last line. Used by `syncDiskToModified` so a single
