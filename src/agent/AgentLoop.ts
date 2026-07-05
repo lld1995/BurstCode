@@ -959,7 +959,8 @@ export class AgentLoop {
         const compacted = compressMessages(messages, {
           ...defaultCompressorConfig,
           contextWindow: ctxMax,
-          inputBudgetRatio: AUTO_COMPRESS_TARGET_RATIO
+          inputBudgetRatio: AUTO_COMPRESS_TARGET_RATIO,
+          dropMessagesOnOverflow: false
         });
         // Replace contents in place so callers holding the same array
         // reference (the chat session store) see the new transcript.
@@ -1370,7 +1371,8 @@ export class AgentLoop {
             const compacted = compressMessages(messages, {
               ...defaultCompressorConfig,
               contextWindow: ctxMaxForCompress,
-              inputBudgetRatio: targetRatio
+              inputBudgetRatio: targetRatio,
+              dropMessagesOnOverflow: false
             });
             messages.splice(0, messages.length, ...compacted);
             const after = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);

@@ -11,7 +11,13 @@ import { Tool, ToolResult } from './types';
  * inputBudgetRatio=0.3: frees ~70% of the token budget post-compression.
  */
 function topicSwitchConfig(contextWindow: number) {
-  return { ...defaultCompressorConfig, contextWindow, keepLastN: 1, inputBudgetRatio: 0.3 };
+  return {
+    ...defaultCompressorConfig,
+    contextWindow,
+    keepLastN: 1,
+    inputBudgetRatio: 0.3,
+    dropMessagesOnOverflow: false
+  };
 }
 
 /**

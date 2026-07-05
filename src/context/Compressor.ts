@@ -8,6 +8,12 @@ export interface CompressorConfig {
   inputBudgetRatio: number;
   /** always preserve the last N message exchanges in full */
   keepLastN: number;
+  /**
+   * When true (default), budget overflow may remove old assistant/tool messages.
+   * Set false for the persistent session transcript so the chat UI keeps its
+   * historical records and only their bulky contents are summarized.
+   */
+  dropMessagesOnOverflow?: boolean;
 }
 
 export const defaultCompressorConfig: CompressorConfig = {
@@ -183,10 +189,25 @@ export function compressMessages(messages: ChatMessage[], cfg: CompressorConfig)
   // Drop oldest non-system, non-user, non-protected messages until under budget.
   // User messages must never be dropped — they are the ground truth of the
   // conversation and their absence causes history to render without the prompts.
+  // Persistent-session compression also disables dropping for assistant/tool
+  // messages so the visible chat record keeps its bubbles/cards; those bulky
+  // contents are squeezed to short summaries instead.
   const protected_ = result.length - cfg.keepLastN * 2;
+  const canDropMessages = cfg.dropMessagesOnOverflow !== false;
   while (current > budget) {
     const idx = result.findIndex((m, i) => i > systemIdx && i < protected_ && m.role !== 'user');
     if (idx < 0) break;
+    const msg = result[idx];
+    const beforeContent = stringifyContent(msg.content);
+
+    if (!canDropMessages) {
+      const compact = summarizeText(beforeContent, 160);
+      if (compact === beforeContent) break;
+      result[idx] = { ...msg, content: compact } as ChatMessage;
+      current += estimateTokens(compact) - estimateTokens(beforeContent);
+      continue;
+    }
+
     const removed = result.splice(idx, 1)[0];
     current -= estimateTokens(stringifyContent(removed.content));
   }
