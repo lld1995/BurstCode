@@ -439,6 +439,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   ) {
     this.sessions = new SessionStore(context.workspaceState);
     this.lessons = new LessonStore(context.workspaceState);
+    // VS Code can be killed/reloaded while a run is persisted as "running".
+    // In-memory CancellationTokenSources do not survive that restart, so those
+    // sessions are no longer cancellable; mark them stopped before the webview
+    // renders, otherwise the UI shows a Stop button that has nothing to cancel.
+    void this.recoverAbandonedRunningSessions();
     // Restore the open-tab working set. Filter out any ids whose session has
     // since been deleted so we never render orphan tabs.
     const persisted = context.workspaceState.get<string[]>(KEY_OPEN_TABS) ?? [];
@@ -508,7 +513,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Resolve the effective status (live runs override the persisted field). */
   private effectiveStatus(sessionId: string, persisted?: SessionStatus): SessionStatus | undefined {
     if (this.runs.has(sessionId)) return 'running';
+    // A persisted "running" status is only meaningful while an in-memory run
+    // context exists. After an abnormal VS Code exit/reload there is no
+    // CancellationTokenSource to cancel, so treat it as stopped immediately.
+    if (persisted === 'running') return 'stopped';
     return persisted;
+  }
+
+  private recoverAbandonedRunningSessions(): void {
+    const stale = this.sessions.list().filter((s) => s.status === 'running');
+    if (stale.length === 0) return;
+    void (async () => {
+      for (const meta of stale) {
+        const session = this.sessions.get(meta.id);
+        if (!session || session.status !== 'running') continue;
+        session.status = 'stopped';
+        session.updatedAt = Date.now();
+        await this.sessions.save(session);
+      }
+      this.broadcastSessions();
+    })().catch((err) => {
+      this.logger.warn('Failed to recover abandoned running sessions', String(err));
+    });
   }
 
   /** Mark a session as "open" in the foreground tab strip. Idempotent. */
@@ -901,8 +927,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Cancel the run for a specific session (e.g. from history's stop button). */
   private cancelSession(id: string): void {
     const ctx = this.runs.get(id);
-    if (!ctx) return;
-    ctx.cts.cancel();
+    if (ctx) {
+      ctx.cts.cancel();
+      return;
+    }
+    // If VS Code exited abnormally, workspaceState may still say the session is
+    // running even though the process-local run map is empty. In that case the
+    // Stop button used to do nothing forever; convert the stale state to stopped.
+    const session = this.sessions.get(id);
+    if (session?.status === 'running') {
+      session.status = 'stopped';
+      void this.sessions.save(session).then(() => {
+        if (this.currentSession?.id === id) {
+          this.post({ type: 'done', payload: { reason: 'cancelled' } });
+        }
+        this.broadcastSessions();
+      }).catch((err) => {
+        this.logger.warn('Failed to stop abandoned session', String(err));
+      });
+    }
   }
 
   private ensureSessionForUserText(userText: string): Session {

@@ -1172,20 +1172,17 @@ export class AgentLoop {
             const interruptedToolCalls = Array.from(toolCallAccumulator.entries())
               .sort((a, b) => a[0] - b[0])
               .map(([index, v]) => ({ index, name: v.name, arguments: v.arguments }));
-            const salvage = await salvageInterruptedWrites(
-              toolCallAccumulator,
-              runToolMap,
-              this.logger,
-              cancellation,
-              salvagedInterruptedEdits,
-              assistantText
-            );
+            // Do not run the interrupted-write salvage path for an explicit user
+            // Stop. Salvage can execute filesystem writes after the user has asked
+            // to abort, and for large/truncated tool arguments it may block long
+            // enough that the stop button appears ineffective. Keep the partial
+            // draft/progress note in history so the next turn can resume safely.
             const progressNote = buildInterruptedProgressNote(
               'cancelled',
               assistantText,
               reasoningText,
               interruptedToolCalls,
-              salvage
+              combineSalvage()
             );
             const interruptedDraft = buildInterruptedDraftAssistantMessage(
               'cancelled',
@@ -1269,20 +1266,16 @@ export class AgentLoop {
             const interruptedToolCalls = Array.from(toolCallAccumulator.entries())
               .sort((a, b) => a[0] - b[0])
               .map(([index, v]) => ({ index, name: v.name, arguments: v.arguments }));
-            const salvage = await salvageInterruptedWrites(
-              toolCallAccumulator,
-              runToolMap,
-              this.logger,
-              cancellation,
-              salvagedInterruptedEdits,
-              assistantText
-            );
+            // Explicit Stop should be fast and side-effect free. Do not attempt
+            // interrupted-write salvage here; it can apply partially streamed edits
+            // after cancellation and keep the run alive while the UI still shows
+            // a running request.
             const progressNote = buildInterruptedProgressNote(
               'cancelled',
               assistantText,
               reasoningText,
               interruptedToolCalls,
-              salvage
+              combineSalvage()
             );
             const interruptedDraft = buildInterruptedDraftAssistantMessage(
               'cancelled',
@@ -1449,7 +1442,7 @@ export class AgentLoop {
           // wire — otherwise each auto-resume leaves the previous request
           // hanging server-side and the user observes many concurrent
           // identical requests instead of a single in-flight one.
-          if (!streamConsumed) {
+          if (!streamConsumed && !cancellation.isCancellationRequested) {
             try {
               await streamIter.return?.(undefined);
             } catch {
