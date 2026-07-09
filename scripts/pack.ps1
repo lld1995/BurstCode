@@ -53,7 +53,7 @@ function Invoke-VscePackage([string]$WorkingDirectory, [string]$PackagePath, [st
   Write-Host "[pack] vsce package: $Label" -ForegroundColor Yellow
   Push-Location $WorkingDirectory
   try {
-    & $script:VsceCmd package --no-dependencies --allow-missing-repository --skip-license --out $PackagePath | Out-Host
+    & $script:VsceCmd package --no-dependencies --out $PackagePath | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "vsce package failed for $Label." }
   }
   finally {

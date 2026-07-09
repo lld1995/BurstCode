@@ -4,6 +4,15 @@
     "description":  "Local UI companion for BurstCode Remote SSH sound and taskbar attention alerts.",
     "version":  "0.1.132",
     "publisher":  "burstcode",
+    "repository":  {
+                       "type":  "git",
+                       "url":  "https://github.com/lld1995/BurstCode.git"
+                   },
+    "homepage":  "https://github.com/lld1995/BurstCode/tree/main/companion#readme",
+    "bugs":  {
+                 "url":  "https://github.com/lld1995/BurstCode/issues"
+             },
+    "license":  "MIT",
     "engines":  {
                     "vscode":  "^1.106.0"
                 },

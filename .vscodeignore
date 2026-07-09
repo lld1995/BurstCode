@@ -12,4 +12,7 @@ tsconfig.json
 scripts/**
 *.vsix
 .burstcode/**
+.burstcode-webview-script.js
+.burstcode-webview-script.*
+*.packbak
 out/**
