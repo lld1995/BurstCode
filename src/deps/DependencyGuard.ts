@@ -19,7 +19,7 @@ const PACKS: LanguagePack[] = [
     label: 'C# / .NET',
     languageIds: ['csharp'],
     extensions: ['cs'],
-    required: ['ms-dotnettools.csdevkit', 'ms-dotnettools.csharp']
+    required: ['ms-dotnettools.csdevkit']
   },
   {
     label: 'Python',
