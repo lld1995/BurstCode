@@ -237,7 +237,8 @@ function startRepeatingAlertSound(kind: AlertSoundKind, enabledKey: string, inte
   const cfg = vscode.workspace.getConfiguration('burstcode.ui');
   if (!(cfg.get<boolean>(enabledKey) ?? true)) return undefined;
 
-  const intervalMs = Math.max(250, cfg.get<number>(intervalKey) ?? fallbackIntervalMs);
+  const raw = Number(cfg.get<number>(intervalKey) ?? fallbackIntervalMs);
+  const intervalMs = Math.max(250, Number.isFinite(raw) && raw > 0 ? raw : fallbackIntervalMs);
   playAlertSoundOnce(kind);
   const timer = setInterval(() => playAlertSoundOnce(kind), intervalMs);
   return {
@@ -1364,7 +1365,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const enabled = cfg.get<boolean>('taskDoneSound') ?? true;
     if (!enabled) return;
 
-    const intervalMs = Math.max(250, cfg.get<number>('taskDoneSoundIntervalMs') ?? 10000);
+    const rawInterval = Number(cfg.get<number>('taskDoneSoundIntervalMs') ?? 10000);
+    const intervalMs = Math.max(250, Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 10000);
     const alert = shouldUseClientSideAlerts() ? undefined : startTaskDoneAlert();
 
     notifyIfWindowInactive('BurstCode needs your attention.');
@@ -1409,7 +1411,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.stopAskUserAlert();
     const cfg = vscode.workspace.getConfiguration('burstcode.ui');
     const enabled = cfg.get<boolean>('askUserSound') ?? true;
-    const intervalMs = Math.max(250, cfg.get<number>('askUserSoundIntervalMs') ?? 10000);
+    const rawInterval = Number(cfg.get<number>('askUserSoundIntervalMs') ?? 10000);
+    const intervalMs = Math.max(250, Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 10000);
     const alert = enabled && !shouldUseClientSideAlerts() ? startAskUserAlert() : undefined;
     notifyIfWindowInactive(message);
     this.showClientAttentionNotification(message);
@@ -3226,13 +3229,15 @@ function stopTaskDoneUserActivityListener() {
 		    // Best effort: webview audio may be blocked until the user has interacted.
 		  }
 		}
-		function startClientAlertSound(kind, intervalMs) {
-		  stopClientAlertSound(kind);
-		  unlockClientAlertAudio();
-		  playClientAlertSoundOnce(kind);
-		  const timer = setInterval(() => playClientAlertSoundOnce(kind), Math.max(250, Number(intervalMs) || 1000));
-		  clientAlertTimers.set(kind, timer);
-		}
+			function startClientAlertSound(kind, intervalMs) {
+			  stopClientAlertSound(kind);
+			  unlockClientAlertAudio();
+			  playClientAlertSoundOnce(kind);
+			  const parsed = Number(intervalMs);
+			  const ms = Math.max(250, Number.isFinite(parsed) && parsed > 0 ? parsed : 10000);
+			  const timer = setInterval(() => playClientAlertSoundOnce(kind), ms);
+			  clientAlertTimers.set(kind, timer);
+			}
 		function stopClientAlertSound(kind) {
 		  const timer = clientAlertTimers.get(kind);
 		  if (timer) clearInterval(timer);

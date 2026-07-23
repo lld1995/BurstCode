@@ -59,7 +59,9 @@ function playAlertSoundOnce(kind: AlertSoundKind): void {
 }
 
 function startRepeatingAlertSound(kind: AlertSoundKind, intervalMs: number): AlertHandle {
-  const ms = Math.max(250, Number.isFinite(intervalMs) ? intervalMs : 10000);
+  // Coerce over the wire (remote → local UI host) so string/NaN never fall back to a noisy short interval.
+  const parsed = Number(intervalMs);
+  const ms = Math.max(250, Number.isFinite(parsed) && parsed > 0 ? parsed : 10000);
   playAlertSoundOnce(kind);
   const timer = setInterval(() => playAlertSoundOnce(kind), ms);
   return { stop: () => clearInterval(timer) };
@@ -165,7 +167,8 @@ function stopAlert(kind: AlertSoundKind): void {
 function startAlert(payload: StartAlertPayload | undefined): void {
   const kind = normalizeKind(payload?.kind);
   stopAlert(kind);
-  const intervalMs = Math.max(250, payload?.intervalMs ?? 10000);
+  const parsed = Number(payload?.intervalMs);
+  const intervalMs = Math.max(250, Number.isFinite(parsed) && parsed > 0 ? parsed : 10000);
   activeAlerts.set(kind, startRepeatingAlertSound(kind, intervalMs));
   // Notification is sent separately through burstcode.alert.notify so the user only sees one popup.
 }

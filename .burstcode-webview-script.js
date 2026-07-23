@@ -253,7 +253,9 @@ function stopTaskDoneUserActivityListener() {
 		  stopClientAlertSound(kind);
 		  unlockClientAlertAudio();
 		  playClientAlertSoundOnce(kind);
-		  const timer = setInterval(() => playClientAlertSoundOnce(kind), Math.max(250, Number(intervalMs) || 1000));
+		  const parsed = Number(intervalMs);
+		  const ms = Math.max(250, Number.isFinite(parsed) && parsed > 0 ? parsed : 10000);
+		  const timer = setInterval(() => playClientAlertSoundOnce(kind), ms);
 		  clientAlertTimers.set(kind, timer);
 		}
 		function stopClientAlertSound(kind) {
