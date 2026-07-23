@@ -307,7 +307,104 @@ log.addEventListener('pointerdown', markManualScrollIntent, { passive: true });
 log.addEventListener('scroll', () => {
   const atBottom = isLogAtBottom();
   if (Date.now() - lastManualScrollAt < 800 || atBottom) autoScroll = atBottom;
+  scheduleLogVirtualization();
 }, { passive: true });
+if (typeof ResizeObserver !== 'undefined') {
+  try {
+    const logResizeObserver = new ResizeObserver(() => scheduleLogVirtualization());
+    logResizeObserver.observe(log);
+  } catch (_) { /* older hosts */ }
+}
+const VIRT_OVERSCAN_PX = 900;
+const VIRT_MIN_ITEMS = 24;
+let virtFrame = 0;
+let virtPinnedEls = new WeakSet();
+const virtParked = new WeakMap(); // el -> DocumentFragment of parked children
+function isLogVirtCandidate(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (el.classList.contains('empty-state')) return false;
+  // Keep live streaming nodes fully mounted so partial updates keep working.
+  if (el === activeAssistantEl || el === activeReasoningEl || el === activeStreamingToolEl) return false;
+  if (el.dataset && el.dataset.streaming === 'true') return false;
+  if (el.querySelector && el.querySelector('summary[data-streaming="true"]')) return false;
+  return true;
+}
+function expandLogItem(el) {
+  if (!el || !el.classList) return;
+  if (el.classList.contains('virt-collapsed')) {
+    el.classList.remove('virt-collapsed');
+    el.style.minHeight = '';
+    el.style.height = '';
+  }
+  const parked = virtParked.get(el);
+  if (parked) {
+    el.appendChild(parked);
+    virtParked.delete(el);
+  }
+}
+function collapseLogItem(el) {
+  if (!el || !el.classList || el.classList.contains('virt-collapsed')) return;
+  // Measure while fully expanded so scroll height stays stable after parking.
+  const height = el.offsetHeight || 0;
+  if (height <= 0) return;
+  if (!virtParked.has(el) && el.childNodes && el.childNodes.length) {
+    const frag = document.createDocumentFragment();
+    while (el.firstChild) frag.appendChild(el.firstChild);
+    virtParked.set(el, frag);
+  }
+  el.style.minHeight = height + 'px';
+  el.style.height = height + 'px';
+  el.classList.add('virt-collapsed');
+}
+function pinLogVirtualization(el) {
+  if (!el) return;
+  virtPinnedEls.add(el);
+  expandLogItem(el);
+}
+function unpinLogVirtualization(el) {
+  if (!el) return;
+  try { virtPinnedEls.delete(el); } catch (_) {}
+}
+function scheduleLogVirtualization() {
+  if (virtFrame) return;
+  virtFrame = requestAnimationFrame(() => {
+    virtFrame = 0;
+    updateLogVirtualization();
+  });
+}
+function updateLogVirtualization() {
+  const kids = Array.from(log.children || []);
+  if (kids.length <= VIRT_MIN_ITEMS) {
+    for (const el of kids) {
+      if (!el || !el.classList) continue;
+      el.classList.add('virt-item');
+      expandLogItem(el);
+    }
+    return;
+  }
+  const viewTop = log.scrollTop - VIRT_OVERSCAN_PX;
+  const viewBottom = log.scrollTop + log.clientHeight + VIRT_OVERSCAN_PX;
+  for (const el of kids) {
+    if (!el || !el.classList) continue;
+    el.classList.add('virt-item');
+    if (!isLogVirtCandidate(el) || virtPinnedEls.has(el)) {
+      expandLogItem(el);
+      continue;
+    }
+    const top = el.offsetTop;
+    const height = el.offsetHeight || 0;
+    const bottom = top + height;
+    const inView = bottom >= viewTop && top <= viewBottom;
+    if (inView) expandLogItem(el);
+    else collapseLogItem(el);
+  }
+}
+function observeLogChild(el) {
+  if (!el || !el.classList) return el;
+  el.classList.add('virt-item');
+  scheduleLogVirtualization();
+  return el;
+}
 function scheduleScrollToBottom(force) {
   pendingScrollForce = pendingScrollForce || force;
   if (pendingScrollFrame) return;
@@ -325,9 +422,19 @@ function scheduleScrollToBottom(force) {
     // content didn't" race caused by async layout.
     requestAnimationFrame(() => {
       const h1 = log.scrollHeight;
-      if (h1 > h0) log.scrollTop = h1;
-      else if (didForce || autoScroll) log.scrollTop = log.scrollHeight;
-      autoScroll = isLogAtBottom();
+      if (h1 > h0) {
+        log.scrollTop = h1;
+        // Content grew between the two passes — the user didn't scroll up,
+        // the content just arrived faster than we could scroll. Keep
+        // autoScroll unchanged so streaming continues to follow the bottom.
+        // Setting autoScroll=false here would stop auto-scrolling for the
+        // rest of the stream, causing the final text to never scroll into
+        // view.
+      } else {
+        if (didForce || autoScroll) log.scrollTop = log.scrollHeight;
+        autoScroll = isLogAtBottom();
+      }
+      scheduleLogVirtualization();
     });
   });
 }
@@ -1114,6 +1221,7 @@ function renderTranscript(entries) {
   activeAssistantEl = null;
   activeReasoningEl = null;
   activeStreamingToolEl = null;
+  virtPinnedEls = new WeakSet();
   if (!entries || entries.length === 0) {
     showEmptyState();
     return;
@@ -1129,7 +1237,7 @@ function renderTranscript(entries) {
       const sum = document.createElement('summary');
       sum.textContent = (e.isError ? '⚠ ' : '✓ ') + (e.name || 'tool');
       det.appendChild(sum);
-      log.appendChild(det);
+      log.appendChild(observeLogChild(det));
       // Rebuild the rich card (diff / read / collect) when we still have the
       // call args from the saved transcript. Falls back to a plain <pre> dump
       // for everything else or when applyRichTool can't build a body.
@@ -1145,6 +1253,7 @@ function renderTranscript(entries) {
     }
   });
   forceScrollToBottom();
+  scheduleLogVirtualization();
 }
 
 // Re-hydrate the in-flight UI state from a backend snapshot. Called when the
@@ -1168,21 +1277,21 @@ function replayLiveState(snap) {
       pill.className = 'iter-pill';
       const iter = (p.payload && p.payload.iter !== undefined) ? p.payload.iter : 0;
       pill.innerHTML = '<span class="pill">iter ' + (iter + 1) + '</span>';
-      log.appendChild(pill);
+      log.appendChild(observeLogChild(pill));
     } else if (p.kind === 'auto-continue') {
       const pill = document.createElement('div');
       pill.className = 'iter-pill';
       const count = (p.payload && p.payload.count) || 1;
       const max = (p.payload && p.payload.max) || 1;
       pill.innerHTML = '<span class="pill">↻ auto-continue ' + count + '/' + max + '</span>';
-      log.appendChild(pill);
+      log.appendChild(observeLogChild(pill));
     } else if (p.kind === 'auto-resume') {
       const pill = document.createElement('div');
       pill.className = 'iter-pill';
       const attempt = (p.payload && p.payload.attempt) || 1;
       const max = (p.payload && p.payload.max) || 1;
       pill.innerHTML = '<span class="pill">↻ auto-resume ' + attempt + '/' + max + '</span>';
-      log.appendChild(pill);
+      log.appendChild(observeLogChild(pill));
     }
   }
   // In-flight reasoning bubble.
@@ -1199,6 +1308,7 @@ function replayLiveState(snap) {
   // In-flight assistant bubble.
   if (snap.assistantText) {
     activeAssistantEl = addAssistantMsg(snap.assistantText);
+    pinLogVirtualization(activeAssistantEl);
   }
   // Running tools — rebuild each as an open details element.
   const tools = Array.isArray(snap.runningTools) ? snap.runningTools : [];
@@ -1222,7 +1332,8 @@ function replayLiveState(snap) {
       det.appendChild(progPre);
       det.open = true;
     }
-    log.appendChild(det);
+    log.appendChild(observeLogChild(det));
+    pinLogVirtualization(det);
     toolElements.set(t.id, det);
     runningTools.set(t.id, { name: t.name, startedAt: t.startedAt || Date.now() });
   }
@@ -1959,7 +2070,7 @@ function showEmptyState() {
   hint.textContent = 'Ask anything about your codebase, or describe a change to make.';
   wrap.appendChild(title);
   wrap.appendChild(hint);
-  log.appendChild(wrap);
+  log.appendChild(observeLogChild(wrap));
 }
 
 function addUserMsg(text, messageIndex, checkpointRef, checkpointError, imageCount, imageUrls) {
@@ -2050,7 +2161,7 @@ function addUserMsg(text, messageIndex, checkpointRef, checkpointError, imageCou
   }
 
   if (actions.childElementCount > 0) el.appendChild(actions);
-  log.appendChild(el);
+  log.appendChild(observeLogChild(el));
   // The user just submitted a prompt; jump them to the bottom regardless of
   // where they were reading, and re-arm auto-follow for the upcoming run.
   forceScrollToBottom();
@@ -2133,7 +2244,7 @@ function addAssistantMsg(text) {
   md.innerHTML = renderMarkdown(text || '');
   bindCodeCopy(md);
   el.appendChild(buildAssistantActions(el));
-  log.appendChild(el);
+  log.appendChild(observeLogChild(el));
   scrollToBottom();
   return el;
 }
@@ -2157,7 +2268,8 @@ function addReasoningMsg(text, opts) {
   body.textContent = text || '';
   det.appendChild(body);
   det.dataset.raw = text || '';
-  log.appendChild(det);
+  log.appendChild(observeLogChild(det));
+  if (opts && opts.streaming) pinLogVirtualization(det);
   scrollToBottom();
   return det;
 }
@@ -2167,7 +2279,7 @@ function addErrorMsg(text) {
   const el = document.createElement('div');
   el.className = 'msg error';
   el.textContent = text;
-  log.appendChild(el);
+  log.appendChild(observeLogChild(el));
   scrollToBottom();
   return el;
 }
@@ -2239,6 +2351,7 @@ window.addEventListener('message', (e) => {
       toolElements.clear();
       runningTools.clear();
       currentIter = 0;
+      virtPinnedEls = new WeakSet();
       renderPlan([]);
       // Reset the send button back to send mode. Other sessions may still be
       // running in the background, but THIS view (the fresh / new-chat view)
@@ -2353,7 +2466,7 @@ window.addEventListener('message', (e) => {
       qEl.appendChild(qBody);
       qEl.appendChild(qBadge);
       qEl.appendChild(qUndo);
-      log.appendChild(qEl);
+      log.appendChild(observeLogChild(qEl));
       scrollToBottom();
       break;
     }
@@ -2362,6 +2475,7 @@ window.addEventListener('message', (e) => {
       if (!id) break;
       const qEl = log.querySelector('[data-queued-id="' + cssAttrEscape(id) + '"]');
       if (!qEl) break;
+      expandLogItem(qEl);
       if (msg.payload && msg.payload.removed) {
         const restoredText = (typeof msg.payload.text === 'string') ? msg.payload.text : '';
         qEl.remove();
@@ -2392,6 +2506,7 @@ window.addEventListener('message', (e) => {
       if (cpRef) {
         const msgEl = log.querySelector('[data-message-index="' + cpIdx + '"]');
         if (msgEl) {
+          expandLogItem(msgEl);
           msgEl.dataset.checkpointRef = cpRef;
           const rollbackBtn = msgEl.querySelector('.rollback-btn');
           if (rollbackBtn) {
@@ -2423,7 +2538,7 @@ window.addEventListener('message', (e) => {
       const pill = document.createElement('div');
       pill.className = 'iter-pill';
       pill.innerHTML = '<span class="pill">iter ' + (msg.payload.iter + 1) + '</span>';
-      log.appendChild(pill);
+      log.appendChild(observeLogChild(pill));
       scrollToBottom();
       activeAssistantEl = null;
       activeReasoningEl = null;
@@ -2436,7 +2551,7 @@ window.addEventListener('message', (e) => {
       const pill = document.createElement('div');
       pill.className = 'iter-pill';
       pill.innerHTML = '<span class="pill">↻ auto-continue ' + msg.payload.count + '/' + msg.payload.max + '</span>';
-      log.appendChild(pill);
+      log.appendChild(observeLogChild(pill));
       scrollToBottom();
       activeAssistantEl = null;
       activeReasoningEl = null;
@@ -2468,7 +2583,7 @@ window.addEventListener('message', (e) => {
         const pill = document.createElement('div');
         pill.className = 'iter-pill';
         pill.innerHTML = '<span class="pill" title="' + escapeHtml(errText) + '">↻ auto-resume ' + attempt + '/' + max + '</span>';
-        log.appendChild(pill);
+        log.appendChild(observeLogChild(pill));
         scrollToBottom();
         setStatus('continue', 'Stream interrupted, resuming ' + attempt + '/' + max + '...');
         break;
@@ -2497,11 +2612,13 @@ window.addEventListener('message', (e) => {
           const sum = activeReasoningEl.querySelector('summary');
           if (sum) delete sum.dataset.streaming;
           activeReasoningEl.open = false;
+          unpinLogVirtualization(activeReasoningEl);
         }
         activeReasoningEl = null;
       }
       if (!activeAssistantEl) {
         activeAssistantEl = addAssistantMsg('');
+        pinLogVirtualization(activeAssistantEl);
         if (runningTools.size === 0) {
           setStatus('busy', currentIter ? 'Streaming (iter ' + currentIter + ')...' : 'Streaming...');
         }
@@ -2521,6 +2638,7 @@ window.addEventListener('message', (e) => {
           const sum = activeReasoningEl.querySelector('summary');
           if (sum) delete sum.dataset.streaming;
           activeReasoningEl.open = false;
+          unpinLogVirtualization(activeReasoningEl);
         }
         activeReasoningEl = null;
       }
@@ -2535,10 +2653,12 @@ window.addEventListener('message', (e) => {
             mdEl.innerHTML = renderMarkdown(finalText);
             bindCodeCopy(mdEl);
           }
+          unpinLogVirtualization(activeAssistantEl);
         }
       }
       activeAssistantEl = null;
       scrollToBottom();
+      scheduleLogVirtualization();
       break;
     case 'tool-call-start': {
       clearEmptyState();
@@ -2546,12 +2666,14 @@ window.addEventListener('message', (e) => {
       console.log('[Webview] tool-call-start received. name=' + msg.payload.name + ', id=' + msg.payload.id + ', existingKey=' + existingKey + ', existsInToolElements=' + toolElements.has(existingKey) + ', args=' + JSON.stringify(msg.payload.args));
       if (toolElements.has(existingKey)) {
         const existingDet = toolElements.get(existingKey);
+        expandLogItem(existingDet);
         const existingSum = existingDet.querySelector('summary');
         if (msg.payload.streaming) {
           existingDet.dataset.running = 'true';
           existingDet.dataset.streaming = 'true';
           delete existingDet.dataset.resuming;
           activeStreamingToolEl = existingDet;
+          pinLogVirtualization(existingDet);
           if (existingSum) existingSum.textContent = ' 27} ' + msg.payload.name + '(continuing streamed args...) · running...';
           break;
         }
@@ -2560,6 +2682,7 @@ window.addEventListener('message', (e) => {
         }
         delete existingDet.dataset.streaming;
         activeStreamingToolEl = null;
+        unpinLogVirtualization(existingDet);
         break;
       }
       const det = document.createElement('details');
@@ -2577,7 +2700,8 @@ window.addEventListener('message', (e) => {
       const sum = document.createElement('summary');
       sum.textContent = ' 27} ' + msg.payload.name + '(' + JSON.stringify(msg.payload.args).slice(0, 200) + ') · running...';
       det.appendChild(sum);
-      log.appendChild(det);
+      log.appendChild(observeLogChild(det));
+      pinLogVirtualization(det);
       applyRichTool(det, msg.payload.name, msg.payload.args, msg.payload.meta, null, false, false);
       const key = existingKey;
       toolElements.set(key, det);
@@ -2593,6 +2717,7 @@ window.addEventListener('message', (e) => {
       // Some models omit id from streaming deltas, so we can't rely on it.
       const argDet = (argKey && toolElements.get(argKey)) || activeStreamingToolEl;
       if (argDet) {
+        expandLogItem(argDet);
         argDet.dataset.argsBuf = (argDet.dataset.argsBuf || '') + msg.payload.delta;
         const buf = argDet.dataset.argsBuf;
         if (buf.length > 16000) argDet.dataset.argsBuf = buf.slice(0, 16000);
@@ -2647,6 +2772,7 @@ window.addEventListener('message', (e) => {
         progDet = items[items.length - 1] || null;
       }
       if (progDet) {
+        expandLogItem(progDet);
         let progPre = progDet.querySelector('.tool-progress-log');
         if (!progPre) {
           progPre = document.createElement('pre');
@@ -2672,6 +2798,7 @@ window.addEventListener('message', (e) => {
         det = items[items.length - 1];
       }
       if (det) {
+        expandLogItem(det);
         det.dataset.error = String(!!msg.payload.isError);
         det.dataset.running = 'false';
         // Prefer the authoritative, fully-parsed args delivered with tool-call-end.
@@ -2700,6 +2827,9 @@ window.addEventListener('message', (e) => {
           det.appendChild(pre);
           preserveToolScrollableAutoScroll(det, pre);
         }
+        delete det.dataset.streaming;
+        if (activeStreamingToolEl === det) activeStreamingToolEl = null;
+        unpinLogVirtualization(det);
       }
       if (key) runningTools.delete(key);
       if (runningTools.size === 0) {
@@ -2709,6 +2839,7 @@ window.addEventListener('message', (e) => {
         setStatus('tool', 'Running ' + names + '...');
       }
       scrollToBottom();
+      scheduleLogVirtualization();
       break;
     }
     case 'pending-edits': {
@@ -2722,7 +2853,7 @@ window.addEventListener('message', (e) => {
         const wasAccepted = /accepted/.test(p.recentDecision) && !/all hunks rejected/.test(p.recentDecision);
         flash.className = 'decision-flash ' + (wasAccepted ? 'accept' : 'reject');
         flash.textContent = (wasAccepted ? '✓ ' : '✕ ') + p.recentDecision;
-        log.appendChild(flash);
+        log.appendChild(observeLogChild(flash));
         scrollToBottom();
       }
       break;
@@ -2788,6 +2919,8 @@ window.addEventListener('message', (e) => {
         reply.appendChild(gutter);
         reply.appendChild(body);
         wrap.appendChild(reply);
+        unpinLogVirtualization(wrap);
+        scheduleLogVirtualization();
         vscode.postMessage({ type: 'ask-user-response', payload: { id: askId, answer: answer, sessionId: sessionsCache.activeId || null } });
       };
 
@@ -2911,7 +3044,8 @@ window.addEventListener('message', (e) => {
         });
       }
 
-      log.appendChild(wrap);
+      log.appendChild(observeLogChild(wrap));
+      pinLogVirtualization(wrap);
       if (textInput) textInput.focus();
       // Asking the user a question requires their attention; pull the panel
       // back to the bottom even if they had scrolled up.
@@ -2924,6 +3058,7 @@ window.addEventListener('message', (e) => {
       const id = String((msg.payload && msg.payload.id) || '');
       const node = id ? log.querySelector('.ask-clarify[data-ask-id="' + id + '"]') : null;
       if (node && node.dataset.done !== '1') {
+        expandLogItem(node);
         node.dataset.done = '1';
         node.classList.add('answered', 'cancelled');
         const ctrls = node.querySelectorAll('button, input, label');
@@ -2949,6 +3084,7 @@ window.addEventListener('message', (e) => {
       activeStreamingToolEl = null;
       runningTools.clear();
       setStatus('error', 'Error');
+      forceScrollToBottom();
       break;
     case 'done': {
       setBusy(false);
@@ -2977,6 +3113,27 @@ window.addEventListener('message', (e) => {
       }
       runningTools.clear();
       setStatus(errorish ? 'error' : 'done', labels[reason] || ('Done (' + reason + ')'));
+      // Flush any pending markdown render for the in-flight assistant bubble.
+      // In the normal flow, assistant-message already rendered synchronously
+      // and set activeAssistantEl=null. But if the run was cancelled before
+      // assistant-message arrived, the last assistant-delta's scheduleRender
+      // rAF may not have fired yet — flush it now so the partial text is
+      // visible immediately.
+      if (activeAssistantEl && activeAssistantEl.dataset.renderPending === 'true') {
+        delete activeAssistantEl.dataset.renderPending;
+        if (activeAssistantEl.isConnected) {
+          const raw = activeAssistantEl.dataset.raw || '';
+          const mdEl = activeAssistantEl.querySelector('.md');
+          if (mdEl) {
+            mdEl.innerHTML = renderMarkdown(raw);
+            bindCodeCopy(mdEl);
+          }
+        }
+      }
+      // Ensure the final output is scrolled into view. During rapid streaming
+      // the two-pass scroll can fall behind the growing content; force a
+      // final scroll so the last text is always visible when the run ends.
+      forceScrollToBottom();
       break;
     }
     case 'models': {
@@ -3039,7 +3196,7 @@ window.addEventListener('message', (e) => {
       note.style.opacity = '0.7';
       note.textContent = '↯ Context auto-compressed: ' + fmtTokens(p.before)
         + ' → ' + fmtTokens(p.after) + ' tokens';
-      log.appendChild(note);
+      log.appendChild(observeLogChild(note));
       scrollToBottom();
       break;
     }
@@ -3052,7 +3209,7 @@ window.addEventListener('message', (e) => {
         : 'nudging the model to try a different approach';
       note.textContent = '⚠ Detected ' + p.repeats + ' identical tool-call turns ('
         + (p.calls || 'unknown') + ') — ' + verb + '.';
-      log.appendChild(note);
+      log.appendChild(observeLogChild(note));
       scrollToBottom();
       break;
     }

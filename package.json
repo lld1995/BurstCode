@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.133",
+  "version": "0.1.134",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -439,10 +439,10 @@
         },
         "burstcode.ui.taskDoneSoundIntervalMs": {
           "type": "number",
-          "default": 800,
+          "default": 10000,
           "minimum": 250,
           "order": 51,
-          "description": "Interval in milliseconds between repeated task-completion notification sounds. The completion sound is a bright ascending chime, distinct from the ask-user prompt sound."
+          "description": "Interval in milliseconds between repeated task-completion notification sounds (default 10000 = once every 10s). The completion sound is a bright ascending chime, distinct from the ask-user prompt sound."
         },
         "burstcode.ui.askUserSound": {
           "type": "boolean",
@@ -452,10 +452,10 @@
         },
         "burstcode.ui.askUserSoundIntervalMs": {
           "type": "number",
-          "default": 1200,
+          "default": 10000,
           "minimum": 250,
           "order": 53,
-          "description": "Interval in milliseconds between repeated ask-user prompt notification sounds."
+          "description": "Interval in milliseconds between repeated ask-user prompt notification sounds (default 10000 = once every 10s)."
         },
         "burstcode.git.autoCheckpoint": {
           "type": "boolean",

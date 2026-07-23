@@ -59,7 +59,7 @@ function playAlertSoundOnce(kind: AlertSoundKind): void {
 }
 
 function startRepeatingAlertSound(kind: AlertSoundKind, intervalMs: number): AlertHandle {
-  const ms = Math.max(250, Number.isFinite(intervalMs) ? intervalMs : kind === 'taskDone' ? 800 : 1200);
+  const ms = Math.max(250, Number.isFinite(intervalMs) ? intervalMs : 10000);
   playAlertSoundOnce(kind);
   const timer = setInterval(() => playAlertSoundOnce(kind), ms);
   return { stop: () => clearInterval(timer) };
@@ -165,7 +165,7 @@ function stopAlert(kind: AlertSoundKind): void {
 function startAlert(payload: StartAlertPayload | undefined): void {
   const kind = normalizeKind(payload?.kind);
   stopAlert(kind);
-  const intervalMs = Math.max(250, payload?.intervalMs ?? (kind === 'taskDone' ? 800 : 1200));
+  const intervalMs = Math.max(250, payload?.intervalMs ?? 10000);
   activeAlerts.set(kind, startRepeatingAlertSound(kind, intervalMs));
   // Notification is sent separately through burstcode.alert.notify so the user only sees one popup.
 }
