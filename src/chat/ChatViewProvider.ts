@@ -424,6 +424,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private rollbackSnapshotSub?: vscode.Disposable;
   private readonly sessions: SessionStore;
   private readonly lessons: LessonStore;
+  private static readonly TRANSCRIPT_PAGE_SIZE = 80;
   private readonly foregroundActivityEmitter = new vscode.EventEmitter<string>();
   readonly onDidForegroundActivity: vscode.Event<string> = this.foregroundActivityEmitter.event;
   private taskDoneAlert?: SoundAlertHandle;
@@ -847,12 +848,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // explicitly wanted to look at it.
     this.openTab(s.id);
     this.post({ type: 'reset' });
+    const fullTranscript = buildTranscript(s.messages, s.checkpoints);
+    const transcriptOffset = Math.max(0, fullTranscript.length - ChatViewProvider.TRANSCRIPT_PAGE_SIZE);
     this.post({
       type: 'load-session',
       payload: {
         id: s.id,
         title: s.title,
-        transcript: buildTranscript(s.messages, s.checkpoints),
+        transcript: fullTranscript.slice(transcriptOffset),
+        transcriptOffset,
+        transcriptTotal: fullTranscript.length,
         plan: s.plan ?? [],
         status: this.effectiveStatus(s.id, s.status) ?? 'idle'
       }
@@ -1124,6 +1129,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'load-session':
         await this.loadSession(String((msg.payload as { id: string })?.id ?? ''));
         break;
+      case 'load-older-transcript': {
+        const payload = (msg.payload ?? {}) as { id?: string; before?: number };
+        const id = String(payload.id ?? '').trim();
+        const before = Math.max(0, Math.floor(Number(payload.before) || 0));
+        if (!id || this.currentSession?.id !== id || before <= 0) break;
+        const live = this.runs.get(id)?.session;
+        const session = live ?? this.sessions.get(id);
+        if (!session) break;
+        const transcript = buildTranscript(session.messages, session.checkpoints);
+        const end = Math.min(before, transcript.length);
+        const start = Math.max(0, end - ChatViewProvider.TRANSCRIPT_PAGE_SIZE);
+        this.post({
+          type: 'older-transcript',
+          payload: {
+            id,
+            transcript: transcript.slice(start, end),
+            transcriptOffset: start,
+            transcriptTotal: transcript.length
+          }
+        });
+        break;
+      }
       case 'delete-session':
         await this.deleteSession(String((msg.payload as { id: string })?.id ?? ''));
         break;
@@ -2505,6 +2532,10 @@ setTimeout(() => {
   #log > .virt-item { contain: layout style; }
   #log > .virt-item.virt-collapsed { overflow: hidden; }
   #log > .virt-item.virt-collapsed > * { display: none !important; }
+  #log .transcript-loader { display: flex; justify-content: center; padding: 0 0 12px; }
+  #log .transcript-loader button { background: transparent; color: var(--vscode-textLink-foreground); border: 1px solid var(--vscode-panel-border); border-radius: 999px; padding: 4px 12px; cursor: pointer; font-size: 0.8em; }
+  #log .transcript-loader button:hover { background: var(--vscode-toolbar-hoverBackground); }
+  #log .transcript-loader button:disabled { opacity: 0.55; cursor: default; }
   #log .turn { margin-bottom: 18px; max-width: 100%; }
   #log .turn:last-child { margin-bottom: 8px; }
 
@@ -3289,6 +3320,7 @@ log.addEventListener('pointerdown', markManualScrollIntent, { passive: true });
 log.addEventListener('scroll', () => {
   const atBottom = isLogAtBottom();
   if (Date.now() - lastManualScrollAt < 800 || atBottom) autoScroll = atBottom;
+  if (log.scrollTop < 120) requestOlderTranscript();
   scheduleLogVirtualization();
 }, { passive: true });
 if (typeof ResizeObserver !== 'undefined') {
@@ -3301,6 +3333,11 @@ const VIRT_OVERSCAN_PX = 900;
 const VIRT_MIN_ITEMS = 24;
 let virtFrame = 0;
 let virtPinnedEls = new WeakSet();
+let loadedTranscript = [];
+let loadedTranscriptSessionId = '';
+let loadedTranscriptOffset = 0;
+let loadedTranscriptTotal = 0;
+let loadingOlderTranscript = false;
 const virtParked = new WeakMap(); // el -> DocumentFragment of parked children
 function isLogVirtCandidate(el) {
   if (!el || el.nodeType !== 1) return false;
@@ -4197,7 +4234,37 @@ function buildLessonEditor(existing) {
   return wrap;
 }
 
-function renderTranscript(entries) {
+function requestOlderTranscript() {
+  if (loadingOlderTranscript || !loadedTranscriptSessionId || loadedTranscriptOffset <= 0) return;
+  loadingOlderTranscript = true;
+  const btn = log.querySelector('.transcript-loader button');
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+  vscode.postMessage({
+    type: 'load-older-transcript',
+    payload: { id: loadedTranscriptSessionId, before: loadedTranscriptOffset }
+  });
+}
+
+function addTranscriptLoader() {
+  if (loadedTranscriptOffset <= 0) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'transcript-loader';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = loadingOlderTranscript
+    ? 'Loading…'
+    : 'Load earlier messages (' + loadedTranscriptOffset + ' remaining)';
+  btn.disabled = loadingOlderTranscript;
+  btn.onclick = requestOlderTranscript;
+  wrap.appendChild(btn);
+  log.insertBefore(wrap, log.firstChild);
+}
+
+function renderTranscript(entries, preserveViewport) {
+  const oldHeight = preserveViewport ? log.scrollHeight : 0;
+  const oldTop = preserveViewport ? log.scrollTop : 0;
+  const previousAutoScroll = autoScroll;
+  if (preserveViewport) autoScroll = false;
   log.innerHTML = '';
   toolElements.clear();
   activeAssistantEl = null;
@@ -4234,7 +4301,13 @@ function renderTranscript(entries) {
       }
     }
   });
-  forceScrollToBottom();
+  addTranscriptLoader();
+  if (preserveViewport) {
+    log.scrollTop = oldTop + Math.max(0, log.scrollHeight - oldHeight);
+    autoScroll = previousAutoScroll;
+  } else {
+    forceScrollToBottom();
+  }
   scheduleLogVirtualization();
 }
 
@@ -5327,6 +5400,11 @@ window.addEventListener('message', (e) => {
     case 'reset':
       rollbackOverlay.classList.remove('active');
       log.innerHTML = '';
+      loadedTranscript = [];
+      loadedTranscriptSessionId = '';
+      loadedTranscriptOffset = 0;
+      loadedTranscriptTotal = 0;
+      loadingOlderTranscript = false;
       activeAssistantEl = null;
       activeReasoningEl = null;
       activeStreamingToolEl = null;
@@ -5345,7 +5423,12 @@ window.addEventListener('message', (e) => {
       showEmptyState();
       break;
     case 'load-session': {
-      renderTranscript(msg.payload.transcript || []);
+      loadedTranscript = Array.isArray(msg.payload.transcript) ? msg.payload.transcript : [];
+      loadedTranscriptSessionId = String(msg.payload.id || '');
+      loadedTranscriptOffset = Math.max(0, Number(msg.payload.transcriptOffset) || 0);
+      loadedTranscriptTotal = Math.max(loadedTranscript.length, Number(msg.payload.transcriptTotal) || 0);
+      loadingOlderTranscript = false;
+      renderTranscript(loadedTranscript, false);
       renderPlan(msg.payload.plan || []);
       runningTools.clear();
       currentIter = 0;
@@ -5361,6 +5444,16 @@ window.addEventListener('message', (e) => {
         const [st, lb] = map[loadedStatus] || ['idle', 'Idle'];
         setStatus(st, lb);
       }
+      break;
+    }
+    case 'older-transcript': {
+      if (String(msg.payload.id || '') !== loadedTranscriptSessionId) break;
+      const older = Array.isArray(msg.payload.transcript) ? msg.payload.transcript : [];
+      loadedTranscript = older.concat(loadedTranscript);
+      loadedTranscriptOffset = Math.max(0, Number(msg.payload.transcriptOffset) || 0);
+      loadedTranscriptTotal = Math.max(loadedTranscript.length, Number(msg.payload.transcriptTotal) || 0);
+      loadingOlderTranscript = false;
+      renderTranscript(loadedTranscript, true);
       break;
     }
     case 'live-state-replay': {
