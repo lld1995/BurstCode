@@ -776,8 +776,8 @@ export function buildEditTools(
         const diagnosticsNote = await buildPostEditDiagnosticsNote(files);
         return {
           content:
-            `propose_edit applied every VALID fragment and staged it on disk; only the ` +
-            `fragment(s) below failed and were skipped (the rest of the same call still landed):\n${message}\n` +
+            `ON-DISK STATE: propose_edit already wrote every VALID fragment to the live workspace; only the ` +
+            `fragment(s) below failed and were skipped (the rest of the same call is already on disk):\n${message}\n` +
             `RECOVERY REQUIRED — before making another edit, inspect the current file state: read the whole affected file with read_file when it is reasonably sized; if it is too large or appears corrupted/garbled, restore it from git/checkpoint first. Then write a short revised plan and switch strategy instead of repeating the same failing edit shape. ` +
             `If the failure looks like missing/wrong braces, brackets, parentheses, tags, or quotes, treat it as a syntax-structure repair: read the smallest block that includes the broken delimiter plus neighboring function/class boundaries, patch only the unmatched/extra delimiter or tiny enclosing block, and run the relevant compiler/parser check before any broader rewrite. ` +
             `Re-issue ONLY the failed fragment(s) above: re-read the relevant current range because landed fragments may have shifted line numbers, then submit smaller hunks with precise oldText / non-overlapping ranges, use replace_lines for a just-read large block, use delete_lines for exact duplicate blocks, or use a temporary scripted replacement for controlled broad changes. ` +
@@ -820,7 +820,7 @@ export function buildEditTools(
         ? `\nIMPORTANT: your propose_edit call was TRUNCATED mid-stream (output token budget). Only the ${rawEdits.length} fully-received fragment(s) above were recovered and applied; any edits after the cut-off point were lost. Re-issue the REMAINING edits in a new, smaller propose_edit call.`
         : '';
       return {
-        content: `Queued edits for ${files.length} file(s): ${filePaths} — pending user review (non-blocking). You may call propose_edit again to add or replace hunks, or move on to the next step.${aliasNote}${truncationNote}${diagnosticsNote}`,
+        content: `ON-DISK STATE: edits were written immediately to the live workspace for ${files.length} file(s): ${filePaths}. REVIEW STATE ONLY: user review is pending and non-blocking; Accept changes only review status and performs no additional write, while Reject rolls the on-disk hunks back. Build, test, read, and continue editing against the current files now—do not wait for Accept and do not describe these edits as not yet applied. You may call propose_edit again to add or replace hunks, or move on to the next step.${aliasNote}${truncationNote}${diagnosticsNote}`,
         meta: {
           files: files.map((f) => f.path),
           summary,
