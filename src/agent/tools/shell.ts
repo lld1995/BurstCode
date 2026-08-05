@@ -262,6 +262,11 @@ async function collectGitChanges(gitRoot: string, baseline: BaselineSnapshot, ap
   if (untrackedOutput) for (const p of untrackedOutput.split('\n')) if (p.trim()) allPaths.add(p.trim());
 
   for (const relPath of allPaths) {
+    // Repository metadata and automation files are intentionally excluded from
+    // shell-command review, including every file nested under `.github/`.
+    const normalizedRelPath = relPath.replace(/\\/g, '/');
+    if (normalizedRelPath === '.github' || normalizedRelPath.startsWith('.github/')) continue;
+
     // Skip untracked files that already existed before the command ran —
     // they are NOT changes caused by this shell command.
     if (baseline.untracked.has(relPath)) continue;
