@@ -3161,6 +3161,7 @@ let lastUserActivityPostAt = 0;
 // stop forcing scroll so they can read freely; once they come back to the
 // bottom edge, auto-follow resumes.
 let autoScroll = true;
+let renderingTranscript = false;
 let pendingScrollFrame = 0;
 let pendingScrollForce = false;
 let lastManualScrollAt = 0;
@@ -3526,6 +3527,11 @@ function restoreToolScroll(det, snap) {
   requestAnimationFrame(() => { apply(); requestAnimationFrame(apply); });
 }
 function forceScrollToBottom() {
+  // Rebuilding a paged transcript calls the normal message renderers, including
+  // addUserMsg(). Those renderers force-scroll for genuinely new prompts, but a
+  // queued forced rAF here would override renderTranscript's viewport restore
+  // after older messages are prepended.
+  if (renderingTranscript) return;
   autoScroll = true;
   scheduleScrollToBottom(true);
 }
@@ -4266,12 +4272,14 @@ function renderTranscript(entries, preserveViewport) {
   const previousAutoScroll = autoScroll;
   if (preserveViewport) autoScroll = false;
   log.innerHTML = '';
+  renderingTranscript = true;
   toolElements.clear();
   activeAssistantEl = null;
   activeReasoningEl = null;
   activeStreamingToolEl = null;
   virtPinnedEls = new WeakSet();
   if (!entries || entries.length === 0) {
+    renderingTranscript = false;
     showEmptyState();
     return;
   }
@@ -4301,6 +4309,7 @@ function renderTranscript(entries, preserveViewport) {
       }
     }
   });
+  renderingTranscript = false;
   addTranscriptLoader();
   if (preserveViewport) {
     log.scrollTop = oldTop + Math.max(0, log.scrollHeight - oldHeight);
