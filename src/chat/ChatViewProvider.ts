@@ -2050,7 +2050,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       autoContinueOnLength: agentCfg.get<boolean>('autoContinueOnLength') ?? true,
       maxAutoContinues: agentCfg.get<number>('maxAutoContinues') ?? 3,
       autoResumeOnStreamError: agentCfg.get<boolean>('autoResumeOnStreamError') ?? true,
-      maxAutoResumes: agentCfg.get<number>('maxAutoResumes') ?? 3,
+      maxAutoResumes: agentCfg.get<number>('maxAutoResumes') ?? 0,
       maxStuckRepeats: agentCfg.get<number>('maxStuckRepeats') ?? 2,
       autoContinueOnPrematureStop: agentCfg.get<boolean>('autoContinueOnPrematureStop') ?? true,
       maxPrematureStopContinues: agentCfg.get<number>('maxPrematureStopContinues') ?? 2,
@@ -4344,7 +4344,8 @@ function replayLiveState(snap) {
       const pill = document.createElement('div');
       pill.className = 'iter-pill';
       const attempt = (p.payload && p.payload.attempt) || 1;
-      const max = (p.payload && p.payload.max) || 1;
+      const maxValue = p.payload && p.payload.max;
+      const max = maxValue === 0 ? '∞' : (maxValue || 1);
       pill.innerHTML = '<span class="pill">\u21bb auto-resume ' + attempt + '/' + max + '</span>';
       log.appendChild(observeLogChild(pill));
     }
@@ -5653,7 +5654,8 @@ window.addEventListener('message', (e) => {
           }
         }
         const attempt = (msg.payload && msg.payload.attempt) || 1;
-        const max = (msg.payload && msg.payload.max) || 1;
+        const maxValue = msg.payload && msg.payload.max;
+        const max = maxValue === 0 ? '∞' : (maxValue || 1);
         const errText = (msg.payload && msg.payload.error) ? String(msg.payload.error) : 'stream interrupted';
         const pill = document.createElement('div');
         pill.className = 'iter-pill';

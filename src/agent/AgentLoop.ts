@@ -765,7 +765,7 @@ export interface AgentOptions {
    * When false, the agent ends the run with reason 'error' as before.
    */
   autoResumeOnStreamError: boolean;
-  /** Cap on consecutive auto-resumes (resets after any successful streaming turn). */
+  /** Cap on consecutive auto-resumes; 0 means unlimited (resets after a successful streaming turn). */
   maxAutoResumes: number;
   /**
    * System prompt for this run. Built freshly per user request by the host so
@@ -1017,8 +1017,9 @@ export class AgentLoop {
       // the next streaming pass starts from a clean slate. The webview also
       // discards any partial assistant bubble on receipt of `auto-resume` so
       // the user does not see duplicated text.
+      const configuredMaxResumes = Math.max(0, Math.floor(this.options.maxAutoResumes));
       const maxResumes = this.options.autoResumeOnStreamError
-        ? Math.max(0, this.options.maxAutoResumes)
+        ? configuredMaxResumes === 0 ? Number.POSITIVE_INFINITY : configuredMaxResumes
         : 0;
       let resumeAttempt = 0;
       let streamOk = false;
@@ -1383,7 +1384,7 @@ export class AgentLoop {
           // frame limit cut the POST body mid-flight. Retrying usually succeeds,
           // so we grant extra auto-resume attempts beyond the normal budget.
           const truncated = isTruncatedRequestError(err);
-          const effectiveMax = truncated ? maxResumes + 3 : maxResumes;
+          const effectiveMax = Number.isFinite(maxResumes) && truncated ? maxResumes + 3 : maxResumes;
           if (resumeAttempt >= effectiveMax) {
             this.logger.error('LLM stream error', String(err));
             const detail = String(err);
@@ -1399,16 +1400,18 @@ export class AgentLoop {
             return;
           }
           resumeAttempt++;
-          const delayMs = Math.min(500 * 2 ** (resumeAttempt - 1), 4000);
+          const delayMs = Math.min(1000 * 2 ** (resumeAttempt - 1), 120_000);
+          const displayMax = Number.isFinite(effectiveMax) ? effectiveMax : 0;
+          const maxLabel = displayMax === 0 ? '∞' : String(displayMax);
           const reason = truncated ? 'truncated request body (network)' : 'stream error';
           this.logger.warn(
-            `LLM stream interrupted — ${reason} (attempt ${resumeAttempt}/${effectiveMax}); resuming in ${delayMs}ms: ${String(err)}`
+            `LLM stream interrupted — ${reason} (attempt ${resumeAttempt}/${maxLabel}); resuming in ${delayMs}ms: ${String(err)}`
           );
           yield {
             type: 'auto-resume',
             payload: {
               attempt: resumeAttempt,
-              max: effectiveMax,
+              max: displayMax,
               error: String(err),
               delayMs
             }

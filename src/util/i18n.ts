@@ -47,6 +47,10 @@ const EN: Dict = {
   'models.imageProfile.desc': 'baseURL / apiKey / model / size',
   'models.videoProfile': 'Video profile settings…',
   'models.videoProfile.desc': 'baseURL / apiKey / model / resolution / duration',
+  'models.llmRetries': 'LLM retry limit…',
+  'models.llmRetries.unlimited': 'unlimited',
+  'models.llmRetries.count': 'up to {0}',
+  'models.llmRetries.tip': 'Retries interrupted LLM streams with increasing delays, capped at 120 seconds. Set to 0 for unlimited retries.',
 
   // Permissions group
   'perm.group': 'Permissions',
@@ -174,6 +178,10 @@ const ZH: Dict = {
   'models.imageProfile.desc': 'baseURL / apiKey / 模型 / 尺寸',
   'models.videoProfile': '视频配置…',
   'models.videoProfile.desc': 'baseURL / apiKey / 模型 / 分辨率 / 时长',
+  'models.llmRetries': 'LLM 重试上限…',
+  'models.llmRetries.unlimited': '无限重试',
+  'models.llmRetries.count': '最多 {0} 次',
+  'models.llmRetries.tip': 'LLM 流中断后按阶梯增长的间隔自动重试，最大间隔 120 秒；设为 0 表示无限重试。',
 
   // Permissions group
   'perm.group': '权限',

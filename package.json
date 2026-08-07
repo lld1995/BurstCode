@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.137",
+  "version": "0.1.138",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -487,9 +487,10 @@
           "description": "When the LLM stream is interrupted by a transient error (network drop, server reset, HTTP 5xx, etc.), automatically retry the in-flight turn instead of ending the run with an error."
         },
         "burstcode.agent.maxAutoResumes": {
-          "type": "number",
-          "default": 2,
-          "description": "Maximum number of consecutive auto-resumes after a stream interruption before surfacing the error. The counter resets after a successful streaming turn."
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Maximum number of consecutive retries after an LLM stream interruption. Set to 0 for unlimited retries. Retry delays grow exponentially and are capped at 120 seconds; the counter resets after a successful streaming turn."
         },
         "burstcode.agent.maxStuckRepeats": {
           "type": "number",

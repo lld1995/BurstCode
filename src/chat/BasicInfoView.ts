@@ -101,6 +101,7 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     const chatModel = chatProfile.model || chatProfile.models[0] || '';
     const bgProfile = readBackgroundProfile();
     const bg = vscode.workspace.getConfiguration('burstcode.background');
+    const agent = vscode.workspace.getConfiguration('burstcode.agent');
     const shell = vscode.workspace.getConfiguration('burstcode.shell');
     const web = vscode.workspace.getConfiguration('burstcode.web');
     const mcp = vscode.workspace.getConfiguration('burstcode.mcp');
@@ -108,6 +109,7 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
 
     const bgEnabled = bg.get<boolean>('enabled') ?? false;
     const bgRunTests = bg.get<boolean>('runGeneratedTests') ?? false;
+    const maxAutoResumes = Math.max(0, Math.floor(agent.get<number>('maxAutoResumes') ?? 0));
     const bgOutputDir = (bg.get<string>('outputDir') ?? '.burstcode').trim() || '.burstcode';
 
     const shellEnabled = shell.get<boolean>('enabled') ?? true;
@@ -191,6 +193,16 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
           command: 'workbench.action.openSettings',
           title: 'Open Video Profile Settings',
           arguments: ['burstcode.llm.video']
+        }
+      }),
+      new BasicNode('leaf', t('models.llmRetries'), {
+        description: maxAutoResumes === 0 ? t('models.llmRetries.unlimited') : t('models.llmRetries.count', maxAutoResumes),
+        icon: 'sync',
+        tooltip: t('models.llmRetries.tip'),
+        command: {
+          command: 'workbench.action.openSettings',
+          title: 'Configure LLM Retry Limit',
+          arguments: ['burstcode.agent.maxAutoResumes']
         }
       })
     ];
