@@ -1948,7 +1948,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (isActive()) this.broadcastContextUsage();
     void this.persistSession(session);
 
-    const llmCfg = this.llmConfigForSession(session);
+    const llmCfg = { ...this.llmConfigForSession(session), supportsVision: activeModelSupportsVision };
     const client = new OpenAIClient(llmCfg, this.logger);
     const bridge = new LspBridge(
       vscode.workspace.getConfiguration('burstcode.lsp').get<number>('maxWaitMs') ?? 60000

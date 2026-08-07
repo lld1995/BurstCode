@@ -9,6 +9,8 @@ export interface LLMConfig {
   model: string;
   temperature: number;
   contextWindow: number;
+  /** Image content is sent only when vision support is explicitly confirmed. */
+  supportsVision?: boolean;
   /** Skip TLS cert verification for the configured baseURL (self-signed corporate endpoints). */
   allowSelfSignedCerts?: boolean;
 }
@@ -758,16 +760,7 @@ export async function fetchProfileModels(profile: {
   const entries: FetchedModelEntry[] = res.data
     .filter((m) => typeof m.id === 'string' && !!m.id)
     .map((m) => {
-      // Some gateways (e.g. OpenRouter, LiteLLM, One-API) expose a
-      // `capabilities` object on the model record with boolean vision flags.
-      const cap = (m as unknown as Record<string, unknown>).capabilities as
-        | Record<string, unknown>
-        | undefined;
-      const supportsVision =
-        !!cap?.vision ||
-        !!cap?.images ||
-        !!(cap?.input_modalities as string[] | undefined)?.includes('image');
-      return { id: m.id, supportsVision };
+      return { id: m.id, supportsVision: modelRecordSupportsVision(m as unknown as Record<string, unknown>) };
     });
   entries.sort((a, b) => a.id.localeCompare(b.id));
   return entries;
@@ -779,6 +772,22 @@ export async function fetchProfileModels(profile: {
  * IDE restarts; the model picker can show the previously-fetched ids
  * immediately and only re-hit the network when the user clicks Refresh.
  */
+/**
+ * Read vision metadata conservatively. Several OpenAI-compatible gateways emit
+ * string values such as `"false"`; coercing those with `!!value` incorrectly
+ * marks text-only models as vision-capable.
+ */
+export function modelRecordSupportsVision(model: Record<string, unknown>): boolean {
+  const cap = model.capabilities;
+  if (!cap || typeof cap !== 'object' || Array.isArray(cap)) return false;
+  const capabilities = cap as Record<string, unknown>;
+  if (capabilities.vision === true || capabilities.images === true) return true;
+  const modalities = capabilities.input_modalities;
+  return Array.isArray(modalities) && modalities.some(
+    (value) => typeof value === 'string' && value.toLowerCase() === 'image'
+  );
+}
+
 const FETCHED_MODELS_CACHE_KEY = 'burstcode.llm.fetchedModelsCache.v1';
 
 export interface FetchedModelEntry {
@@ -809,13 +818,17 @@ export function getCachedFetchedModels(
   const cache = readFetchedModelsCache(memento);
   const entry = cache[url];
   if (!entry || !Array.isArray(entry.models)) return null;
-  // Normalise: entries might be bare strings from an older cache version.
+  // Normalise all cache generations defensively. Older persisted entries may
+  // contain gateway values such as supportsVision: "false". Returning those
+  // objects as-is makes `!!cachedEntry.supportsVision` true and incorrectly
+  // re-enables image_url for text-only models until globalState is cleared.
   const models: FetchedModelEntry[] = entry.models
     .map((m: unknown): FetchedModelEntry | null => {
       if (typeof m === 'string' && m) return { id: m, supportsVision: false };
-      if (m && typeof (m as FetchedModelEntry).id === 'string' && (m as FetchedModelEntry).id)
-        return m as FetchedModelEntry;
-      return null;
+      if (!m || typeof m !== 'object') return null;
+      const record = m as Record<string, unknown>;
+      if (typeof record.id !== 'string' || !record.id) return null;
+      return { id: record.id, supportsVision: record.supportsVision === true };
     })
     .filter((m): m is FetchedModelEntry => m !== null);
   const fetchedAt = typeof entry.fetchedAt === 'number' ? entry.fetchedAt : 0;
@@ -1055,7 +1068,36 @@ function stripAssistantReasoningContent(messages: ChatMessage[]): ChatMessage[] 
  *   Backfill `reasoning_content: ''` when the field is absent so Qwen-thinking
  *   endpoints always receive a shape-correct request body.
  */
-function prepareMessagesForModel(messages: ChatMessage[], model: string): ChatMessage[] {
+function stripImageContent(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    const filtered = (message.content as Array<unknown>).filter((part) => {
+      if (!part || typeof part !== 'object') return true;
+      return (part as { type?: unknown }).type !== 'image_url';
+    });
+    if (filtered.length === message.content.length) return message;
+    return {
+      ...message,
+      content: filtered.length > 0
+        ? filtered as typeof message.content
+        : message.role === 'user'
+          ? '[Image omitted because the current model does not support vision.]'
+          : null
+    } as ChatMessage;
+  });
+}
+
+/** Detect the strict text-only schema error returned by OpenAI-compatible providers. */
+export function isImageContentRejectedError(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error ?? '');
+  return /image_url/i.test(text) && /(?:unknown variant|expected [`'"]?text|deserialize|invalid_params|HTTP 400)/i.test(text);
+}
+
+export function prepareMessagesForModel(
+  messages: ChatMessage[],
+  model: string,
+  supportsVision?: boolean
+): ChatMessage[] {
   const modelLower = model.toLowerCase();
   let out: ChatMessage[];
   if (modelLower.includes('claude')) {
@@ -1096,7 +1138,12 @@ function prepareMessagesForModel(messages: ChatMessage[], model: string): ChatMe
   //       message.
   // sanitizeToolPairing strips any unpaired tool_calls and orphan tool
   // replies so the body is always valid regardless of how history got here.
-  return enforceToolCallPairing(out);
+  // Fail closed: image_url is allowed only when the caller explicitly proved
+  // that the active model supports vision. Background/sub-agent callers do not
+  // always carry model capability metadata, and treating `undefined` as vision
+  // support can leak images from persisted history into a text-only endpoint.
+  const capabilitySafe = supportsVision === true ? out : stripImageContent(out);
+  return enforceToolCallPairing(capabilitySafe);
 }
 
 /**
@@ -1242,7 +1289,11 @@ export class OpenAIClient {
 
     // Normalise the message history for the target model before sending.
     // See prepareMessagesForModel for the per-model rules.
-    const safeMessages = prepareMessagesForModel(messages, this.config.model);
+    const safeMessages = prepareMessagesForModel(
+      messages,
+      this.config.model,
+      this.config.supportsVision
+    );
 
     // Some models (e.g. claude-* via OpenAI-compatible endpoints, or the same
     // models accessed via OpenRouter as "anthropic/claude-*") reject the
@@ -1252,9 +1303,11 @@ export class OpenAIClient {
     const isGemini = modelLower.includes('gemini');
     const supportsTemperature = !modelLower.includes('claude');
 
-    const buildRequest = (): OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & Record<string, unknown> => ({
+    const buildRequest = (
+      requestMessages: ChatMessage[] = safeMessages
+    ): OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & Record<string, unknown> => ({
       model: this.config.model,
-      messages: safeMessages,
+      messages: requestMessages,
       tools: tools.length ? tools : undefined,
       tool_choice: tools.length ? 'auto' : undefined,
       // Encourage the model to batch independent tool calls into a single
@@ -1402,14 +1455,36 @@ export class OpenAIClient {
         if (m.role === 'assistant') {
           const am = m as typeof m & { tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> };
           if (Array.isArray(am.tool_calls) && am.tool_calls.length > 0) {
-            const replay = am.tool_calls
-              .map((tc) =>
-                `<|DSML|invoke name="${tc.function?.name ?? ''}"><|DSML|parameter name="arguments" string="true">${tc.function?.arguments ?? '{}'}<\/|DSML|parameter><\/|DSML|invoke>`
-              )
-              .join('\n');
+            const replayable: string[] = [];
+            const compacted: string[] = [];
+            for (const tc of am.tool_calls) {
+              const name = tc.function?.name ?? '';
+              const args = tc.function?.arguments ?? '{}';
+              let isCompacted = false;
+              try {
+                const parsed = JSON.parse(args) as Record<string, unknown>;
+                const keys = Object.keys(parsed);
+                isCompacted = keys.length > 0 && keys.every((key) =>
+                  key === '_elided' || key === '_truncated' || key === '_omitted'
+                );
+              } catch {
+                // Preserve malformed historical arguments verbatim; AgentLoop owns
+                // live-call JSON repair, while this adapter only changes transport.
+              }
+              if (isCompacted) {
+                compacted.push(`[historical ${name || 'tool'} call: arguments removed by context compaction]`);
+              } else {
+                replayable.push(
+                  `<|DSML|invoke name="${name}"><|DSML|parameter name="arguments" string="true">${args}<\/|DSML|parameter><\/|DSML|invoke>`
+                );
+              }
+            }
+            const replay = replayable.length > 0
+              ? `<|DSML|tool_calls>\n${replayable.join('\n')}\n<\/|DSML|tool_calls>`
+              : '';
             return {
               role: 'assistant' as const,
-              content: `${toGeminiText(am.content)}\n<|DSML|tool_calls>\n${replay}\n<\/|DSML|tool_calls>`.trim()
+              content: [toGeminiText(am.content), ...compacted, replay].filter(Boolean).join('\n').trim()
             };
           }
         }
@@ -1521,8 +1596,27 @@ export class OpenAIClient {
         return;
       }
 
-      for await (const c of streamSdkOnce(this.client, buildRequest(), ac.signal)) {
-        yield c;
+      let emitted = false;
+      try {
+        for await (const c of streamSdkOnce(this.client, buildRequest(), ac.signal)) {
+          emitted = true;
+          yield c;
+        }
+      } catch (error) {
+        // Last-resort compatibility at the actual HTTP boundary. Capability
+        // metadata can be stale or simply wrong; if a provider explicitly says
+        // its message schema does not accept image_url, retry the untouched turn
+        // once with image blocks removed. Only retry before any stream output so
+        // content/tool-call deltas can never be duplicated.
+        const textOnlyMessages = stripImageContent(safeMessages);
+        const hadImages = JSON.stringify(textOnlyMessages) !== JSON.stringify(safeMessages);
+        if (emitted || !hadImages || !isImageContentRejectedError(error)) throw error;
+        this.logger.warn(
+          `Provider rejected image_url for model ${this.config.model}; retrying once with text-only history.`
+        );
+        for await (const c of streamSdkOnce(this.client, buildRequest(textOnlyMessages), ac.signal)) {
+          yield c;
+        }
       }
     } finally {
       sub.dispose();

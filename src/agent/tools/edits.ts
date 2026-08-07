@@ -442,27 +442,6 @@ export function buildEditTools(
               enum: ['edit', 'delete_lines', 'replace_lines'],
               description: "Optional mode selector. Use 'delete_lines' for pure line-range deletion, 'replace_lines' for whole-line replacement by line number, or omit/use 'edit' for normal edits[]."
             },
-            path: { type: 'string', description: "Single-file shortcut for operation='delete_lines'/'replace_lines', or fallback path for edits[]." },
-            startLine: { type: 'number', description: "Single-range shortcut for operation='delete_lines'/'replace_lines'. 1-indexed inclusive first line." },
-            endLine: { type: 'number', description: "Single-range shortcut for operation='delete_lines'/'replace_lines'. 1-indexed inclusive last line." },
-            ranges: {
-              type: 'array',
-              description: "Batch form for operation='delete_lines' or operation='replace_lines'. Each range must include path/startLine/endLine; replace_lines ranges must also include newText.",
-              items: {
-                type: 'object',
-                properties: {
-                  path: { type: 'string' },
-                  startLine: { type: 'number' },
-                  endLine: { type: 'number' },
-                  newText: { type: 'string', description: "Replacement text for operation='replace_lines'. Omit for delete_lines." },
-                  expectedReadVersion: {
-                    type: 'string',
-                    description: 'Optional read snapshot token returned by read_file/collect_context; lets line-range edits detect/re-anchor drift.'
-                  }
-                },
-                required: ['path', 'startLine', 'endLine']
-              }
-            },
             edits: {
               type: 'array',
               items: {
@@ -495,6 +474,24 @@ export function buildEditTools(
                   }
                 },
                 required: ['path', 'newText']
+              }
+            },
+            path: { type: 'string', description: "Single-file shortcut for operation='delete_lines'/'replace_lines', or fallback path for edits[]." },
+            startLine: { type: 'number', description: "Single-range shortcut for operation='delete_lines'/'replace_lines'. 1-indexed inclusive first line." },
+            endLine: { type: 'number', description: "Single-range shortcut for operation='delete_lines'/'replace_lines'. 1-indexed inclusive last line." },
+            ranges: {
+              type: 'array',
+              description: "Batch form for operation='delete_lines' or operation='replace_lines'. Each range must include path/startLine/endLine; replace_lines ranges must also include newText.",
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string' },
+                  startLine: { type: 'number' },
+                  endLine: { type: 'number' },
+                  newText: { type: 'string', description: "Replacement text for operation='replace_lines'. Omit for delete_lines." },
+                  expectedReadVersion: { type: 'string', description: 'Optional read snapshot token returned by read_file/collect_context; lets line-range edits detect/re-anchor drift.' }
+                },
+                required: ['path', 'startLine', 'endLine']
               }
             }
           },
@@ -798,16 +795,6 @@ export function buildEditTools(
       }
       if (usedAlias) {
         aliasNotes.push(`top-level field 'edits' was sent as '${usedAlias}'`);
-      }
-      if (synthesizedDeleteLines) {
-        aliasNotes.push(
-          "operation='delete_lines' was converted into normal line-range deletion hunks with newText:'' and no oldText"
-        );
-      }
-      if (synthesizedReplaceLines) {
-        aliasNotes.push(
-          "operation='replace_lines' was converted into normal line-range replacement hunks with no oldText"
-        );
       }
       if (aliasedPathKey) {
         aliasNotes.push(`per-edit field 'path' was sent as '${aliasedPathKey}'`);

@@ -152,10 +152,6 @@ function buildDsmlArguments(params: Record<string, unknown>): string {
   if (keys.length === 1) {
     const key = keys[0];
     const value = params[key];
-    // Be tolerant of common LLM variants:
-    //   <parameter name="json_arg">{"path":"..."}</parameter>
-    //   <parameter name="arguments" string="true">{"path":"..."}</parameter>
-    // Both should become the tool's argument object, not { json_arg: ... }.
     if ((key === 'json_arg' || key === 'arguments') && value && typeof value === 'object' && !Array.isArray(value)) {
       return JSON.stringify(value);
     }
@@ -168,7 +164,6 @@ function extractDsmlInvokesFromText(text: string): AccumulatedToolCall[] {
   const dsml = '[|｜]DSML[|｜]';
   const invokeRe = new RegExp(`<${dsml}invoke\\b([^>]*)>([\\s\\S]*?)<\\/${dsml}invoke>`, 'g');
   const paramRe = new RegExp(`<${dsml}parameter\\b([^>]*)>([\\s\\S]*?)<\\/${dsml}parameter>`, 'g');
-
   let invoke: RegExpExecArray | null;
   while ((invoke = invokeRe.exec(text))) {
     const invokeAttrs = parseDsmlAttributes(invoke[1]);
@@ -192,10 +187,11 @@ function extractDsmlToolCalls(text: string): { text: string; calls: AccumulatedT
   const dsml = '[|｜]DSML[|｜]';
   const blockRe = new RegExp(`<${dsml}tool_calls\\b[^>]*>([\\s\\S]*?)<\\/${dsml}tool_calls>`, 'g');
 
-  const calls = extractDsmlInvokesFromText(text);
-  const cleaned = calls.length > 0
-    ? text.replace(blockRe, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd()
-    : text;
+  const calls: AccumulatedToolCall[] = [];
+  const cleaned = text.replace(blockRe, (_full, body: string) => {
+    calls.push(...extractDsmlInvokesFromText(body));
+    return '';
+  }).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd();
 
   return { text: cleaned, calls };
 }
