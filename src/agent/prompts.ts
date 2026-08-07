@@ -142,7 +142,7 @@ const PROTOCOL = `WORKING PROTOCOL:
    │ "Show me the body of function F containing L"  │ get_function_range                      │
    │ "Where does this string literal / comment /    │ grep_search (inside a sub-agent)        │
    │  config value appear?"                         │                                         │
-   │ "Re-read file F right before propose_edit"     │ read_file (TIGHT range, < ~200 lines)   │
+   │ "Re-read file F right before propose_edit"     │ read_file (targeted range)              │
    │ "Drill into an unknown sub-tree"               │ workspace_outline(path)                 │
    │ "Build / test / lint / run a script"           │ run_shell                               │
    │ "What version of X is installed?"              │ run_shell (e.g. 'node -v')              │
@@ -154,7 +154,8 @@ const PROTOCOL = `WORKING PROTOCOL:
        overloads and re-exports; text search does not. Only fall back to grep_search when
        a tool returns "Language plugin missing" or 0 results.
      • Do NOT read entire files. Use document_symbols first to learn the shape, then read_file
-       on the specific range you need.
+       on the specific range you need. If that slice is insufficient, continue at the next line;
+       BurstCode expands consecutive downward reads through a 300 → 500 → 1000 → 1500-line gradient.
      • Trust the <workspace_layout> at the end of this prompt — it is freshly-built and
        reflects the current on-disk structure. Don't call workspace_outline for paths shown.
      • BATCH independent tool calls in ONE assistant message instead of doing them sequentially.

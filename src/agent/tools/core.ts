@@ -37,7 +37,22 @@ function resolveUri(target: string): vscode.Uri {
   return vscode.Uri.file(absPath);
 }
 
-export function buildReadFileTool(applier?: HunkApplier, sessionId?: string): Tool {
+export interface ReadWindowTracker {
+  /** Last completed slice per normalized path, shared by read_file and collect_context. */
+  readonly lastByPath: Map<string, { end: number; continuationCount: number }>;
+}
+
+export function createReadWindowTracker(): ReadWindowTracker {
+  return { lastByPath: new Map() };
+}
+
+const READ_CONTINUATION_GRADIENT = [300, 500, 1000, 1500] as const;
+
+export function buildReadFileTool(
+  applier?: HunkApplier,
+  sessionId?: string,
+  readWindowTracker: ReadWindowTracker = createReadWindowTracker()
+): Tool {
   return {
     name: 'read_file',
     schema: {
@@ -47,6 +62,7 @@ export function buildReadFileTool(applier?: HunkApplier, sessionId?: string): To
         description:
           'Read a slice of a workspace file with 1-indexed line numbers. ' +
           'Use for a SINGLE targeted follow-up read when you already know the exact file and line range. ' +
+          'When repeatedly continuing directly below the previous slice of the same file, BurstCode automatically expands short requests to at least 300, then 500, 1000, and finally 1500 lines, avoiding many tiny reads. ' +
           'To read 2+ files or combine a read with a grep, use collect_context instead — it runs everything concurrently in one round-trip.',
         parameters: {
           type: 'object',
@@ -69,6 +85,7 @@ export function buildReadFileTool(applier?: HunkApplier, sessionId?: string): To
       }
       const target = String(args.path);
       const uri = resolveUri(target);
+      const trackerKey = uri.toString().toLowerCase();
       let rawLines: string[];
       let pendingNote = '';
       const pendingContent = applier?.getPendingModifiedContent(uri);
@@ -93,9 +110,20 @@ export function buildReadFileTool(applier?: HunkApplier, sessionId?: string): To
       const total = rawLines.length;
       const start = Math.max(1, Number(args.startLine) || 1);
       const full = args.full === true || args.full === 'true';
-      const end = full
-        ? total
-        : Math.min(total, Number(args.endLine) || Math.min(total, start + 199));
+      const previous = readWindowTracker.lastByPath.get(trackerKey);
+      const isDirectContinuation = !full && previous !== undefined && start === previous.end + 1;
+      const continuationCount = isDirectContinuation ? previous.continuationCount + 1 : 0;
+      const requestedEnd = Number(args.endLine) || Math.min(total, start + 199);
+      const gradientIndex = Math.min(Math.max(0, continuationCount - 1), READ_CONTINUATION_GRADIENT.length - 1);
+      const minimumWindow = isDirectContinuation ? READ_CONTINUATION_GRADIENT[gradientIndex] : 0;
+      const expandedEnd = minimumWindow > 0
+        ? Math.max(requestedEnd, start + minimumWindow - 1)
+        : requestedEnd;
+      const end = full ? total : Math.min(total, expandedEnd);
+      readWindowTracker.lastByPath.set(trackerKey, { end, continuationCount });
+      const expansionNote = !full && end > Math.min(total, requestedEnd)
+        ? ` [continued-read gradient expanded requested end ${requestedEnd} to ${end} (${end - start + 1} lines)]`
+        : '';
       const lines: string[] = [];
       for (let i = start - 1; i < end; i++) {
         lines.push(`${(i + 1).toString().padStart(5)}\t${rawLines[i] ?? ''}`);
@@ -145,7 +173,7 @@ export function buildReadFileTool(applier?: HunkApplier, sessionId?: string): To
         : '';
 
       return {
-        content: `# ${vscode.workspace.asRelativePath(uri)} (lines ${start}-${end} of ${total})${pendingNote}${readVersionNote}\n${lines.join('\n')}${hunkMap}`,
+        content: `# ${vscode.workspace.asRelativePath(uri)} (lines ${start}-${end} of ${total})${pendingNote}${expansionNote}${readVersionNote}\n${lines.join('\n')}${hunkMap}`,
         meta: { uri: uri.toString(), totalLines: total, start, end, hasReviewPendingEdits: pendingContent !== undefined, readVersion }
       };
     }
@@ -647,8 +675,12 @@ const CC_MAX_OUTLINES = 8;
 const CC_MAX_SECTION_CHARS = 14_000;
 const CC_MAX_TOTAL_CHARS = 64_000;
 
-export function buildCollectContextTool(applier?: HunkApplier, sessionId?: string): Tool {
-  const readFileTool = buildReadFileTool(applier, sessionId);
+export function buildCollectContextTool(
+  applier?: HunkApplier,
+  sessionId?: string,
+  readWindowTracker: ReadWindowTracker = createReadWindowTracker()
+): Tool {
+  const readFileTool = buildReadFileTool(applier, sessionId, readWindowTracker);
 
   return {
     name: 'collect_context',
@@ -677,7 +709,7 @@ export function buildCollectContextTool(applier?: HunkApplier, sessionId?: strin
                 properties: {
                   path: { type: 'string', description: 'Workspace-relative or absolute path.' },
                   startLine: { type: 'number', description: '1-indexed start line (inclusive). Defaults to 1.' },
-                  endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200; collect_context returns only this slice, not the whole file.' },
+                  endLine: { type: 'number', description: '1-indexed end line (inclusive). Defaults to startLine+200. Direct continuations below the prior slice are automatically expanded through the 300/500/1000/1500-line gradient.' },
                   full: { type: 'boolean', description: 'When true, read from startLine through the file end. Use sparingly; prefer targeted windows for large files.' }
                 },
                 required: ['path']

@@ -24,6 +24,7 @@ import { AgentLoop } from '../agent/AgentLoop';
 import {
   buildReadFileTool,
   buildCollectContextTool,
+  createReadWindowTracker,
   listDirTool,
   grepSearchTool,
   workspaceOutlineTool
@@ -927,7 +928,8 @@ export class BackgroundExplorer implements vscode.Disposable {
 
     try {
       const client = new OpenAIClient(llm, this.logger);
-      const tools = [buildCollectContextTool(), buildReadFileTool(), listDirTool, grepSearchTool, workspaceOutlineTool];
+      const readWindowTracker = createReadWindowTracker();
+      const tools = [buildCollectContextTool(undefined, undefined, readWindowTracker), buildReadFileTool(undefined, undefined, readWindowTracker), listDirTool, grepSearchTool, workspaceOutlineTool];
       const agent = new AgentLoop(client, tools, this.hunkApplier, this.logger, {
         contextWindow: llm.contextWindow,
         maxIterations: 12,

@@ -24,7 +24,7 @@ import { LspBridge } from '../lsp/LspBridge';
 import { estimateMessagesTokens } from '../llm/tokenizer';
 import { AgentLoop } from '../agent/AgentLoop';
 import { Tool } from '../agent/tools/types';
-import { buildReadFileTool, buildWriteFileTool, buildCollectContextTool, listDirTool, grepSearchTool, workspaceOutlineTool } from '../agent/tools/core';
+import { buildReadFileTool, buildWriteFileTool, buildCollectContextTool, createReadWindowTracker, listDirTool, grepSearchTool, workspaceOutlineTool } from '../agent/tools/core';
 import { readWebpageTool, webSearchTool } from '../agent/tools/web';
 import { buildImageTool } from '../agent/tools/image';
 import { buildVideoTool } from '../agent/tools/video';
@@ -1999,7 +1999,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const systemPrompt = await systemPromptPromise;
     const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
-    const coreReadTools: Tool[] = [buildCollectContextTool(this.applier, session.id), buildReadFileTool(this.applier, session.id), listDirTool, grepSearchTool, workspaceOutlineTool, webSearchTool, readWebpageTool];
+    const readWindowTracker = createReadWindowTracker();
+    const coreReadTools: Tool[] = [buildCollectContextTool(this.applier, session.id, readWindowTracker), buildReadFileTool(this.applier, session.id, readWindowTracker), listDirTool, grepSearchTool, workspaceOutlineTool, webSearchTool, readWebpageTool];
     const writeFileTool = buildWriteFileTool(this.applier, session.id, messageIndex);
     const lspTools = buildLspTools(bridge, this.depGuard);
     const editTools = buildEditTools(this.applier, askUser, session.id, messageIndex);
