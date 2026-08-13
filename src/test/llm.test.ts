@@ -73,6 +73,21 @@ describe('image_url provider rejection detection', () => {
 
   test('does not swallow unrelated 400 errors', () => {
     assert.equal(isImageContentRejectedError(new Error('HTTP 400 invalid tool schema')), false);
+    assert.equal(isImageContentRejectedError(new Error('HTTP 400: messages.1.role is invalid')), false);
+  });
+
+  test('matches the content.type text-only validator error that never names image_url', () => {
+    const error = new Error(
+      'HTTP 400: {"error":{"code":"400","type":"invalid params","message":"The request is invalid: messages.content.type 参数非法, 取值范围 [\'text\']"}}'
+    );
+    assert.equal(isImageContentRejectedError(error), true);
+  });
+
+  test('matches English content.type allowed-value errors', () => {
+    assert.equal(
+      isImageContentRejectedError(new Error("HTTP 400: messages.content.type must be one of ['text']")),
+      true
+    );
   });
 });
 

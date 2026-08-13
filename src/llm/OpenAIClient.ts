@@ -1087,10 +1087,32 @@ function stripImageContent(messages: ChatMessage[]): ChatMessage[] {
   });
 }
 
-/** Detect the strict text-only schema error returned by OpenAI-compatible providers. */
+/**
+ * Detect the strict text-only schema error returned by OpenAI-compatible
+ * providers. Two flavours have been seen in the wild:
+ *
+ *   1. serde-style rejections that name the offending variant explicitly:
+ *        400 Provider z1: Failed to deserialize messages[108]:
+ *        unknown variant `image_url`, expected `text`
+ *   2. Validators that never name image_url and only state that message
+ *      content parts must have type 'text' — e.g.
+ *        HTTP 400: The request is invalid: messages.content.type 参数非法,
+ *        取值范围 ['text']
+ *      The only non-text content.type BurstCode ever sends is image_url, so
+ *      this shape is safe to treat as an image rejection.
+ */
 export function isImageContentRejectedError(error: unknown): boolean {
   const text = error instanceof Error ? error.message : String(error ?? '');
-  return /image_url/i.test(text) && /(?:unknown variant|expected [`'"]?text|deserialize|invalid_params|HTTP 400)/i.test(text);
+  const namesImageUrl =
+    /image_url/i.test(text) &&
+    /(?:unknown variant|expected [`'"]?text|deserialize|invalid_params|HTTP 400)/i.test(text);
+  if (namesImageUrl) return true;
+  // Variant 2: content.type rejected with an allowed-value list of just 'text'.
+  const mentionsContentType = /content\.type/i.test(text);
+  const allowsOnlyText =
+    /\[\s*['"`]text['"`]\s*\]/i.test(text) ||
+    /取值范围[\s\S]{0,30}?['"`\[]text/i.test(text);
+  return mentionsContentType && allowsOnlyText;
 }
 
 export function prepareMessagesForModel(
