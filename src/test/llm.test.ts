@@ -105,6 +105,49 @@ describe('prepareMessagesForModel vision compatibility', () => {
 
     assert.equal(prepared[1].content, '[Tool returned no output.]');
   });
+
+  test('omits assistant tool-call content that is only an empty text block', () => {
+    const prepared = prepareMessagesForModel([
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: '' }],
+        tool_calls: [{ id: 'call_4', type: 'function', function: { name: 'read_file', arguments: '{}' } }]
+      },
+      { role: 'tool', tool_call_id: 'call_4', content: 'ok' }
+    ] as unknown as ChatMessage[], 'claude-compatible', false);
+
+    assert.equal(Object.prototype.hasOwnProperty.call(prepared[0], 'content'), false);
+    assert.equal(prepared[1].content, 'ok');
+  });
+
+  test('gives a tool-call-less assistant message with an empty text block a placeholder', () => {
+    const prepared = prepareMessagesForModel([
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: [{ type: 'text', text: '' }] }
+    ] as unknown as ChatMessage[], 'claude-compatible', false);
+
+    const assistant = prepared[1];
+    assert.equal(typeof assistant.content, 'string');
+    assert.equal((assistant.content as string).trim().length > 0, true);
+  });
+
+  test('repairs an empty text block left in a user message', () => {
+    const prepared = prepareMessagesForModel([
+      { role: 'user', content: [{ type: 'text', text: '' }] }
+    ] as unknown as ChatMessage[], 'claude-compatible', false);
+
+    assert.equal(typeof prepared[0].content, 'string');
+    assert.equal((prepared[0].content as string).trim().length > 0, true);
+  });
+
+  test('drops only the empty text block from a mixed content array', () => {
+    const prepared = prepareMessagesForModel([
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: [{ type: 'text', text: '' }, { type: 'text', text: 'real answer' }] }
+    ] as unknown as ChatMessage[], 'claude-compatible', false);
+
+    assert.deepEqual(prepared[1].content, [{ type: 'text', text: 'real answer' }]);
+  });
 });
 
 describe('image_url provider rejection detection', () => {

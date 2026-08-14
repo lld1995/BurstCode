@@ -1249,23 +1249,70 @@ function enforceToolCallPairing(messages: ChatMessage[]): ChatMessage[] {
       if (m.role === 'user' || m.role === 'system') activeIds = null;
     }
   }
-  // Never turn a legitimate assistant tool-call `content: null` into "".
-  // Anthropic-style gateways translate null/empty content into an empty text
-  // block and reject the entire request with "text content blocks must be
-  // non-empty". Omitting content lets the gateway represent the turn solely
-  // by its tool-call blocks, while also avoiding null-enumeration bugs in some
-  // OpenAI-compatible .NET proxies. Check "" too because persisted histories
-  // created by older versions may already contain the former normalisation.
-  // A null/empty tool result instead needs an explicit non-empty textual result.
-  return out.map((m) => {
-    if (m.role === 'assistant' && (m.content == null || m.content === '')) {
-      const { content: _content, ...withoutContent } = m;
-      return withoutContent as ChatMessage;
+  // Final guarantee against the Anthropic-style rejection
+  //   400 messages: text content blocks must be non-empty
+  // This fires not only for null/"" string content but ALSO for array content
+  // that contains an empty `text` block, e.g. `[{ type: 'text', text: '' }]`.
+  // Persisted histories from older versions are the main source of these: a
+  // cancelled/interrupted stream, a stripped thinking/image block, or an older
+  // normalisation can all leave behind an empty text part that only surfaces
+  // when the session is reopened and re-sent.
+  return sanitizeEmptyContentBlocks(out);
+}
+
+/**
+ * Drop empty/whitespace-only `text` blocks from array content and repair any
+ * message that ends up with no usable content, so the request always satisfies
+ * the strict "text content blocks must be non-empty" rule of Anthropic-style
+ * gateways. Rules per role once content is empty after cleaning:
+ *   - assistant WITH tool_calls            -> omit `content` (turn carried by tool_use)
+ *   - tool                                 -> explicit non-empty placeholder result
+ *   - user / system / assistant w/o calls  -> non-empty placeholder text
+ */
+function sanitizeEmptyContentBlocks(messages: ChatMessage[]): ChatMessage[] {
+  const hasToolCalls = (m: ChatMessage): boolean => {
+    const calls = (m as { tool_calls?: unknown }).tool_calls;
+    return Array.isArray(calls) && calls.length > 0;
+  };
+
+  return messages.map((m) => {
+    const content = m.content;
+
+    // Clean array content by dropping malformed and empty/whitespace text blocks.
+    let usable: unknown = content;
+    if (Array.isArray(content)) {
+      usable = (content as Array<unknown>).filter((block) => {
+        if (!block || typeof block !== 'object') return false;
+        const b = block as Record<string, unknown>;
+        if (b.type === 'text') {
+          const t = typeof b.text === 'string' ? b.text : '';
+          return t.trim().length > 0;
+        }
+        return true;
+      });
     }
-    if (m.role === 'tool' && (m.content == null || m.content === '')) {
+
+    const isEmpty =
+      usable == null ||
+      (typeof usable === 'string' && usable.trim().length === 0) ||
+      (Array.isArray(usable) && usable.length === 0);
+
+    if (!isEmpty) {
+      // Persist the cleaned array only when we actually removed something.
+      if (Array.isArray(content) && Array.isArray(usable) && usable.length !== content.length) {
+        return { ...m, content: usable } as ChatMessage;
+      }
+      return m;
+    }
+
+    if (m.role === 'assistant' && hasToolCalls(m)) {
+      const { content: _content, ...rest } = m;
+      return rest as ChatMessage;
+    }
+    if (m.role === 'tool') {
       return { ...m, content: '[Tool returned no output.]' } as ChatMessage;
     }
-    return m;
+    return { ...m, content: '.' } as ChatMessage;
   });
 }
 
