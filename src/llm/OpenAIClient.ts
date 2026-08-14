@@ -1249,15 +1249,21 @@ function enforceToolCallPairing(messages: ChatMessage[]): ChatMessage[] {
       if (m.role === 'user' || m.role === 'system') activeIds = null;
     }
   }
-  // Some OpenAI-compatible gateways (e.g. MiniMax-M3 and other .NET-based
-  // proxies) iterate `content` as a multimodal array and call LINQ on it,
-  // throwing `Value cannot be null. (Parameter 'source')` when an assistant
-  // tool_call message (whose content is legitimately null per the OpenAI
-  // spec) or a tool reply carries `content: null`. Normalise those to "" so
-  // the body never sends a null content the gateway can choke on.
+  // Never turn a legitimate assistant tool-call `content: null` into "".
+  // Anthropic-style gateways translate null/empty content into an empty text
+  // block and reject the entire request with "text content blocks must be
+  // non-empty". Omitting content lets the gateway represent the turn solely
+  // by its tool-call blocks, while also avoiding null-enumeration bugs in some
+  // OpenAI-compatible .NET proxies. Check "" too because persisted histories
+  // created by older versions may already contain the former normalisation.
+  // A null/empty tool result instead needs an explicit non-empty textual result.
   return out.map((m) => {
-    if ((m.role === 'assistant' || m.role === 'tool') && m.content == null) {
-      return { ...m, content: '' } as ChatMessage;
+    if (m.role === 'assistant' && (m.content == null || m.content === '')) {
+      const { content: _content, ...withoutContent } = m;
+      return withoutContent as ChatMessage;
+    }
+    if (m.role === 'tool' && (m.content == null || m.content === '')) {
+      return { ...m, content: '[Tool returned no output.]' } as ChatMessage;
     }
     return m;
   });

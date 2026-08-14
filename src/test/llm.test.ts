@@ -63,6 +63,48 @@ describe('prepareMessagesForModel vision compatibility', () => {
     assert.equal(JSON.stringify(prepared).includes('image_url'), false);
     assert.deepEqual(prepared[0].content, [{ type: 'text', text: 'historical answer' }]);
   });
+
+  test('omits null assistant tool-call content instead of emitting an empty text block', () => {
+    const prepared = prepareMessagesForModel([
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{}' } }]
+      },
+      { role: 'tool', tool_call_id: 'call_1', content: 'file contents' }
+    ], 'claude-compatible', false);
+
+    assert.equal(Object.prototype.hasOwnProperty.call(prepared[0], 'content'), false);
+    assert.equal(prepared[1].content, 'file contents');
+  });
+
+  test('also cleans empty content persisted by older versions', () => {
+    const prepared = prepareMessagesForModel([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'call_2', type: 'function', function: { name: 'read_file', arguments: '{}' } }]
+      },
+      { role: 'tool', tool_call_id: 'call_2', content: '' }
+    ], 'claude-compatible', false);
+
+    assert.equal(Object.prototype.hasOwnProperty.call(prepared[0], 'content'), false);
+    assert.equal(prepared[1].content, '[Tool returned no output.]');
+  });
+
+  test('replaces a malformed null tool result with non-empty text', () => {
+    const malformed = [
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call_3', type: 'function', function: { name: 'read_file', arguments: '{}' } }]
+      },
+      { role: 'tool', tool_call_id: 'call_3', content: null }
+    ] as unknown as ChatMessage[];
+    const prepared = prepareMessagesForModel(malformed, 'claude-compatible', false);
+
+    assert.equal(prepared[1].content, '[Tool returned no output.]');
+  });
 });
 
 describe('image_url provider rejection detection', () => {
