@@ -6762,22 +6762,26 @@ function updateReasoningControls() {
   reasoningToggle.disabled = !supports;
   const enabled = supports && reasoningToggle.checked && efforts.length > 0;
   reasoningEffort.innerHTML = '';
-  if (!efforts.includes(reasoningEffortValue)) reasoningEffortValue = efforts[0] || '';
-  efforts.forEach(function(value) {
+  if (reasoningEffortValue && !efforts.includes(reasoningEffortValue)) reasoningEffortValue = '';
+  [{ value: '', label: 'Auto' }].concat(efforts.map(function(value) {
+    return { value: value, label: value };
+  })).forEach(function(option) {
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = value;
-    button.dataset.effort = value;
-    button.className = value === reasoningEffortValue ? 'selected' : '';
+    button.textContent = option.label;
+    button.dataset.effort = option.value;
+    button.className = option.value === reasoningEffortValue ? 'selected' : '';
     button.disabled = !enabled;
-    button.setAttribute('aria-pressed', value === reasoningEffortValue ? 'true' : 'false');
+    button.setAttribute('aria-pressed', option.value === reasoningEffortValue ? 'true' : 'false');
     button.addEventListener('click', function() {
-      reasoningEffortValue = value;
+      reasoningEffortValue = option.value;
       updateReasoningControls();
     });
     reasoningEffort.appendChild(button);
   });
-  reasoningEffort.title = efforts.length ? '选择思考 effort' : '当前模型未提供 effort 选项';
+  reasoningEffort.title = efforts.length
+    ? 'Auto 不发送 reasoning_effort，由模型或网关自动选择'
+    : '当前模型未提供 effort 选项';
   reasoningEffort.setAttribute('aria-disabled', enabled ? 'false' : 'true');
   reasoningToggle.title = supports ? '开启/关闭思考' : '当前模型不支持思考';
 }

@@ -24,6 +24,9 @@ const newBtn = document.getElementById('newBtn');
 const cfgBtn = document.getElementById('cfgBtn');
 const modelPickerBtn = document.getElementById('modelPickerBtn');
 const modelPicker = document.getElementById('modelPicker');
+const reasoningToggle = document.getElementById('reasoningToggle');
+const reasoningEffort = document.getElementById('reasoningEffort');
+let reasoningEffortValue = '';
 const ctxUsageEl = document.getElementById('ctxUsage');
 const ctxUsagePctEl = ctxUsageEl.querySelector('.pct');
 const ctxUsageTokensEl = ctxUsageEl.querySelector('.tokens');
@@ -150,6 +153,7 @@ let lastUserActivityPostAt = 0;
 // stop forcing scroll so they can read freely; once they come back to the
 // bottom edge, auto-follow resumes.
 let autoScroll = true;
+let renderingTranscript = false;
 let pendingScrollFrame = 0;
 let pendingScrollForce = false;
 let lastManualScrollAt = 0;
@@ -249,13 +253,15 @@ function stopTaskDoneUserActivityListener() {
 		    // Best effort: webview audio may be blocked until the user has interacted.
 		  }
 		}
-		function startClientAlertSound(kind, intervalMs) {
-		  stopClientAlertSound(kind);
-		  unlockClientAlertAudio();
-		  playClientAlertSoundOnce(kind);
-		  const timer = setInterval(() => playClientAlertSoundOnce(kind), Math.max(250, Number(intervalMs) || 1000));
-		  clientAlertTimers.set(kind, timer);
-		}
+			function startClientAlertSound(kind, intervalMs) {
+			  stopClientAlertSound(kind);
+			  unlockClientAlertAudio();
+			  playClientAlertSoundOnce(kind);
+			  const parsed = Number(intervalMs);
+			  const ms = Math.max(250, Number.isFinite(parsed) && parsed > 0 ? parsed : 10000);
+			  const timer = setInterval(() => playClientAlertSoundOnce(kind), ms);
+			  clientAlertTimers.set(kind, timer);
+			}
 		function stopClientAlertSound(kind) {
 		  const timer = clientAlertTimers.get(kind);
 		  if (timer) clearInterval(timer);
@@ -307,6 +313,7 @@ log.addEventListener('pointerdown', markManualScrollIntent, { passive: true });
 log.addEventListener('scroll', () => {
   const atBottom = isLogAtBottom();
   if (Date.now() - lastManualScrollAt < 800 || atBottom) autoScroll = atBottom;
+  if (log.scrollTop < 120) requestOlderTranscript();
   scheduleLogVirtualization();
 }, { passive: true });
 if (typeof ResizeObserver !== 'undefined') {
@@ -319,6 +326,11 @@ const VIRT_OVERSCAN_PX = 900;
 const VIRT_MIN_ITEMS = 24;
 let virtFrame = 0;
 let virtPinnedEls = new WeakSet();
+let loadedTranscript = [];
+let loadedTranscriptSessionId = '';
+let loadedTranscriptOffset = 0;
+let loadedTranscriptTotal = 0;
+let loadingOlderTranscript = false;
 const virtParked = new WeakMap(); // el -> DocumentFragment of parked children
 function isLogVirtCandidate(el) {
   if (!el || el.nodeType !== 1) return false;
@@ -507,6 +519,11 @@ function restoreToolScroll(det, snap) {
   requestAnimationFrame(() => { apply(); requestAnimationFrame(apply); });
 }
 function forceScrollToBottom() {
+  // Rebuilding a paged transcript calls the normal message renderers, including
+  // addUserMsg(). Those renderers force-scroll for genuinely new prompts, but a
+  // queued forced rAF here would override renderTranscript's viewport restore
+  // after older messages are prepended.
+  if (renderingTranscript) return;
   autoScroll = true;
   scheduleScrollToBottom(true);
 }
@@ -1215,14 +1232,46 @@ function buildLessonEditor(existing) {
   return wrap;
 }
 
-function renderTranscript(entries) {
+function requestOlderTranscript() {
+  if (loadingOlderTranscript || !loadedTranscriptSessionId || loadedTranscriptOffset <= 0) return;
+  loadingOlderTranscript = true;
+  const btn = log.querySelector('.transcript-loader button');
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+  vscode.postMessage({
+    type: 'load-older-transcript',
+    payload: { id: loadedTranscriptSessionId, before: loadedTranscriptOffset }
+  });
+}
+
+function addTranscriptLoader() {
+  if (loadedTranscriptOffset <= 0) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'transcript-loader';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = loadingOlderTranscript
+    ? 'Loading…'
+    : 'Load earlier messages (' + loadedTranscriptOffset + ' remaining)';
+  btn.disabled = loadingOlderTranscript;
+  btn.onclick = requestOlderTranscript;
+  wrap.appendChild(btn);
+  log.insertBefore(wrap, log.firstChild);
+}
+
+function renderTranscript(entries, preserveViewport) {
+  const oldHeight = preserveViewport ? log.scrollHeight : 0;
+  const oldTop = preserveViewport ? log.scrollTop : 0;
+  const previousAutoScroll = autoScroll;
+  if (preserveViewport) autoScroll = false;
   log.innerHTML = '';
+  renderingTranscript = true;
   toolElements.clear();
   activeAssistantEl = null;
   activeReasoningEl = null;
   activeStreamingToolEl = null;
   virtPinnedEls = new WeakSet();
   if (!entries || entries.length === 0) {
+    renderingTranscript = false;
     showEmptyState();
     return;
   }
@@ -1252,7 +1301,14 @@ function renderTranscript(entries) {
       }
     }
   });
-  forceScrollToBottom();
+  renderingTranscript = false;
+  addTranscriptLoader();
+  if (preserveViewport) {
+    log.scrollTop = oldTop + Math.max(0, log.scrollHeight - oldHeight);
+    autoScroll = previousAutoScroll;
+  } else {
+    forceScrollToBottom();
+  }
   scheduleLogVirtualization();
 }
 
@@ -1289,7 +1345,8 @@ function replayLiveState(snap) {
       const pill = document.createElement('div');
       pill.className = 'iter-pill';
       const attempt = (p.payload && p.payload.attempt) || 1;
-      const max = (p.payload && p.payload.max) || 1;
+      const maxValue = p.payload && p.payload.max;
+      const max = maxValue === 0 ? '∞' : (maxValue || 1);
       pill.innerHTML = '<span class="pill">↻ auto-resume ' + attempt + '/' + max + '</span>';
       log.appendChild(observeLogChild(pill));
     }
@@ -2345,6 +2402,11 @@ window.addEventListener('message', (e) => {
     case 'reset':
       rollbackOverlay.classList.remove('active');
       log.innerHTML = '';
+      loadedTranscript = [];
+      loadedTranscriptSessionId = '';
+      loadedTranscriptOffset = 0;
+      loadedTranscriptTotal = 0;
+      loadingOlderTranscript = false;
       activeAssistantEl = null;
       activeReasoningEl = null;
       activeStreamingToolEl = null;
@@ -2363,7 +2425,12 @@ window.addEventListener('message', (e) => {
       showEmptyState();
       break;
     case 'load-session': {
-      renderTranscript(msg.payload.transcript || []);
+      loadedTranscript = Array.isArray(msg.payload.transcript) ? msg.payload.transcript : [];
+      loadedTranscriptSessionId = String(msg.payload.id || '');
+      loadedTranscriptOffset = Math.max(0, Number(msg.payload.transcriptOffset) || 0);
+      loadedTranscriptTotal = Math.max(loadedTranscript.length, Number(msg.payload.transcriptTotal) || 0);
+      loadingOlderTranscript = false;
+      renderTranscript(loadedTranscript, false);
       renderPlan(msg.payload.plan || []);
       runningTools.clear();
       currentIter = 0;
@@ -2379,6 +2446,16 @@ window.addEventListener('message', (e) => {
         const [st, lb] = map[loadedStatus] || ['idle', 'Idle'];
         setStatus(st, lb);
       }
+      break;
+    }
+    case 'older-transcript': {
+      if (String(msg.payload.id || '') !== loadedTranscriptSessionId) break;
+      const older = Array.isArray(msg.payload.transcript) ? msg.payload.transcript : [];
+      loadedTranscript = older.concat(loadedTranscript);
+      loadedTranscriptOffset = Math.max(0, Number(msg.payload.transcriptOffset) || 0);
+      loadedTranscriptTotal = Math.max(loadedTranscript.length, Number(msg.payload.transcriptTotal) || 0);
+      loadingOlderTranscript = false;
+      renderTranscript(loadedTranscript, true);
       break;
     }
     case 'live-state-replay': {
@@ -2578,7 +2655,8 @@ window.addEventListener('message', (e) => {
           }
         }
         const attempt = (msg.payload && msg.payload.attempt) || 1;
-        const max = (msg.payload && msg.payload.max) || 1;
+        const maxValue = msg.payload && msg.payload.max;
+        const max = maxValue === 0 ? '∞' : (maxValue || 1);
         const errText = (msg.payload && msg.payload.error) ? String(msg.payload.error) : 'stream interrupted';
         const pill = document.createElement('div');
         pill.className = 'iter-pill';
@@ -3141,7 +3219,7 @@ window.addEventListener('message', (e) => {
       const newChat = payload.chat || { baseURL: '', model: '', models: [] };
       const oldBaseURL = modelsState.chat.baseURL;
       modelsState.chat = newChat;
-      modelsState.active = payload.active || { model: modelsState.chat.model || '' };
+      modelsState.active = payload.active || { model: modelsState.chat.model || '', supportsReasoning: false, reasoningEffortValues: [] };
       modelsState.video = payload.video || modelsState.video || { resolution: '1280x720' };
       const cached = payload.fetched && Array.isArray(payload.fetched.models) ? payload.fetched : null;
       if (oldBaseURL !== newChat.baseURL) {
@@ -3160,6 +3238,7 @@ window.addEventListener('message', (e) => {
         modelsState.fetched.fetchedAt = cached.fetchedAt;
       }
       renderModelPickerLabel();
+      updateReasoningControls();
       if (modelPicker.classList.contains('open')) { renderModelPicker(); positionModelPicker(); }
       break;
     }
@@ -3171,6 +3250,7 @@ window.addEventListener('message', (e) => {
         error: error || null,
         fetchedAt: typeof fetchedAt === 'number' ? fetchedAt : (modelsState.fetched && modelsState.fetched.fetchedAt) || 0
       };
+      updateReasoningControls();
       if (modelPicker.classList.contains('open')) { renderModelPicker(); positionModelPicker(); }
       break;
     }
@@ -3569,7 +3649,7 @@ sendBtn.addEventListener('click', () => {
     // the server respond with an appropriate error if needed.
     console.warn('[burstcode] current model not flagged as vision-capable; sending anyway');
   }
-  vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked } });
+  vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
   pastedImages = [];
   renderAttachments();
   input.value = '';
@@ -3579,12 +3659,14 @@ sendBtn.addEventListener('click', () => {
 queueBtn.addEventListener('click', () => {
   const text = input.value.trim();
   if (!text) return;
-  vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked } });
+  vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
   input.value = '';
   autosizeInput();
   updateQueueButton();
 });
 
+reasoningToggle.addEventListener('change', updateReasoningControls);
+reasoningEffort.addEventListener('change', updateReasoningControls);
 input.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
   if (e.isComposing) return; // don't intercept while IME is composing
@@ -3622,10 +3704,45 @@ input.addEventListener('input', () => {
 // (or via the 'BurstCode: Background Explorer Model' command).
 const modelsState = {
   chat: { baseURL: '', model: '', models: [] },
-  active: { model: '', supportsVision: false },
+  active: { model: '', supportsVision: false, supportsReasoning: false, reasoningEffortValues: [] },
   fetched: { loading: false, models: null, error: null, fetchedAt: 0 },
   video: { resolution: '1280x720' }
 };
+
+function updateReasoningControls() {
+  const active = modelsState.active || {};
+  const fetched = Array.isArray(modelsState.fetched && modelsState.fetched.models) ? modelsState.fetched.models : [];
+  const entry = fetched.find(function(m) { return modelEntryId(m) === active.model; });
+  const supports = entry ? entry.supportsReasoning === true : active.supportsReasoning === true;
+  const efforts = entry && Array.isArray(entry.reasoningEffortValues)
+    ? entry.reasoningEffortValues
+    : (Array.isArray(active.reasoningEffortValues) ? active.reasoningEffortValues : []);
+  reasoningToggle.disabled = !supports;
+  const enabled = supports && reasoningToggle.checked && efforts.length > 0;
+  reasoningEffort.innerHTML = '';
+  if (reasoningEffortValue && !efforts.includes(reasoningEffortValue)) reasoningEffortValue = '';
+  [{ value: '', label: 'Auto' }].concat(efforts.map(function(value) {
+    return { value: value, label: value };
+  })).forEach(function(option) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = option.label;
+    button.dataset.effort = option.value;
+    button.className = option.value === reasoningEffortValue ? 'selected' : '';
+    button.disabled = !enabled;
+    button.setAttribute('aria-pressed', option.value === reasoningEffortValue ? 'true' : 'false');
+    button.addEventListener('click', function() {
+      reasoningEffortValue = option.value;
+      updateReasoningControls();
+    });
+    reasoningEffort.appendChild(button);
+  });
+  reasoningEffort.title = efforts.length
+    ? 'Auto 不发送 reasoning_effort，由模型或网关自动选择'
+    : '当前模型未提供 effort 选项';
+  reasoningEffort.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+  reasoningToggle.title = supports ? '开启/关闭思考' : '当前模型不支持思考';
+}
 
 function positionModelPicker() {
   const br = modelPickerBtn.getBoundingClientRect();
@@ -3669,6 +3786,7 @@ function renderModelPickerLabel() {
     fetchedEntry !== undefined
       ? modelEntrySupportsVision(fetchedEntry)
       : (!!a.supportsVision || modelSupportsVisionJS(String(a.model || '')));
+  updateReasoningControls();
   // Always allow image paste — tooltip shows support status only.
   input.title = currentModelSupportsVision
     ? '支持粘贴图片（模型已标记为视觉/VL）'
