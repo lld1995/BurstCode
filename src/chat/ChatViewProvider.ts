@@ -75,6 +75,8 @@ interface RunOptions {
   useRules?: boolean;
   useSkills?: boolean;
   useMcp?: boolean;
+  reasoningEnabled?: boolean;
+  reasoningEffort?: string;
 }
 
 function modelSupportsVision(model: string): boolean {
@@ -800,7 +802,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       payload: {
         active: {
           model: activeModel,
-          supportsVision
+          supportsVision,
+          supportsReasoning: cachedEntry?.supportsReasoning === true
+            || (cachedEntry?.reasoningEffortValues?.length ?? 0) > 0,
+          reasoningEffortValues: cachedEntry?.reasoningEffortValues ?? []
         },
         chat: {
           baseURL: chat.baseURL,
@@ -994,7 +999,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async handleMessage(msg: InboundMessage): Promise<void> {
     switch (msg.type) {
       case 'send': {
-        const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttachment[]; useRules?: boolean; useSkills?: boolean; useMcp?: boolean };
+        const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttachment[]; useRules?: boolean; useSkills?: boolean; useMcp?: boolean; reasoningEnabled?: boolean; reasoningEffort?: string };
         const images = Array.isArray(payload.images)
           ? payload.images
               .filter((img): img is ChatImageAttachment => {
@@ -1024,7 +1029,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           images,
           useRules: payload.useRules !== false,
           useSkills: payload.useSkills !== false,
-          useMcp: payload.useMcp !== false
+          useMcp: payload.useMcp !== false,
+          reasoningEnabled: payload.reasoningEnabled === true,
+          reasoningEffort: typeof payload.reasoningEffort === 'string' ? payload.reasoningEffort : undefined
         });
         break;
       }
@@ -1813,6 +1820,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // OR the gateway flag with the local heuristic: gateways often omit
     // capability metadata, so a cached false may just mean "unknown".
     const activeModelSupportsVision = !!cachedEntry?.supportsVision || modelSupportsVision(activeModel);
+    const requestedEffort = opts.reasoningEnabled === true ? String(opts.reasoningEffort ?? '').trim() : '';
+    const reasoningEfforts = cachedEntry?.reasoningEffortValues ?? [];
+    const reasoningEffort = requestedEffort && reasoningEfforts.includes(requestedEffort) ? requestedEffort : undefined;
     const sendImagesToLlm = images.length > 0 && activeModelSupportsVision;
     if (images.length > 0 && !activeModelSupportsVision) {
       // Avoid sending image_url parts to text-only models/gateways. The user may
@@ -1948,7 +1958,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (isActive()) this.broadcastContextUsage();
     void this.persistSession(session);
 
-    const llmCfg = { ...this.llmConfigForSession(session), supportsVision: activeModelSupportsVision };
+    const llmCfg = { ...this.llmConfigForSession(session), supportsVision: activeModelSupportsVision, reasoningEffort };
     const client = new OpenAIClient(llmCfg, this.logger);
     const bridge = new LspBridge(
       vscode.workspace.getConfiguration('burstcode.lsp').get<number>('maxWaitMs') ?? 60000
@@ -2446,6 +2456,19 @@ setTimeout(() => {
   #bgStatus[data-phase="error"] { color: var(--vscode-errorForeground); }
   #bgStatus[data-phase="disabled"], #bgStatus[data-phase="no-workspace"] { opacity: 0.5; }
   @keyframes bgPulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(0.85); } }
+  .reasoning-controls { display: inline-flex; align-items: center; gap: 5px; margin-left: 2px; }
+  .reasoning-toggle { display: inline-flex; align-items: center; gap: 4px; font-size: 0.78em; opacity: 0.8; cursor: pointer; user-select: none; }
+  .reasoning-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+  .reasoning-toggle .track { width: 22px; height: 12px; border-radius: 999px; background: var(--vscode-scrollbarSlider-background); position: relative; transition: background 0.15s; }
+  .reasoning-toggle .track::after { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-foreground); position: absolute; top: 2px; left: 2px; transition: transform 0.15s; }
+  .reasoning-toggle input:checked + .track { background: var(--vscode-charts-blue); }
+  .reasoning-toggle input:checked + .track::after { transform: translateX(10px); background: white; }
+  .reasoning-toggle input:disabled + .track { opacity: 0.35; }
+  .reasoning-effort { display: inline-flex; align-items: center; gap: 2px; }
+  .reasoning-effort button { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid transparent; border-radius: 4px; padding: 2px 5px; font-size: 0.76em; line-height: 1.2; cursor: pointer; }
+  .reasoning-effort button:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+  .reasoning-effort button.selected { color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
+  .reasoning-effort button:disabled { opacity: 0.45; cursor: default; }
   #modelPickerBtn { display: inline-flex; align-items: center; gap: 6px; background: transparent; color: var(--vscode-foreground); border: 1px solid transparent; border-radius: 6px; padding: 3px 8px 3px 6px; font-size: 0.8em; opacity: 0.7; cursor: pointer; max-width: 100%; transition: opacity 0.15s, background 0.15s, border-color 0.15s; }
   #modelPickerBtn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); border-color: var(--vscode-panel-border); }
   #modelPickerBtn[aria-expanded="true"] { opacity: 1; background: var(--vscode-toolbar-hoverBackground); border-color: var(--vscode-panel-border); }
@@ -2946,6 +2969,13 @@ setTimeout(() => {
         <span class="label"><span class="ep">No model</span></span>
         <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5l3 3 3-3"/></svg>
       </button>
+      <div id="reasoningControls" class="reasoning-controls" aria-label="Reasoning controls">
+        <label class="reasoning-toggle" title="Enable model reasoning">
+          <input id="reasoningToggle" type="checkbox" disabled>
+          <span class="track"></span><span class="reasoning-label">思考</span>
+        </label>
+        <div id="reasoningEffort" class="reasoning-effort" aria-label="Reasoning effort" role="group"></div>
+      </div>
       <div id="ctxUsage" data-level="ok" title="Context usage">
         <svg class="ring" viewBox="0 0 24 24" aria-hidden="true">
           <circle class="bg" cx="12" cy="12" r="9"/>
@@ -3036,6 +3066,9 @@ const newBtn = document.getElementById('newBtn');
 const cfgBtn = document.getElementById('cfgBtn');
 const modelPickerBtn = document.getElementById('modelPickerBtn');
 const modelPicker = document.getElementById('modelPicker');
+const reasoningToggle = document.getElementById('reasoningToggle');
+const reasoningEffort = document.getElementById('reasoningEffort');
+let reasoningEffortValue = '';
 const ctxUsageEl = document.getElementById('ctxUsage');
 const ctxUsagePctEl = ctxUsageEl.querySelector('.pct');
 const ctxUsageTokensEl = ctxUsageEl.querySelector('.tokens');
@@ -6228,7 +6261,7 @@ window.addEventListener('message', (e) => {
       const newChat = payload.chat || { baseURL: '', model: '', models: [] };
       const oldBaseURL = modelsState.chat.baseURL;
       modelsState.chat = newChat;
-      modelsState.active = payload.active || { model: modelsState.chat.model || '' };
+      modelsState.active = payload.active || { model: modelsState.chat.model || '', supportsReasoning: false, reasoningEffortValues: [] };
       modelsState.video = payload.video || modelsState.video || { resolution: '1280x720' };
       const cached = payload.fetched && Array.isArray(payload.fetched.models) ? payload.fetched : null;
       if (oldBaseURL !== newChat.baseURL) {
@@ -6247,6 +6280,7 @@ window.addEventListener('message', (e) => {
         modelsState.fetched.fetchedAt = cached.fetchedAt;
       }
       renderModelPickerLabel();
+      updateReasoningControls();
       if (modelPicker.classList.contains('open')) { renderModelPicker(); positionModelPicker(); }
       break;
     }
@@ -6258,6 +6292,7 @@ window.addEventListener('message', (e) => {
         error: error || null,
         fetchedAt: typeof fetchedAt === 'number' ? fetchedAt : (modelsState.fetched && modelsState.fetched.fetchedAt) || 0
       };
+      updateReasoningControls();
       if (modelPicker.classList.contains('open')) { renderModelPicker(); positionModelPicker(); }
       break;
     }
@@ -6656,7 +6691,7 @@ sendBtn.addEventListener('click', () => {
     // the server respond with an appropriate error if needed.
     console.warn('[burstcode] current model not flagged as vision-capable; sending anyway');
   }
-  vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked } });
+  vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
   pastedImages = [];
   renderAttachments();
   input.value = '';
@@ -6666,12 +6701,14 @@ sendBtn.addEventListener('click', () => {
 queueBtn.addEventListener('click', () => {
   const text = input.value.trim();
   if (!text) return;
-  vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked } });
+  vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
   input.value = '';
   autosizeInput();
   updateQueueButton();
 });
 
+reasoningToggle.addEventListener('change', updateReasoningControls);
+reasoningEffort.addEventListener('change', updateReasoningControls);
 input.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
   if (e.isComposing) return; // don't intercept while IME is composing
@@ -6709,10 +6746,41 @@ input.addEventListener('input', () => {
 // (or via the 'BurstCode: Background Explorer Model' command).
 const modelsState = {
   chat: { baseURL: '', model: '', models: [] },
-  active: { model: '', supportsVision: false },
+  active: { model: '', supportsVision: false, supportsReasoning: false, reasoningEffortValues: [] },
   fetched: { loading: false, models: null, error: null, fetchedAt: 0 },
   video: { resolution: '1280x720' }
 };
+
+function updateReasoningControls() {
+  const active = modelsState.active || {};
+  const fetched = Array.isArray(modelsState.fetched && modelsState.fetched.models) ? modelsState.fetched.models : [];
+  const entry = fetched.find(function(m) { return modelEntryId(m) === active.model; });
+  const supports = entry ? entry.supportsReasoning === true : active.supportsReasoning === true;
+  const efforts = entry && Array.isArray(entry.reasoningEffortValues)
+    ? entry.reasoningEffortValues
+    : (Array.isArray(active.reasoningEffortValues) ? active.reasoningEffortValues : []);
+  reasoningToggle.disabled = !supports;
+  const enabled = supports && reasoningToggle.checked && efforts.length > 0;
+  reasoningEffort.innerHTML = '';
+  if (!efforts.includes(reasoningEffortValue)) reasoningEffortValue = efforts[0] || '';
+  efforts.forEach(function(value) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = value;
+    button.dataset.effort = value;
+    button.className = value === reasoningEffortValue ? 'selected' : '';
+    button.disabled = !enabled;
+    button.setAttribute('aria-pressed', value === reasoningEffortValue ? 'true' : 'false');
+    button.addEventListener('click', function() {
+      reasoningEffortValue = value;
+      updateReasoningControls();
+    });
+    reasoningEffort.appendChild(button);
+  });
+  reasoningEffort.title = efforts.length ? '选择思考 effort' : '当前模型未提供 effort 选项';
+  reasoningEffort.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+  reasoningToggle.title = supports ? '开启/关闭思考' : '当前模型不支持思考';
+}
 
 function positionModelPicker() {
   const br = modelPickerBtn.getBoundingClientRect();
@@ -6756,6 +6824,7 @@ function renderModelPickerLabel() {
     fetchedEntry !== undefined
       ? modelEntrySupportsVision(fetchedEntry)
       : (!!a.supportsVision || modelSupportsVisionJS(String(a.model || '')));
+  updateReasoningControls();
   // Always allow image paste — tooltip shows support status only.
   input.title = currentModelSupportsVision
     ? '支持粘贴图片（模型已标记为视觉/VL）'

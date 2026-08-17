@@ -11,6 +11,8 @@ export interface LLMConfig {
   contextWindow: number;
   /** Image content is sent only when vision support is explicitly confirmed. */
   supportsVision?: boolean;
+  /** Gateway-supported reasoning effort for this chat request. */
+  reasoningEffort?: string;
   /** Skip TLS cert verification for the configured baseURL (self-signed corporate endpoints). */
   allowSelfSignedCerts?: boolean;
 }
@@ -760,7 +762,13 @@ export async function fetchProfileModels(profile: {
   const entries: FetchedModelEntry[] = res.data
     .filter((m) => typeof m.id === 'string' && !!m.id)
     .map((m) => {
-      return { id: m.id, supportsVision: modelRecordSupportsVision(m as unknown as Record<string, unknown>) };
+      const record = m as unknown as Record<string, unknown>;
+      return {
+        id: m.id,
+        supportsVision: modelRecordSupportsVision(record),
+        reasoningEffortValues: modelRecordReasoningEfforts(record),
+        supportsReasoning: modelRecordSupportsReasoning(record)
+      };
     });
   entries.sort((a, b) => a.id.localeCompare(b.id));
   return entries;
@@ -788,11 +796,31 @@ export function modelRecordSupportsVision(model: Record<string, unknown>): boole
   );
 }
 
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((v): v is string => typeof v === 'string' && !!v.trim()).map((v) => v.trim())
+    : [];
+}
+
+export function modelRecordReasoningEfforts(model: Record<string, unknown>): string[] {
+  return stringArray(model.reasoning_effort_values ?? model.reasoningEffortValues);
+}
+
+export function modelRecordSupportsReasoning(model: Record<string, unknown>): boolean {
+  const capabilities = stringArray(model.capabilities).map((v) => v.toLowerCase());
+  return model.supportsReasoning === true
+    || model.supports_reasoning === true
+    || capabilities.includes('reasoning')
+    || modelRecordReasoningEfforts(model).length > 0;
+}
+
 const FETCHED_MODELS_CACHE_KEY = 'burstcode.llm.fetchedModelsCache.v1';
 
 export interface FetchedModelEntry {
   id: string;
   supportsVision: boolean;
+  supportsReasoning?: boolean;
+  reasoningEffortValues?: string[];
 }
 
 export interface FetchedModelsCacheEntry {
@@ -828,7 +856,14 @@ export function getCachedFetchedModels(
       if (!m || typeof m !== 'object') return null;
       const record = m as Record<string, unknown>;
       if (typeof record.id !== 'string' || !record.id) return null;
-      return { id: record.id, supportsVision: record.supportsVision === true };
+      const efforts = stringArray(record.reasoningEffortValues ?? record.reasoning_effort_values);
+      const supportsReasoning = record.supportsReasoning === true
+        || record.supports_reasoning === true
+        || record.supports_reasoning_effort === true
+        || efforts.length > 0;
+      return supportsReasoning || efforts.length > 0
+        ? { id: record.id, supportsVision: record.supportsVision === true, supportsReasoning, reasoningEffortValues: efforts }
+        : { id: record.id, supportsVision: record.supportsVision === true };
     })
     .filter((m): m is FetchedModelEntry => m !== null);
   const fetchedAt = typeof entry.fetchedAt === 'number' ? entry.fetchedAt : 0;
@@ -1394,6 +1429,7 @@ export class OpenAIClient {
       // the whole request as INVALID_ARGUMENT.
       parallel_tool_calls: tools.length && !isGemini ? true : undefined,
       ...(supportsTemperature ? { temperature: this.config.temperature } : {}),
+      ...(this.config.reasoningEffort ? { reasoning_effort: this.config.reasoningEffort as never } : {}),
       // Gemini OpenAI-compatible adapters may synthesize an invalid native
       // safety_settings default (seen as GenerateContentRequest.safety_settings[4]
       // category predicate failures). Send an explicit empty array on the FIRST
