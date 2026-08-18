@@ -261,6 +261,20 @@ async function collectGitChanges(gitRoot: string, baseline: BaselineSnapshot, ap
   if (diffOutput) for (const p of diffOutput.split('\n')) if (p.trim()) allPaths.add(p.trim());
   if (untrackedOutput) for (const p of untrackedOutput.split('\n')) if (p.trim()) allPaths.add(p.trim());
 
+  // Git does not report deletion of an untracked file: once the shell removes
+  // it, it disappears from both `git diff` and `git ls-files --others`. Check
+  // pending new-file entries explicitly so their review cards do not linger.
+  if (applier) {
+    for (const entry of applier.pendingFiles()) {
+      if (!entry.isNewFile) continue;
+      try {
+        await vscode.workspace.fs.stat(entry.uri);
+      } catch {
+        await applier.discardPendingNewFileIfDeleted(entry.uri);
+      }
+    }
+  }
+
   for (const relPath of allPaths) {
     // Repository metadata and automation files are intentionally excluded from
     // shell-command review, including every file nested under `.github/`.
@@ -273,8 +287,21 @@ async function collectGitChanges(gitRoot: string, baseline: BaselineSnapshot, ap
     const absPath = path.join(gitRoot, relPath);
     const uri = vscode.Uri.file(absPath);
     const key = uri.toString();
-    // Skip files already pending in the review UI — they have their own baseline.
-    if (applier?.hasPendingForPath(key)) continue;
+    // A shell command may delete a file that was created by a pending edit.
+    // Remove that stale review entry instead of leaving a card for a file that
+    // no longer exists. Existing pending files retain their own baseline.
+    if (applier?.hasPendingForPath(key)) {
+      let fileExists = true;
+      try {
+        await vscode.workspace.fs.stat(uri);
+      } catch {
+        fileExists = false;
+      }
+      if (!fileExists) {
+        await applier.discardPendingNewFileIfDeleted(uri);
+      }
+      continue;
+    }
 
     // Original content from the git baseline (null if the file didn't exist).
     const gitPath = relPath.replace(/\\/g, '/');

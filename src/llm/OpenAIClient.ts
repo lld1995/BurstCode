@@ -11,7 +11,9 @@ export interface LLMConfig {
   contextWindow: number;
   /** Image content is sent only when vision support is explicitly confirmed. */
   supportsVision?: boolean;
-  /** Gateway-supported reasoning effort for this chat request. */
+  /** Whether reasoning should be enabled for this chat request. */
+  reasoningEnabled?: boolean;
+  /** Gateway-supported reasoning effort for this chat request; undefined means Auto. */
   reasoningEffort?: string;
   /** Skip TLS cert verification for the configured baseURL (self-signed corporate endpoints). */
   allowSelfSignedCerts?: boolean;
@@ -1429,7 +1431,32 @@ export class OpenAIClient {
       // the whole request as INVALID_ARGUMENT.
       parallel_tool_calls: tools.length && !isGemini ? true : undefined,
       ...(supportsTemperature ? { temperature: this.config.temperature } : {}),
-      ...(this.config.reasoningEffort ? { reasoning_effort: this.config.reasoningEffort as never } : {}),
+      // Carry both reasoning dialects used by supported OpenAI-compatible gateways:
+      // ZenMux consumes the top-level fields, while vLLM/Transformers gateways may
+      // read the chat-template kwargs. Auto deliberately omits both effort values.
+      ...(!isGemini
+        ? {
+            reasoning: {
+              enabled: this.config.reasoningEnabled === true,
+              ...(this.config.reasoningEnabled === true && this.config.reasoningEffort
+                ? { effort: this.config.reasoningEffort }
+                : {})
+            },
+            ...(this.config.reasoningEnabled === true && this.config.reasoningEffort
+              ? {
+                  reasoning_effort: this.config.reasoningEffort as NonNullable<
+                    OpenAI.Chat.Completions.ChatCompletionCreateParams['reasoning_effort']
+                  >
+                }
+              : {}),
+            chat_template_kwargs: {
+              thinking: this.config.reasoningEnabled === true,
+              ...(this.config.reasoningEnabled === true && this.config.reasoningEffort
+                ? { reasoning_effort: this.config.reasoningEffort }
+                : {})
+            }
+          }
+        : {}),
       // Gemini OpenAI-compatible adapters may synthesize an invalid native
       // safety_settings default (seen as GenerateContentRequest.safety_settings[4]
       // category predicate failures). Send an explicit empty array on the FIRST

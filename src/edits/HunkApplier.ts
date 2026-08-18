@@ -1243,6 +1243,41 @@ export class HunkApplier implements vscode.Disposable {
   }
 
   /**
+   * Remove a pending review entry when an external command deletes a file that
+   * was created by the pending edit. There is no useful Accept/Reject decision
+   * left in that case: the live file is already gone, and keeping the entry
+   * leaves a stale card in the pending-edits UI.
+   */
+  async discardPendingNewFileIfDeleted(uri: vscode.Uri): Promise<boolean> {
+    const key = uri.toString();
+    let discarded = false;
+    await this.withFileLock(key, async () => {
+      const entry = this.pending.get(key);
+      if (!entry || !entry.isNewFile) return;
+      try {
+        await vscode.workspace.fs.stat(uri);
+        return;
+      } catch {
+        // The file is genuinely absent; remove its stale review entry below.
+      }
+      this.pending.delete(key);
+      this.diffPreview.unregister(entry.proposedUri);
+      this.codeLensProvider.refresh();
+      const sessionIds = new Set(entry.hunks.map((h) => h.sessionId ?? ''));
+      for (const sessionId of sessionIds) this.diffOpenedForSessions.delete(sessionId);
+      if (this.pending.size === 0) this.cycleInitPromise = null;
+      discarded = true;
+    });
+    if (discarded) {
+      this.logger.info('Discarded pending new file after external deletion', {
+        uri: key
+      });
+      this.emitState();
+    }
+    return discarded;
+  }
+
+  /**
    * Look up a pending file by either its source `uri.toString()` key or a
    * workspace-relative / absolute fs path. The webview's propose_edit cards
    * only know the path string the model supplied, so we accept both forms.
