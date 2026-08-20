@@ -2,6 +2,7 @@
 .vscode-test/**
 src/**
 companion/**
+code-oss/**
 .gitignore
 .eslintrc*
 **/*.map

@@ -17,6 +17,9 @@ out/
 # --- BurstCode background explorer output ---
 .burstcode/
 
+# --- Code-OSS build workspace (huge, not part of extension source) ---
+code-oss/
+
 # --- Editor / IDE ---
 .idea/
 *.swp
