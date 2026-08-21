@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { Tool, ToolContext, ToolResult } from './types';
-import { generateImage, readImageConfig } from '../../llm/OpenAIClient';
+import { generateImage, readImageConfig, ImageAction } from '../../llm/OpenAIClient';
 import { Logger } from '../../util/Logger';
 
 function workspaceRoot(): string | undefined {
@@ -38,7 +38,7 @@ function slugify(text: string): string {
  * falling back to the chat profile). The bytes are written into the workspace
  * so the user can open / commit the result.
  */
-export function buildImageTool(logger: Logger): Tool {
+export function buildImageTool(logger: Logger, getDefaultImages?: () => Array<{ dataUrl: string; mimeType: string; name?: string }> | undefined): Tool {
   return {
     name: 'generate_image',
     parallelSafe: false,
@@ -48,30 +48,15 @@ export function buildImageTool(logger: Logger): Tool {
       function: {
         name: 'generate_image',
         description:
-          'Generate an image from a text prompt using the configured image model ' +
-          '(burstcode.llm.image, falls back to the chat endpoint). Image models such as ' +
-          'gpt-image-1 / gpt-image-2 / dall-e-3 are called via /v1/images/generations — ' +
-          'they CANNOT be used as the chat model. The generated PNG is saved into the ' +
-          'workspace and its path is returned. Use when the user asks to create / draw / ' +
-          'generate a picture, icon, illustration, or logo.',
+          'Generate a new image or edit attached images. Set action to edit when an input image is present and the user asks to modify it; attached chat images are used automatically.',
         parameters: {
           type: 'object',
           properties: {
-            prompt: {
-              type: 'string',
-              description: 'Detailed description of the image to generate (English usually works best).'
-            },
-            path: {
-              type: 'string',
-              description:
-                'Optional output path (workspace-relative or absolute) for the saved image. ' +
-                'When omitted, a file is created under ./generated-images/ with a slug derived from the prompt.'
-            },
-            size: {
-              type: 'string',
-              description:
-                'Optional image size, e.g. "1024x1024", "1024x1536", "1536x1024". Defaults to the configured size.'
-            }
+            prompt: { type: 'string', description: 'Detailed generation or editing instruction.' },
+            action: { type: 'string', enum: ['auto', 'generate', 'edit'], description: 'auto selects edit when images are attached.' },
+            imageUrl: { type: 'string', description: 'Optional data URL of an input image to edit.' },
+            path: { type: 'string', description: 'Optional output path.' },
+            size: { type: 'string', description: 'Optional image size.' }
           },
           required: ['prompt']
         }
@@ -83,6 +68,10 @@ export function buildImageTool(logger: Logger): Tool {
         return { content: 'generate_image: "prompt" is required.', isError: true };
       }
       const size = args.size ? String(args.size).trim() : undefined;
+      const action = String(args.action ?? 'auto') as ImageAction;
+      const argumentImages = args.imageUrl ? [String(args.imageUrl).trim()] : [];
+      const defaultImages = getDefaultImages?.() ?? [];
+      const imageDataUrls = [...argumentImages, ...defaultImages.map((image) => image.dataUrl)].filter(Boolean);
 
       const cfg = readImageConfig();
       if (!cfg.baseURL) {
@@ -100,7 +89,12 @@ export function buildImageTool(logger: Logger): Tool {
       const sub = ctx.cancellation.onCancellationRequested(() => ac.abort());
       let result;
       try {
-        result = await generateImage(cfg, prompt, { size, signal: ac.signal });
+        result = await generateImage(cfg, prompt, {
+          size,
+          action,
+          imageDataUrls,
+          signal: ac.signal
+        });
       } catch (err) {
         const msg = String((err as Error)?.message ?? err);
         logger.warn(`generate_image failed: ${msg}`);

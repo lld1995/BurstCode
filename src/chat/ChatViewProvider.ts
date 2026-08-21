@@ -2044,7 +2044,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ...buildLangTools(),
       ...editTools,
       writeFileTool,
-      buildImageTool(this.logger),
+      buildImageTool(this.logger, () => images),
       buildVideoTool(this.logger, () => images.length > 0 ? images : this.videoFrameImagesBySession.get(session.id)),
       ...buildShellTools({ askUser, applier: this.applier, sessionId: session.id, turnIndex: messageIndex }),
       buildPlanTool(onPlanUpdate),

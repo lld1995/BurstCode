@@ -58,7 +58,8 @@ export function openTunnel(
   proxy: URL,
   targetHost: string,
   targetPort: number,
-  useTls: boolean
+  useTls: boolean,
+  cancellation?: vscode.CancellationToken
 ): Promise<tls.TLSSocket | net.Socket> {
   return new Promise((resolve, reject) => {
     const proxyPort = parseInt(proxy.port || (proxy.protocol === 'https:' ? '443' : '80'), 10);
@@ -68,6 +69,8 @@ export function openTunnel(
       : undefined;
 
     let settled = false;
+    let activeSocket: net.Socket | tls.TLSSocket;
+    let cancellationDisposable: vscode.Disposable | undefined;
     const socket = net.connect(proxyPort, proxyHost, () => {
       const lines = [
         `CONNECT ${targetHost}:${targetPort} HTTP/1.1`,
@@ -77,13 +80,20 @@ export function openTunnel(
       if (proxyAuth) lines.push(`Proxy-Authorization: ${proxyAuth}`);
       socket.write(`${lines.join('\r\n')}\r\n\r\n`);
     });
+    activeSocket = socket;
 
     const fail = (err: Error) => {
       if (settled) return;
       settled = true;
-      socket.destroy();
+      cancellationDisposable?.dispose();
+      activeSocket.destroy();
       reject(err);
     };
+    cancellationDisposable = cancellation?.onCancellationRequested(() => fail(new Error('Request cancelled')));
+    if (cancellation?.isCancellationRequested) {
+      fail(new Error('Request cancelled'));
+      return;
+    }
 
     const chunks: Buffer[] = [];
     socket.on('data', (chunk: Buffer) => {
@@ -104,10 +114,11 @@ export function openTunnel(
       }
 
       if (settled) return;
-      settled = true;
 
       if (!useTls) {
         if (leftover.length > 0) socket.unshift(leftover);
+        settled = true;
+        cancellationDisposable?.dispose();
         resolve(socket);
         return;
       }
@@ -118,16 +129,22 @@ export function openTunnel(
         servername: targetHost,
         rejectUnauthorized: false,
       });
+      activeSocket = tlsSocket;
       if (leftover.length > 0) tlsSocket.unshift(leftover);
-      tlsSocket.once('secureConnect', () => resolve(tlsSocket));
-      tlsSocket.once('error', (e) => reject(e));
+      tlsSocket.once('secureConnect', () => {
+        if (settled) return;
+        settled = true;
+        cancellationDisposable?.dispose();
+        resolve(tlsSocket);
+      });
+      tlsSocket.once('error', fail);
     });
 
     socket.once('error', fail);
     socket.setTimeout(TIMEOUT_MS, () => fail(new Error('Proxy connection timed out')));
   });
 }
-export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}): Promise<FetchResult> {
+export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}, cancellation?: vscode.CancellationToken): Promise<FetchResult> {
   return new Promise((resolve, reject) => {
     let parsed: URL;
     try {
@@ -158,7 +175,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
         try { next = new URL(res.headers.location, targetUrl).href; }
         catch { reject(new Error(`Redirect to invalid URL: ${res.headers.location}`)); return; }
         res.resume();
-        fetchUrl(next, redirectsLeft - 1, headers).then(resolve).catch(reject);
+        fetchUrl(next, redirectsLeft - 1, headers, cancellation).then(resolve).catch(reject);
         return;
       }
 
@@ -182,12 +199,24 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
     if (proxy) {
       // openTunnel handles CONNECT + TLS; send plain HTTP/1.1 directly over the socket
       // instead of using http.request (which ignores createConnection and re-connects).
-      openTunnel(proxy, parsed.hostname, targetPort, isHttps)
+      openTunnel(proxy, parsed.hostname, targetPort, isHttps, cancellation)
         .then((socket) => {
-          const timer = setTimeout(() => {
+          let settled = false;
+          const settleReject = (err: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            cancellationDisposable?.dispose();
             socket.destroy();
-            reject(new Error(`Request timed out after ${TIMEOUT_MS}ms`));
-          }, TIMEOUT_MS);
+            reject(err);
+          };
+          const timer = setTimeout(() => settleReject(new Error(`Request timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS);
+          let cancellationDisposable: vscode.Disposable | undefined;
+          cancellationDisposable = cancellation?.onCancellationRequested(() => settleReject(new Error('Request cancelled')));
+          if (cancellation?.isCancellationRequested) {
+            settleReject(new Error('Request cancelled'));
+            return;
+          }
 
           // Build raw HTTP/1.1 request
           const headerLines = Object.entries(reqHeaders)
@@ -197,9 +226,12 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
 
           const chunks: Buffer[] = [];
           socket.on('data', (chunk: Buffer) => chunks.push(chunk));
-          socket.once('error', (e) => { clearTimeout(timer); console.error('[BurstCode proxy req error]', e); reject(e); });
+          socket.once('error', (e) => { settleReject(e); });
           socket.once('end', () => {
+            if (settled) return;
+            settled = true;
             clearTimeout(timer);
+            cancellationDisposable?.dispose();
             const raw = Buffer.concat(chunks);
             const rawStr = raw.toString('binary');
             const headerEnd = rawStr.indexOf('\r\n\r\n');
@@ -220,7 +252,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
               let next: string;
               try { next = new URL(resHeaders['location'], targetUrl).href; }
               catch { reject(new Error(`Redirect to invalid URL: ${resHeaders['location']}`)); return; }
-              fetchUrl(next, redirectsLeft - 1, headers).then(resolve).catch(reject);
+              fetchUrl(next, redirectsLeft - 1, headers, cancellation).then(resolve).catch(reject);
               return;
             }
             resolve({
@@ -246,8 +278,27 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
         rejectUnauthorized: false,
         timeout: TIMEOUT_MS,
       }, handleResponse);
-      req.on('error', reject);
-      req.on('timeout', () => { req.destroy(); reject(new Error(`Request timed out after ${TIMEOUT_MS}ms`)); });
+      let settled = false;
+      let cancellationDisposable: vscode.Disposable | undefined;
+      const rejectAndDestroy = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        req.destroy();
+        cancellationDisposable?.dispose();
+        reject(err);
+      };
+      req.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        cancellationDisposable?.dispose();
+        reject(err);
+      });
+      req.on('timeout', () => rejectAndDestroy(new Error(`Request timed out after ${TIMEOUT_MS}ms`)));
+      cancellationDisposable = cancellation?.onCancellationRequested(() => rejectAndDestroy(new Error('Request cancelled')));
+      if (cancellation?.isCancellationRequested) {
+        rejectAndDestroy(new Error('Request cancelled'));
+        return;
+      }
       req.end();
     }
   });
@@ -400,8 +451,8 @@ interface SearchResult {
   snippet: string;
 }
 
-async function fetchSearchPage(url: string, headers: Record<string, string> = {}): Promise<string> {
-  const res = await fetchUrl(url, MAX_REDIRECTS, headers);
+async function fetchSearchPage(url: string, headers: Record<string, string> = {}, cancellation?: vscode.CancellationToken): Promise<string> {
+  const res = await fetchUrl(url, MAX_REDIRECTS, headers, cancellation);
   if (res.statusCode >= 400) {
     const detail = summarizeResponseBody(res.body.toString('utf-8'));
     throw new Error(`search provider returned HTTP ${res.statusCode}${detail ? ` — ${detail}` : ''}`);
@@ -518,7 +569,7 @@ function parseBraveResults(json: string, maxResults: number): SearchResult[] {
     .slice(0, maxResults);
 }
 
-async function duckduckgoSearch(query: string, maxResults: number): Promise<SearchResult[]> {
+async function duckduckgoSearch(query: string, maxResults: number, cancellation?: vscode.CancellationToken): Promise<SearchResult[]> {
   const encoded = encodeURIComponent(query);
   const braveKey = getBraveApiKey();
   const attempts: Array<{
@@ -549,7 +600,7 @@ async function duckduckgoSearch(query: string, maxResults: number): Promise<Sear
 
   for (const attempt of attempts) {
     try {
-      const body = await fetchSearchPage(attempt.url, attempt.headers);
+      const body = await fetchSearchPage(attempt.url, attempt.headers, cancellation);
       const results = attempt.parse(body, maxResults);
       if (results.length > 0) return results;
       failures.push(`${attempt.name}: no parseable results`);
@@ -562,7 +613,7 @@ async function duckduckgoSearch(query: string, maxResults: number): Promise<Sear
   throw new Error(failures.join('; '));
 }
 
-export async function testBraveSearchApi(query = 'BurstCode'): Promise<SearchResult[]> {
+export async function testBraveSearchApi(query = 'BurstCode', cancellation?: vscode.CancellationToken): Promise<SearchResult[]> {
   const braveKey = getBraveApiKey();
   if (!braveKey) {
     throw new Error('burstcode.web.braveApiKey is not configured');
@@ -574,7 +625,7 @@ export async function testBraveSearchApi(query = 'BurstCode'): Promise<SearchRes
     response = await fetchUrl(url, MAX_REDIRECTS, {
       'Accept': 'application/json',
       'X-Subscription-Token': braveKey,
-    });
+    }, cancellation);
   } catch (err) {
     console.error('[BurstCode Brave] fetchUrl error:', err);
     const msg = err instanceof Error
@@ -609,7 +660,6 @@ export async function testBraveSearchApi(query = 'BurstCode'): Promise<SearchRes
 export const webSearchTool: Tool = {
   name: 'web_search',
   parallelSafe: true,
-  noTimeout: true,
   schema: {
     type: 'function',
     function: {
@@ -645,7 +695,7 @@ export const webSearchTool: Tool = {
 
     let results: SearchResult[];
     try {
-      results = await duckduckgoSearch(query, maxResults);
+      results = await duckduckgoSearch(query, maxResults, ctx.cancellation);
     } catch (err) {
       return {
         content: `web_search: search failed — ${String((err as Error).message ?? err)}`,
@@ -682,7 +732,6 @@ export const webSearchTool: Tool = {
 export const readWebpageTool: Tool = {
   name: 'read_webpage',
   parallelSafe: true,
-  noTimeout: true,
   schema: {
     type: 'function',
     function: {
@@ -727,7 +776,7 @@ export const readWebpageTool: Tool = {
 
     let result: FetchResult;
     try {
-      result = await fetchUrl(url);
+      result = await fetchUrl(url, MAX_REDIRECTS, {}, ctx.cancellation);
     } catch (err) {
       return { content: `read_webpage: fetch failed — ${String((err as Error).message ?? err)}`, isError: true };
     }

@@ -166,16 +166,16 @@ export interface GeneratedImage {
   revisedPrompt?: string;
 }
 
+export type ImageAction = 'auto' | 'generate' | 'edit';
+
 /**
- * Generate one image via the OpenAI-compatible `/v1/images/generations`
- * endpoint. Prefers `response_format: b64_json` so the bytes come back inline
- * (no second download round-trip); falls back to fetching the returned URL
- * when an endpoint only supports URL responses.
+ * Generate or edit one image. Editing uses the Responses API image-generation
+ * tool, while generation keeps the broadly supported Images API path.
  */
 export async function generateImage(
   cfg: ImageConfig,
   prompt: string,
-  opts: { size?: string; signal?: AbortSignal } = {}
+  opts: { size?: string; signal?: AbortSignal; action?: ImageAction; imageDataUrls?: string[] } = {}
 ): Promise<GeneratedImage> {
   const clientOpts: ConstructorParameters<typeof OpenAI>[0] = {
     baseURL: cfg.baseURL,
@@ -186,15 +186,34 @@ export async function generateImage(
     clientOpts.httpAgent = new https.Agent({ rejectUnauthorized: false });
   }
   const client = new OpenAI(clientOpts);
+  const imageDataUrls = (opts.imageDataUrls ?? []).filter((value) => value.toLowerCase().startsWith('data:image/'));
+  const action = opts.action === 'auto' || !opts.action ? (imageDataUrls.length ? 'edit' : 'generate') : opts.action;
+
+  if (action === 'edit') {
+    if (!imageDataUrls.length) throw new Error('Image edit requires at least one input image.');
+    const input = [{
+      role: 'user',
+      content: [
+        { type: 'input_text', text: prompt },
+        ...imageDataUrls.map((image_url) => ({ type: 'input_image', image_url }))
+      ]
+    }];
+    const response = await (client as any).responses.create(
+      {
+        model: cfg.model,
+        input,
+        tools: [{ type: 'image_generation', action: 'edit', size: (opts.size || cfg.size || DEFAULT_IMAGE_SIZE).trim() }]
+      },
+      opts.signal ? { signal: opts.signal } : undefined
+    );
+    const call = (response.output ?? []).find((item: any) => item?.type === 'image_generation_call' && item?.result);
+    if (!call?.result) throw new Error('Image edit response contained no image data.');
+    return { data: Buffer.from(call.result, 'base64'), mimeType: 'image/png' };
+  }
 
   const size = (opts.size || cfg.size || DEFAULT_IMAGE_SIZE).trim();
   const res = await client.images.generate(
-    {
-      model: cfg.model,
-      prompt,
-      n: 1,
-      size: size as never
-    } as never,
+    { model: cfg.model, prompt, n: 1, size: size as never } as never,
     opts.signal ? { signal: opts.signal } : undefined
   );
 
