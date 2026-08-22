@@ -96,7 +96,11 @@ overflow. Follow these rules:
     • Re-reading the same file multiple times across turns without making an edit.
     • Broad file dumps (entire large files) when a tight line range suffices.
     • NEVER: use collect_context as a "first move" for broad exploration when you
-      already know the context window is large.`;
+      already know the context window is large.
+    • Oversized tool results are discarded (NOT truncated) when they exceed ~15% of
+      the context window. If you receive [tool-result-discarded], retry with a
+      narrower range, a more specific tool, or different arguments — do NOT repeat
+      the same call.`;
 
 const STATE_POINTER = `WORKSPACE STATE: a snapshot of the current workspace layout,
 recorded lessons, and active plan is appended at the END of this prompt (after

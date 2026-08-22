@@ -410,6 +410,144 @@ export function normalizeToolResult(toolName: string, content: string): string {
   return content;
 }
 
+/** Max fraction of the context window a SINGLE tool result may occupy. */
+export const TOOL_RESULT_MAX_CONTEXT_RATIO = 0.15;
+/** Floor so a tiny window still allows a useful read, and over-budget turns still accept small replies. */
+export const MIN_TOOL_RESULT_TOKEN_CAP = 2000;
+
+export interface ToolResultStorageOptions {
+  /** Total model context window in tokens. */
+  contextWindow: number;
+  /** Tokens already occupying the window (history + this turn) before this result. */
+  usedTokens?: number;
+  /** Original tool arguments, included in the discard hint so the model can change them. */
+  args?: Record<string, unknown>;
+}
+
+function cheapTokenEstimate(text: string): number {
+  if (!text) return 0;
+  // encode() on multi-megabyte payloads is expensive and pointless — we already
+  // know they exceed any reasonable cap. Fall back to the 4-chars-per-token heuristic.
+  if (text.length > 200_000) return Math.ceil(text.length / 4);
+  return estimateTokens(text);
+}
+
+function summarizeToolArgs(args?: Record<string, unknown>): string {
+  if (!args) return '';
+  try {
+    const slim: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(args)) {
+      if (typeof v === 'string' && v.length > 80) slim[k] = `${v.slice(0, 60)}…(${v.length} chars)`;
+      else if (Array.isArray(v)) slim[k] = `[${v.length} items]`;
+      else slim[k] = v;
+    }
+    const json = JSON.stringify(slim);
+    return json.length > 400 ? json.slice(0, 400) + '…' : json;
+  } catch {
+    return '';
+  }
+}
+
+function extractResultHeader(content: string): string {
+  const first = content.split('\n', 3).slice(0, 2).join('\n').trim();
+  if (!first) return '';
+  return first.length > 240 ? first.slice(0, 240) + '…' : first;
+}
+
+function retryHintForTool(toolName: string): string {
+  switch (toolName) {
+    case 'read_file':
+      return 'Use startLine/endLine for a tight slice (default 200 lines). Do not pass full:true on large files. Call document_symbols or grep_search first to locate the relevant range.';
+    case 'collect_context':
+      return 'Reduce files/searches, drop full:true, and use narrower startLine/endLine windows. Split into several smaller collect_context or read_file calls.';
+    case 'grep_search':
+      return 'Tighten the query, add a glob, and/or lower maxResults so the match list stays small.';
+    case 'get_function_range':
+      return 'The function body is too large to inject whole. Read a slice with read_file(startLine/endLine) instead.';
+    case 'run_shell':
+      return 'Re-run a more specific command (head/tail/rg) so stdout/stderr stays small.';
+    case 'workspace_outline':
+    case 'list_dir':
+      return 'Narrow the path, lower depth/maxBytes, or inspect one subdirectory at a time.';
+    case 'launch_subagent':
+      return 'Ask the subagent for a shorter summary, or split the work into smaller independent tasks.';
+    default:
+      return 'Retry with narrower arguments, a more specific tool, or launch_subagent if you only need a summary.';
+  }
+}
+
+export function toolResultTokenCap(opts: ToolResultStorageOptions): number {
+  const ctx = Math.max(0, opts.contextWindow || 0);
+  if (ctx <= 0) return Number.POSITIVE_INFINITY;
+  const singleCap = Math.max(MIN_TOOL_RESULT_TOKEN_CAP, Math.floor(ctx * TOOL_RESULT_MAX_CONTEXT_RATIO));
+  if (opts.usedTokens === undefined) return singleCap;
+  const remaining = ctx - Math.max(0, opts.usedTokens);
+  // Window already full: still accept a tiny error/discard notice, never a dump.
+  if (remaining <= 0) return MIN_TOOL_RESULT_TOKEN_CAP;
+  // Remaining room is a HARD cap — do not floor it back up to MIN, or a 2k
+  // result can still blow a nearly-full window.
+  return Math.min(singleCap, remaining);
+}
+
+function buildOversizedToolDiscardMessage(
+  toolName: string,
+  tokens: number,
+  cap: number,
+  contextWindow: number,
+  content: string,
+  args?: Record<string, unknown>
+): string {
+  const header = extractResultHeader(content);
+  const argsLine = summarizeToolArgs(args);
+  const lines = [
+    `[tool-result-discarded] ${toolName} returned ~${tokens.toLocaleString()} tokens, which exceeds the ${cap.toLocaleString()}-token cap (${Math.round(TOOL_RESULT_MAX_CONTEXT_RATIO * 100)}% of the ${contextWindow.toLocaleString()}-token context window, or remaining room). The result was NOT stored.`,
+    '',
+    'Do NOT repeat this call with the same arguments. Retry with a narrower method or parameters:',
+    retryHintForTool(toolName)
+  ];
+  if (header) lines.push('', `Header: ${header}`);
+  if (argsLine) lines.push(`Args: ${argsLine}`);
+  return lines.join('\n');
+}
+
+/**
+ * Normalize a tool result, then DISCARD it (do not truncate) when it would blow
+ * the configured context window. Oversized payloads in zone 0 survive compression
+ * and make the next request huge; refusing them forces the model to retry with
+ * a tighter range or a different tool.
+ */
+export function prepareToolResultForStorage(
+  toolName: string,
+  content: string,
+  opts: ToolResultStorageOptions
+): { content: string; discarded: boolean; tokens: number; cap: number } {
+  const normalized = normalizeToolResult(toolName, content);
+  const cap = toolResultTokenCap(opts);
+  if (!Number.isFinite(cap)) {
+    return { content: normalized, discarded: false, tokens: cheapTokenEstimate(normalized), cap };
+  }
+  // Cheap reject: even at a very conservative 8 chars/token this is over the cap,
+  // so skip the real tokenizer on megabyte dumps.
+  const definitelyOver = normalized.length > cap * 8;
+  const tokens = definitelyOver ? Math.ceil(normalized.length / 4) : cheapTokenEstimate(normalized);
+  if (tokens <= cap) {
+    return { content: normalized, discarded: false, tokens, cap };
+  }
+  return {
+    content: buildOversizedToolDiscardMessage(
+      toolName,
+      tokens,
+      cap,
+      Math.max(0, opts.contextWindow || 0),
+      normalized,
+      opts.args
+    ),
+    discarded: true,
+    tokens,
+    cap
+  };
+}
+
 /**
  * Ensure every `role: 'tool'` message references a `tool_call_id` declared on
  * a *preceding* assistant `tool_calls`, and that every assistant `tool_calls`

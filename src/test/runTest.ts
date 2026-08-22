@@ -6,3 +6,4 @@ import './register-vscode-mock';
 import './web.test';
 import './video.test';
 import './llm.test';
+import './compressor.test';

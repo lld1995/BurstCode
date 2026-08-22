@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { ChatMessage, OpenAIClient, ToolDef } from '../llm/OpenAIClient';
 import { Tool, ToolResult } from './tools/types';
 import { FALLBACK_SYSTEM_PROMPT } from './prompts';
-import { compressMessages, defaultCompressorConfig, normalizeToolResult, pruneOrphanedToolResults } from '../context/Compressor';
+import { compressMessages, defaultCompressorConfig, prepareToolResultForStorage, pruneOrphanedToolResults } from '../context/Compressor';
 import { estimateMessagesTokens } from '../llm/tokenizer';
 import { Logger } from '../util/Logger';
 import { extractFirstJsonObject, repairJsonControlChars, repairJsonUnescapedQuotes } from '../util/jsonRepair';
@@ -1592,6 +1592,10 @@ export class AgentLoop {
       consecutiveAutoContinues = 0;
       consecutivePrematureStopContinues = 0;
 
+      // Snapshot usage AFTER the assistant tool-call message is in history so
+      // the per-result size cap accounts for this turn's prompt, not last turn's.
+      const usedBeforeTools = estimateMessagesTokens(messages as Array<{ role: string; content: unknown }>);
+
       // Iterate the same filtered `toolCalls` array we used to build
       // assistantMsg.tool_calls so the tool_call_id we attach to each tool
       // reply ALWAYS matches an id on the preceding assistant message. Using
@@ -1784,7 +1788,7 @@ export class AgentLoop {
             if (c.name === 'propose_edit') {
               toolTokenSource = new vscode.CancellationTokenSource();
             }
-            return await c.tool.execute(c.parsed, {
+            const raw = await c.tool.execute(c.parsed, {
               cancellation: toolTokenSource?.token ?? cancellation,
               callId: c.callId,
               emitProgress: (message: string) => {
@@ -1794,6 +1798,22 @@ export class AgentLoop {
                 r?.();
               }
             });
+            const preparedResult = prepareToolResultForStorage(c.name, raw.content, {
+              contextWindow: ctxMax,
+              usedTokens: usedBeforeTools,
+              args: c.parsed
+            });
+            if (preparedResult.discarded) {
+              this.logger.warn(
+                `Discarded oversized ${c.name} result: ~${preparedResult.tokens} tokens > ${preparedResult.cap} cap (${ctxMax} window).`
+              );
+              return {
+                content: preparedResult.content,
+                isError: true,
+                meta: { ...(raw.meta ?? {}), discarded: true, tokens: preparedResult.tokens, cap: preparedResult.cap }
+              };
+            }
+            return preparedResult.content === raw.content ? raw : { ...raw, content: preparedResult.content };
           } finally {
             toolTokenSource?.dispose();
           }
@@ -2009,8 +2029,10 @@ export class AgentLoop {
 
       // Push tool replies back into conversation memory in ORIGINAL order so
       // every tool message lines up with its assistant tool_calls entry.
-      // normalizeToolResult applies per-tool content reductions before storage
-      // so the messages array stays lean from the start (grep caps, file caps, etc).
+      // prepareToolResultForStorage normalizes then DISCARDS (does not truncate)
+      // results that would blow the context window, so a single huge read cannot
+      // inflate the next request. The model gets a retry hint instead.
+      let usedForStorage = usedBeforeTools;
       for (let i = 0; i < prepared.length; i++) {
         const c = prepared[i];
         const result = results[i];
@@ -2023,14 +2045,30 @@ export class AgentLoop {
         // a synthetic reply so the pairing in the PERSISTENT history stays
         // valid (the request-time sanitizer in OpenAIClient is the safety net,
         // but keeping the stored array consistent avoids relying on it).
-        const storedContent = result
-          ? normalizeToolResult(c.name, result.content)
-          : 'Tool call was cancelled before it produced a result.';
+        let storedContent: string;
+        if (!result) {
+          storedContent = 'Tool call was cancelled before it produced a result.';
+        } else {
+          const preparedResult = prepareToolResultForStorage(c.name, result.content, {
+            contextWindow: ctxMax,
+            usedTokens: usedForStorage,
+            args: c.parsed
+          });
+          storedContent = preparedResult.content;
+          if (preparedResult.discarded) {
+            this.logger.warn(
+              `Discarded oversized ${c.name} result at storage: ~${preparedResult.tokens} tokens > ${preparedResult.cap} cap.`
+            );
+            result.content = storedContent;
+            result.isError = true;
+          }
+        }
         messages.push({
           role: 'tool',
           tool_call_id: c.callId,
           content: storedContent
         } as ChatMessage);
+        usedForStorage += Math.ceil(storedContent.length / 4) + 4;
       }
 
       // Context-budget awareness is handled at the next iteration boundary (see
