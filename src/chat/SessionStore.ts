@@ -177,6 +177,30 @@ export function buildTranscript(
   messages: ChatMessage[],
   checkpoints?: SessionCheckpoint[]
 ): TranscriptEntry[] {
+  return buildTranscriptRange(messages, checkpoints, 0, Number.POSITIVE_INFINITY).entries;
+}
+
+/**
+ * Build only one logical transcript window. Session messages can contain very
+ * large tool arguments/results, so callers that render one page must not first
+ * materialize and JSON-parse the entire transcript and slice it afterwards.
+ *
+ * The first pass counts cheap logical entries without parsing tool arguments;
+ * the second pass materializes only entries inside [start, end). Tool results
+ * still update the preceding tool-call entry, matching buildTranscript().
+ */
+export function buildTranscriptRange(
+  messages: ChatMessage[],
+  checkpoints: SessionCheckpoint[] | undefined,
+  requestedStart: number,
+  requestedEnd: number
+): { entries: TranscriptEntry[]; total: number } {
+  const start = Math.max(0, Math.floor(requestedStart));
+  const end = Number.isFinite(requestedEnd)
+    ? Math.max(start, Math.floor(requestedEnd))
+    : Number.POSITIVE_INFINITY;
+  let logicalIndex = 0;
+  let lastEntry: TranscriptEntry | undefined;
   const entries: TranscriptEntry[] = [];
   const refByIndex = new Map<number, string>();
   for (const c of checkpoints ?? []) {
@@ -206,14 +230,17 @@ export function buildTranscript(
         text.startsWith('[interrupted-generation]') ||
         text.startsWith('Your previous response was cut off');
       if (!isInternal) {
-        entries.push({
+        const entry: TranscriptEntry = {
           kind: 'user',
           text,
           messageIndex: i,
           checkpointRef: refByIndex.get(i),
           imageCount: summary.imageCount,
           imageUrls: summary.imageUrls
-        });
+        };
+        if (logicalIndex >= start && logicalIndex < end) entries.push(entry);
+        lastEntry = entry;
+        logicalIndex++;
       }
     } else if (m.role === 'assistant') {
       // Internal interrupted-draft assistant messages are fed back to the model
@@ -230,40 +257,53 @@ export function buildTranscript(
       // output) as a separate collapsible entry that precedes the answer.
       const reasoning = (m as unknown as { reasoning_content?: unknown }).reasoning_content;
       if (typeof reasoning === 'string' && reasoning.trim().length > 0) {
-        entries.push({ kind: 'reasoning', text: reasoning });
+        const entry: TranscriptEntry = { kind: 'reasoning', text: reasoning };
+        if (logicalIndex >= start && logicalIndex < end) entries.push(entry);
+        lastEntry = entry;
+        logicalIndex++;
       }
-      if (text) entries.push({ kind: 'assistant', text });
+      if (text) {
+        const entry: TranscriptEntry = { kind: 'assistant', text };
+        if (logicalIndex >= start && logicalIndex < end) entries.push(entry);
+        lastEntry = entry;
+        logicalIndex++;
+      }
       const calls =
         (m as unknown as { tool_calls?: Array<{ id?: string; function: { name: string; arguments: string } }> })
           .tool_calls ?? [];
       for (const c of calls) {
-        // Preserve the parsed arguments so the webview can rebuild the rich
-        // tool card (diff / read / collect) when this session is replayed from
-        // history. `text` starts as a placeholder and is overwritten by the
-        // matching tool-result message below.
+        const retained = logicalIndex >= start && logicalIndex < end;
+        // Parsing giant propose_edit/write_file arguments dominates session
+        // switching. Parse only calls that are actually part of this page.
         let parsedArgs: unknown;
-        try { parsedArgs = JSON.parse(c.function.arguments); } catch { parsedArgs = undefined; }
-        entries.push({
+        if (retained) {
+          try { parsedArgs = JSON.parse(c.function.arguments); } catch { parsedArgs = undefined; }
+        }
+        const entry: TranscriptEntry = {
           kind: 'tool',
           name: c.function.name,
-          text: '(call) ' + c.function.arguments,
+          text: retained ? '(call) ' + c.function.arguments : '(call)',
           args: parsedArgs
-        });
+        };
+        if (retained) entries.push(entry);
+        lastEntry = entry;
+        logicalIndex++;
       }
     } else if (m.role === 'tool') {
       const text = typeof m.content === 'string' ? m.content : '';
-      // Attach to last tool entry if name unknown.
-      const last = entries[entries.length - 1];
-      if (last && last.kind === 'tool' && last.text.startsWith('(call)')) {
-        // Overwrite the placeholder with the real result, but KEEP last.args /
-        // last.name so rich rendering still has the call arguments.
-        last.text = text;
+      // Attach to the preceding logical tool-call even when that call is just
+      // outside the requested page. A standalone result creates its own entry.
+      if (lastEntry?.kind === 'tool' && lastEntry.text.startsWith('(call)')) {
+        lastEntry.text = text;
       } else {
-        entries.push({ kind: 'tool', name: 'tool', text });
+        const entry: TranscriptEntry = { kind: 'tool', name: 'tool', text };
+        if (logicalIndex >= start && logicalIndex < end) entries.push(entry);
+        lastEntry = entry;
+        logicalIndex++;
       }
     }
   }
-  return entries;
+  return { entries, total: logicalIndex };
 }
 
 /**

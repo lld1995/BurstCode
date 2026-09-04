@@ -48,6 +48,7 @@ import {
   SessionStatus,
   SessionStore,
   buildTranscript,
+  buildTranscriptRange,
   createSessionId,
   deriveTitle,
   rebaseCheckpointsAfterMessageCompaction
@@ -742,8 +743,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'bg-status', payload: this.bgStatus });
   }
 
-  private broadcastContextUsage(): void {
+  private contextUsageRequest = 0;
+
+  private broadcastContextUsage(defer = false): void {
     if (!this.view) return;
+    if (defer && this.currentSession) {
+      const request = ++this.contextUsageRequest;
+      const sessionId = this.currentSession.id;
+      setTimeout(() => {
+        if (request !== this.contextUsageRequest || this.currentSession?.id !== sessionId) return;
+        this.broadcastContextUsage(false);
+      }, 0);
+      return;
+    }
+    this.contextUsageRequest++;
     const cfg = readLLMConfig();
     const used = this.currentSession
       ? estimateMessagesTokens(
@@ -853,16 +866,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // explicitly wanted to look at it.
     this.openTab(s.id);
     this.post({ type: 'reset' });
-    const fullTranscript = buildTranscript(s.messages, s.checkpoints);
-    const transcriptOffset = Math.max(0, fullTranscript.length - ChatViewProvider.TRANSCRIPT_PAGE_SIZE);
+    // Count first, then materialize/JSON-parse only the final visible page.
+    // Previously buildTranscript() expanded every historical tool call/result
+    // before slice(), so pagination reduced DOM work but not switch-time CPU or
+    // allocation pressure.
+    const counted = buildTranscriptRange(s.messages, s.checkpoints, 0, 0);
+    const transcriptOffset = Math.max(0, counted.total - ChatViewProvider.TRANSCRIPT_PAGE_SIZE);
+    const page = buildTranscriptRange(s.messages, s.checkpoints, transcriptOffset, counted.total);
     this.post({
       type: 'load-session',
       payload: {
         id: s.id,
         title: s.title,
-        transcript: fullTranscript.slice(transcriptOffset),
+        transcript: page.entries,
         transcriptOffset,
-        transcriptTotal: fullTranscript.length,
+        transcriptTotal: counted.total,
         plan: s.plan ?? [],
         status: this.effectiveStatus(s.id, s.status) ?? 'idle'
       }
@@ -875,7 +893,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.post({ type: 'live-state-replay', payload: this.serializeLive(ctx) });
     }
     this.broadcastSessions();
-    this.broadcastContextUsage();
+    // Exact tokenization walks every message and can be expensive for long
+    // sessions. Let the transcript reach the webview first.
+    this.broadcastContextUsage(true);
     this.broadcastModels();
     // Refresh the pending-edits banner so it shows THIS session's edits only.
     this.broadcastPendingEdits();
@@ -1144,16 +1164,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const live = this.runs.get(id)?.session;
         const session = live ?? this.sessions.get(id);
         if (!session) break;
-        const transcript = buildTranscript(session.messages, session.checkpoints);
-        const end = Math.min(before, transcript.length);
+        const end = before;
         const start = Math.max(0, end - ChatViewProvider.TRANSCRIPT_PAGE_SIZE);
+        const page = buildTranscriptRange(session.messages, session.checkpoints, start, end);
         this.post({
           type: 'older-transcript',
           payload: {
             id,
-            transcript: transcript.slice(start, end),
+            transcript: page.entries,
             transcriptOffset: start,
-            transcriptTotal: transcript.length
+            transcriptTotal: page.total
           }
         });
         break;
