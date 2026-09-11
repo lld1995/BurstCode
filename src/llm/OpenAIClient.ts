@@ -807,11 +807,18 @@ export async function fetchProfileModels(profile: {
  * marks text-only models as vision-capable.
  */
 export function modelRecordSupportsVision(model: Record<string, unknown>): boolean {
+  // Gateways are not consistent about where they put capability metadata:
+  // some use a nested `capabilities` object, while others (including the
+  // gateway's `/v1/models` response) expose `supports_multimodal` and
+  // `input_modalities` at the model top level.
   const cap = model.capabilities;
-  if (!cap || typeof cap !== 'object' || Array.isArray(cap)) return false;
-  const capabilities = cap as Record<string, unknown>;
-  if (capabilities.vision === true || capabilities.images === true) return true;
-  const modalities = capabilities.input_modalities;
+  const capabilities = cap && typeof cap === 'object' && !Array.isArray(cap)
+    ? cap as Record<string, unknown>
+    : {};
+  if (model.supports_multimodal === true || model.supportsMultimodal === true
+    || capabilities.vision === true || capabilities.images === true
+    || capabilities.multimodal === true) return true;
+  const modalities = model.input_modalities ?? model.inputModalities ?? capabilities.input_modalities;
   return Array.isArray(modalities) && modalities.some(
     (value) => typeof value === 'string' && value.toLowerCase() === 'image'
   );

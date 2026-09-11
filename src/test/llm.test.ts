@@ -181,11 +181,13 @@ describe('modelRecordSupportsVision', () => {
     assert.equal(modelRecordSupportsVision({ capabilities: { vision: 'false', images: 'false' } }), false);
   });
 
-  test('accepts only explicit boolean flags or an image input modality', () => {
+  test('accepts explicit flags or image input modalities from nested and top-level metadata', () => {
     assert.equal(modelRecordSupportsVision({ capabilities: { vision: true } }), true);
     assert.equal(modelRecordSupportsVision({ capabilities: { images: true } }), true);
     assert.equal(modelRecordSupportsVision({ capabilities: { input_modalities: ['text', 'IMAGE'] } }), true);
-    assert.equal(modelRecordSupportsVision({ capabilities: { input_modalities: 'text,image' } }), false);
+    assert.equal(modelRecordSupportsVision({ input_modalities: ['file', 'image', 'text', 'video'] }), true);
+    assert.equal(modelRecordSupportsVision({ supports_multimodal: true }), true);
+    assert.equal(modelRecordSupportsVision({ input_modalities: 'text,image' }), false);
   });
 });
 

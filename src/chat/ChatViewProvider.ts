@@ -2525,7 +2525,9 @@ setTimeout(() => {
   #modelPicker .model-row.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
   #modelPicker .model-row .check { width: 12px; flex-shrink: 0; opacity: 0.85; }
   #modelPicker .model-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #modelPicker .model-row .badge { font-size: 0.75em; opacity: 0.55; flex-shrink: 0; }
+  #modelPicker .model-row .badge { font-size: 0.75em; opacity: 0.55; flex-shrink: 0; display: inline-flex; align-items: center; gap: 4px; }
+  #modelPicker .model-row .badge .vision-eye { width: 14px; height: 14px; color: var(--vscode-charts-green, #2ea043); opacity: 1; }
+  #modelPickerBtn .selected-model-eye { display: inline-flex; vertical-align: -2px; margin-left: 6px; width: 15px; height: 15px; color: var(--vscode-charts-green, #2ea043); flex-shrink: 0; }
   #modelPicker .model-row .del { background: transparent; border: none; color: var(--vscode-foreground); padding: 2px 5px; border-radius: 3px; opacity: 0; cursor: pointer; font-size: 0.95em; flex-shrink: 0; }
   #modelPicker .model-row:hover .del { opacity: 0.55; }
   #modelPicker .model-row .del:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-errorForeground); }
@@ -6862,7 +6864,10 @@ function renderModelPickerLabel() {
     labelEl.innerHTML = '<span class="ep">No model selected</span>';
     return;
   }
-  labelEl.innerHTML = '<span class="model">' + escapeHtml(a.model) + '</span>';
+  const eye = currentModelSupportsVision
+    ? '<span class="selected-model-eye" title="视觉模型" aria-label="视觉模型"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/></svg></span>'
+    : '';
+  labelEl.innerHTML = '<span class="model">' + escapeHtml(a.model) + '</span>' + eye;
 }
 
 function renderModelPicker() {
@@ -6949,7 +6954,15 @@ function renderModelPicker() {
       name.title = r.id;
       const badge = document.createElement('span');
       badge.className = 'badge';
-      badge.textContent = r.supportsVision ? (r.source === 'manual' ? 'manual · VL' : 'fetched · VL') : (r.source === 'manual' ? 'manual' : 'fetched');
+      badge.textContent = r.source === 'manual' ? 'manual' : 'fetched';
+      if (r.supportsVision) {
+        const eye = document.createElement('span');
+        eye.className = 'vision-eye';
+        eye.title = '视觉模型';
+        eye.setAttribute('aria-label', '视觉模型');
+        eye.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/></svg>';
+        badge.appendChild(eye);
+      }
       row.appendChild(check);
       row.appendChild(name);
       row.appendChild(badge);
