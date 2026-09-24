@@ -401,6 +401,12 @@ save_topic_doc:
   The doc is saved to .burstcode/topics/ and is readable by future sessions via
   list_dir / read_file before doing heavy code collection.`;
 
+const WEB_SEARCH_POLICY = `WEB SEARCH POLICY:
+- Tool selection remains model-driven; do not infer tool calls from keyword matching or from host-side heuristics.
+- When the user asks for current, external, online, or web-based information, use the available web_search tool before answering. When web_search is present in the tool list, do not claim that the search capability is unavailable and do not answer from memory instead of calling it.
+- web_search itself tries Brave Search when configured, then automatically falls back to DuckDuckGo and Bing; a missing or unusable Brave key is not a reason to skip the search tool.
+- After web_search returns results, use read_webpage for the specific sources needed and ground the answer in those results. If every provider fails, report the actual tool error instead of pretending the tool does not exist.`;
+
 const RULES = `RULES:
 - ONLY call tools that are defined in the function definitions of this conversation.
   Do NOT invent, guess, or hallucinate tool names (e.g. "greps", "lists", "searches", "dirs",
@@ -437,6 +443,7 @@ export function buildSystemPrompt(input: SystemPromptInput = {}): string {
     !/^\(no lessons/.test(input.lessonsBlock.trim());
   stable.push(hasLessons ? LESSONS_PROTOCOL_FULL : LESSONS_PROTOCOL_SHORT);
   if (input.contextToolsAvailable) stable.push(CONTEXT_MANAGEMENT);
+  stable.push(WEB_SEARCH_POLICY);
   stable.push(RULES);
   stable.push(STATE_POINTER);
 
