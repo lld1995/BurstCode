@@ -21,7 +21,6 @@ export interface SubagentToolOptions {
   applier: HunkApplier;
   readTools: Tool[];
   writeTools: Tool[];
-  systemPrompt: string;
   contextWindow: number;
   maxIterations: number;
   maxConcurrent: number;
@@ -86,7 +85,7 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
       function: {
         name: 'launch_subagent',
         description:
-          'Run focused sub-agents concurrently for independent fan-out tasks. Write tasks require mode="write", independent=true, allowedFiles. See BATCH_PROTOCOL for when to prefer this over inline tool batching.\n\nWHEN TO USE — use launch_subagent only when the work is both independent and broad enough that returning a concise summary is cheaper than injecting raw file content here. Do NOT use it merely because context is high: for ordinary context pressure, narrow reads, compress/truncate stale context, or continue with targeted local tools. Sub-agents have their own LLM loop and are slower than direct tools for small lookups or pre-edit reads.',
+          'Delegate a broad isolated task for a concise summary, or run multiple independent tasks in parallel. Pass only task-relevant context/constraints; the parent conversation and system prompt are not inherited. Every task in a multi-task call must set independent=true. Write tasks require mode="write", independent=true, allowedFiles. Prefer direct tools for small lookups, immediate edits, or context pressure alone.',
         parameters: {
           type: 'object',
           properties: {
@@ -98,9 +97,9 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
                   id: { type: 'string', description: 'Short stable id such as read-api, write-view, write-tests.' },
                   objective: { type: 'string', description: 'Concrete objective for this sub-agent.' },
                   mode: { type: 'string', enum: ['read', 'write'], description: 'Default read. Write enables propose_edit only for allowedFiles.' },
-                  independent: { type: 'boolean', description: 'Required true for write tasks. Means this task can be solved without reading another sub-agent result.' },
+                  independent: { type: 'boolean', description: 'Required true for write tasks and every task in a multi-task call; no task may depend on another task result.' },
                   allowedFiles: { type: 'array', items: { type: 'string' }, description: 'Required for write tasks. Exact workspace-relative or absolute files this sub-agent may edit.' },
-                  context: { type: 'string', description: 'Optional constraints, interface contract, or parent findings.' }
+                  context: { type: 'string', description: 'Only the task-relevant parent findings, constraints or interface contract; never paste the full conversation.' }
                 },
                 required: ['id', 'objective']
               }
@@ -115,6 +114,9 @@ export function buildSubagentTool(options: SubagentToolOptions): Tool {
       const rawTasks = Array.isArray(args.tasks) ? args.tasks : [];
       const tasks = rawTasks.map(parseTask).filter((t): t is SubagentTask => !!t).slice(0, options.maxTasksPerCall);
       if (tasks.length === 0) return { content: 'launch_subagent requires at least one valid task.', isError: true };
+      if (tasks.length > 1 && tasks.some((task) => !task.independent)) {
+        return { content: 'Multi-task launch_subagent calls require independent=true on every task; run dependent tasks sequentially.', isError: true };
+      }
 
       const requestedConcurrent = Number(args.maxConcurrent);
       const perCallLimit = Number.isFinite(requestedConcurrent) && requestedConcurrent > 0
@@ -210,7 +212,7 @@ async function runTask(
     ? [...options.readTools, ...scopeWriteTools(options.writeTools, task.allowedFiles)]
     : options.readTools;
   const messages: ChatMessage[] = [
-    { role: 'system', content: buildTaskSystemPrompt(task, options.systemPrompt) },
+    { role: 'system', content: buildTaskSystemPrompt(task) },
     { role: 'user', content: buildTaskUserPrompt(task) }
   ];
   const taskTokenSource = new vscode.CancellationTokenSource();
@@ -228,7 +230,7 @@ async function runTask(
     maxStuckRepeats: 1,
     autoContinueOnPrematureStop: false,
     maxPrematureStopContinues: 0,
-    systemPrompt: buildTaskSystemPrompt(task, options.systemPrompt)
+    systemPrompt: buildTaskSystemPrompt(task)
   } satisfies AgentOptions);
 
   // Accumulate ALL assistant turns so partial findings from mid-run iterations
@@ -323,41 +325,12 @@ async function runTask(
   return `[${task.id}] ${status} mode=${task.mode} reason=${doneReason} toolCalls=${toolCalls}${fileLine}\n${report}`;
 }
 
-/**
- * Strip sections from the parent system prompt that reference tools the
- * sub-agent does not have (launch_subagent). Leaving those instructions in
- * causes the sub-agent to attempt calling a non-existent tool, which
- * triggers the stuck-detection loop and terminates the task early.
- *
- * We remove:
- *   - The CONTEXT HYGIENE block (bounded by its heading line and the next
- *     blank-line-then-uppercase-heading or end-of-string).
- *   - Any sentence/bullet that mentions "launch_subagent" in BATCH_PROTOCOL.
- */
-function stripSubagentUnsafeSections(prompt: string): string {
-  // Remove the entire CONTEXT HYGIENE fenced block.
-  // The block starts with a line that begins "CONTEXT HYGIENE" and ends
-  // just before the next all-caps section heading or end of string.
-  let out = prompt.replace(
-    /CONTEXT HYGIENE[\s\S]*?(?=\n[A-Z][A-Z\s\-]{3,}:|$)/g,
-    ''
-  );
-  // Remove individual lines / bullets mentioning launch_subagent.
-  out = out
-    .split('\n')
-    .filter((line) => !/launch_subagent/.test(line))
-    .join('\n');
-  // Collapse runs of 3+ blank lines left behind by removals.
-  out = out.replace(/\n{3,}/g, '\n\n');
-  return out.trim();
-}
 
-function buildTaskSystemPrompt(task: SubagentTask, parentSystemPrompt: string): string {
+function buildTaskSystemPrompt(task: SubagentTask): string {
   const writePolicy = task.mode === 'write'
     ? `You may propose edits ONLY to these files: ${task.allowedFiles.join(', ')}. Use propose_edit for all code changes. Do not edit or create any other file.`
     : 'Read-only task. Do not call propose_edit or attempt to modify files.';
-  const safePrompt = stripSubagentUnsafeSections(parentSystemPrompt);
-  return `${safePrompt}\n\n<subagent_policy>\nYou are a focused sub-agent running inside BurstCode. Work only on the assigned objective. Do not ask the user questions. Do not update the parent plan. Return a concise report with files inspected, key findings, and any edits queued. ${writePolicy}\n</subagent_policy>`;
+  return `You are a focused sub-agent running inside BurstCode. Work only on the assigned objective. Do not ask the user questions or update the parent plan. The parent conversation and system prompt are not available; use the task objective and explicitly provided context, plus the enabled tools to inspect task-relevant files. Return a concise report with files inspected, key findings, and any edits queued. ${writePolicy}`;
 }
 
 function buildTaskUserPrompt(task: SubagentTask): string {

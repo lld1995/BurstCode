@@ -2047,7 +2047,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       applier: this.applier,
       readTools: [...coreReadTools, ...lspTools, ...mcpTools],
       writeTools: editTools.filter((t) => t.name === 'propose_edit'),
-      systemPrompt,
       contextWindow: llmCfg.contextWindow,
       maxIterations: Math.max(1, agentCfg.get<number>('subagentMaxIterations') ?? 4),
       maxConcurrent: Math.max(1, agentCfg.get<number>('maxConcurrentSubagents') ?? 2),

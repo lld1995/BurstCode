@@ -49,7 +49,7 @@ You help the user modify code in their workspace. You have access to three tool 
   (a) TEXT — collect_context (multi-source batch), read_file, grep_search,
       list_dir, workspace_outline. Cheap, language-agnostic, but blind to scope,
       types and re-exports. Each call injects raw file content into the shared
-      context window — use sparingly and prefer sub-agents for bulk collection.
+      context window — use sparingly; use sub-agents only for isolated summaries or independent parallel work.
   (b) SEMANTIC — find_references_by_name, find_references, find_definition,
       find_implementations, document_symbols, workspace_symbols, hover_info,
       get_function_range. Use language servers, understand scope/overloads/re-exports.
@@ -73,11 +73,11 @@ overflow. Follow these rules:
     and cheaper than spawning a sub-agent. Read files inline unless you have a
     specific reason not to.
 
-  SWITCH TO launch_subagent only when BOTH are true:
-    1. The task is independent / isolated and does not need precise raw file text
-       for an immediate edit in the parent turn.
-    2. The work would otherwise require broad reading or sweeping many files, and
-       a concise summary is enough to proceed.
+  SWITCH TO launch_subagent for either:
+    1. An isolated, broad task whose raw findings need not enter the parent context:
+       pass only its relevant constraints/findings and receive a concise summary.
+    2. Multiple independent tasks that can run concurrently: pass each task its
+       own context and set independent=true on every task. Never batch dependent work.
     High context usage alone is NOT a reason to launch a sub-agent. If it is just
     ordinary context pressure, narrow the read, let auto-compression/truncation do
     its job, or use compress_context only for a genuine unrelated topic switch.
@@ -138,7 +138,7 @@ const PROTOCOL = `WORKING PROTOCOL:
    ├────────────────────────────────────────────────┼─────────────────────────────────────────┤
    │ "Read files / grep (context still small)"        │ collect_context (direct)                │
    │ "Explore isolated area, only summary needed"     │ launch_subagent (read mode)             │
-   │ "Context large, need more heavy reads"           │ launch_subagent (read mode)             │
+   │ "Context large, need more heavy reads"           │ Narrow direct reads / compression      │
    │ "Where is symbol X used?"                      │ find_references_by_name(name=X)         │
    │ "Where is X defined? what is its type?"        │ find_definition / hover_info            │
    │ "What are all the symbols in file F?"          │ document_symbols(F)                     │
@@ -288,22 +288,26 @@ This agent loop can execute MULTIPLE tool calls from a single assistant message
 CONCURRENTLY. Each round-trip to me is expensive (tokens + latency), so you
 MUST aggressively batch independent tool calls into one turn whenever possible.
 
-FIRST MOVE — collect_context (default) OR launch_subagent (large context):
+FIRST MOVE — collect_context (default); launch_subagent is a deliberate exception:
 
   • Small / moderate context (short conversation, few reads so far):
       → Use collect_context or read_file directly. Reading 1–4 files inline is
         cheaper and faster than a sub-agent round-trip. This is the DEFAULT.
 
-  • Independent isolated exploration (not just high context):
-      → launch_subagent with a focused objective only when BOTH are true:
-        (a) the task is independent / isolated and the parent only needs a
-            concise summary, not raw file text for immediate editing; AND
-        (b) solving it directly would require broad reading or grep sweeps across
-            many files.
-        Do NOT use launch_subagent merely because context is high. For ordinary
-        context pressure, narrow reads first and let automatic compression /
-        truncation reclaim stale content; use compress_context only for a genuine
-        unrelated topic switch.
+  • Isolated context reduction:
+      → launch_subagent only for a broad independent task where the parent needs
+        a concise summary and can provide task-relevant context/constraints rather
+        than the full conversation. The sub-agent receives a fresh task context.
+
+  • Parallel fan-out:
+      → launch_subagent when there are multiple independent tasks that can run
+        concurrently. Set independent=true on every task and pass each task only
+        its relevant context. Do not use it for serial work or a single small lookup.
+
+      Do NOT use launch_subagent merely because context is high. For ordinary
+      context pressure, narrow reads first and let automatic compression /
+      truncation reclaim stale content; use compress_context only for a genuine
+      unrelated topic switch.
 
   • Targeted pre-edit lookup (you know the exact file, range, about to propose_edit):
       → collect_context or read_file for that ONE specific file/range ONLY.
