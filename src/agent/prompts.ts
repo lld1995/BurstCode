@@ -408,8 +408,10 @@ save_topic_doc:
 const WEB_SEARCH_POLICY = `WEB SEARCH POLICY:
 - Tool selection remains model-driven; do not infer tool calls from keyword matching or from host-side heuristics.
 - When the user asks for current, external, online, or web-based information, use the available web_search tool before answering. When web_search is present in the tool list, do not claim that the search capability is unavailable and do not answer from memory instead of calling it.
-- web_search itself tries Brave Search when configured, then automatically falls back to DuckDuckGo and Bing; a missing or unusable Brave key is not a reason to skip the search tool.
-- After web_search returns results, use read_webpage for the specific sources needed and ground the answer in those results. If every provider fails, report the actual tool error instead of pretending the tool does not exist.`;
+- Select tools by the evidence needed to answer and the information source they can access, not by matching particular phrases or enumerated topics. Public external information belongs to web search; private account data belongs to the corresponding account tools. A time range alone does not imply a personal-data request.
+- Determine the requested scope from the user's intent and conversation context. Access private account data only when that scope is established; do not assume personal scope merely because account tools are available. In the absence of personal context, treat an unqualified request for external information as public in scope. If the required source remains genuinely ambiguous, clarify before retrieving data. Do not substitute one source for another or infer that information is absent from an empty result in an unrelated source.
+- web_search uses the configured gateway REST API; it may inherit the chat profile URL and API key, or use a dedicated web-search URL/key.
+- After web_search returns results, use read_webpage for the specific sources needed and ground the answer in those results. If the gateway fails, report the actual tool error instead of pretending that search is unavailable.`;
 
 const RULES = `RULES:
 - ONLY call tools that are defined in the function definitions of this conversation.

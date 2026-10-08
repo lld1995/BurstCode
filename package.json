@@ -2,7 +2,7 @@
   "name": "burstcode",
   "displayName": "BurstCode",
   "description": "Precise, Fast, Cheap, Secure — an autonomous coding agent powered entirely by your own local, OpenAI-compatible LLMs.",
-  "version": "0.1.151",
+  "version": "0.1.153",
   "publisher": "burstcode",
   "repository": {
     "type": "git",
@@ -146,10 +146,6 @@
       {
         "command": "burstcode.background.menu",
         "title": "BurstCode: Background Explorer Menu"
-      },
-      {
-        "command": "burstcode.web.testBrave",
-        "title": "BurstCode: Test Brave Search API Key"
       }
     ],
     "menus": {
@@ -404,17 +400,51 @@
           },
           "markdownDescription": "**MCP** · Enabled MCP tool IDs selected from the BurstCode left panel. Empty means all discovered tools from configured MCP servers are enabled. Prefer using the left-panel **MCP 配置 → 启用的 MCP 工具…** picker instead of editing this manually."
         },
+        "burstcode.web.enabled": {
+          "type": "boolean",
+          "default": true,
+          "order": 40,
+          "description": "Enable web search capabilities for chat requests."
+        },
+        "burstcode.web.inheritChatConfig": {
+          "type": "boolean",
+          "default": true,
+          "order": 41,
+          "description": "Use the chat profile baseURL and apiKey for web search instead of the dedicated web-search URL/key."
+        },
+        "burstcode.web.searchMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "native",
+            "gateway"
+          ],
+          "enumDescriptions": [
+            "Prefer native provider search and fall back to gateway search when explicitly rejected.",
+            "Use the provider's native web_search_options capability only.",
+            "Use BurstCode's gateway web_search tool only."
+          ],
+          "default": "auto",
+          "order": 42,
+          "description": "Web search implementation: automatic, native provider search, or gateway tool search."
+        },
+        "burstcode.web.searchBaseURL": {
+          "type": "string",
+          "default": "http://192.168.191.4:5050/v1",
+          "order": 43,
+          "description": "Web tools · gateway URL for the REST web-search API."
+        },
+        "burstcode.web.searchApiKey": {
+          "type": "string",
+          "default": "",
+          "order": 44,
+          "description": "API key for the dedicated web-search gateway. Required when inheritChatConfig is false; sent as Bearer authentication."
+        },
         "burstcode.web.proxyUrl": {
           "type": "string",
           "default": "",
-          "order": 41,
-          "description": "Web tools · HTTP/HTTPS proxy URL used by web_search and read_webpage. Leave empty to fall back to VS Code http.proxy, then HTTPS_PROXY/HTTP_PROXY."
-        },
-        "burstcode.web.braveApiKey": {
-          "type": "string",
-          "default": "",
-          "order": 42,
-          "markdownDescription": "**Web tools** · Brave Search API key. When configured, `web_search` tries Brave before DuckDuckGo/Bing."
+          "order": 45,
+          "description": "Web tools · HTTP proxy URL (e.g. http://127.0.0.1:7890) used only for reading web pages (read_webpage / fetchUrl). Gateway search requests always connect directly. Falls back to http.proxy and HTTPS_PROXY/HTTP_PROXY when empty."
         },
         "burstcode.ui.language": {
           "type": "string",

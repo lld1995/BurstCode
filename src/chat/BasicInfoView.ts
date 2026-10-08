@@ -116,13 +116,15 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
     const shellAuto = shell.get<boolean>('autoApprove') ?? false;
     const taskDoneSound = ui.get<boolean>('taskDoneSound') ?? true;
     const askUserSound = ui.get<boolean>('askUserSound') ?? true;
+    const webSearchEnabled = web.get<boolean>('enabled') !== false;
+    const searchBaseURL = (web.get<string>('searchBaseURL') ?? '').trim();
+    const searchApiKey = (web.get<string>('searchApiKey') ?? '').trim();
+    const inheritChatConfig = web.get<boolean>('inheritChatConfig') !== false;
     const proxyUrl = (web.get<string>('proxyUrl') ?? '').trim();
-    const braveKey = (web.get<string>('braveApiKey') ?? '').trim();
     const mcpServers = (mcp.get<unknown[]>('servers') ?? []).filter((s) => !!s && typeof s === 'object') as Array<Record<string, unknown>>;
     const mcpEnabledCount = mcpServers.filter((s) => s.disabled !== true).length;
     const mcpSelectedTools = mcp.get<string[]>('enabledTools') ?? [];
     const mcpSelectedToolCount = mcpSelectedTools.filter((v) => typeof v === 'string' && v.trim()).length;
-    const proxyDesc = proxyUrl ? t('web.proxy.configured') : t('web.proxy.fallback');
 
     const status = this.backgroundStatus;
     const phaseLabel = formatPhase(status?.phase ?? 'unknown', bgEnabled);
@@ -232,38 +234,45 @@ export class BasicInfoView implements vscode.TreeDataProvider<BasicNode>, vscode
 
     // ---------- Web tools ----------
     const webGroup = new BasicNode('group', t('web.group'), {
-      description: braveKey ? t('web.brave.on') : t('web.brave.off'),
+      description: inheritChatConfig ? t('web.inherit.on') : (searchBaseURL || t('web.notConfigured')),
       icon: 'search',
       expanded: true
     });
     webGroup.children = [
+      this.toggleNode(
+        t('web.inherit'),
+        inheritChatConfig,
+        'burstcode.web.inheritChatConfig',
+        t('web.inherit.tip'),
+        undefined
+      ),
+      new BasicNode('leaf', t('web.searchMode'), {
+        description: t(`web.searchMode.${web.get<string>('searchMode') === 'native' || web.get<string>('searchMode') === 'gateway' ? web.get<string>('searchMode') : 'auto'}`),
+        icon: 'radio-tower',
+        tooltip: t('web.searchMode.tip'),
+        command: {
+          command: 'burstcode.selectWebSearchMode',
+          title: t('web.searchMode')
+        }
+      }),
+      new BasicNode('leaf', t('web.config'), {
+        description: t('web.config.desc'),
+        icon: 'settings-gear',
+        tooltip: t('web.config.tip'),
+        command: {
+          command: 'workbench.action.openSettings',
+          title: t('web.config'),
+          arguments: ['@id:burstcode.web.searchBaseURL @id:burstcode.web.searchApiKey']
+        }
+      }),
       new BasicNode('leaf', t('web.proxy'), {
-        description: proxyDesc,
-        icon: proxyUrl ? 'plug' : 'globe',
-        tooltip: proxyUrl ? t('web.proxy.tipConfigured', proxyUrl) : t('web.proxy.tipEmpty'),
+        description: proxyUrl || t('web.notConfigured'),
+        icon: 'globe',
+        tooltip: t('web.proxy.tip'),
         command: {
           command: 'workbench.action.openSettings',
-          title: 'Configure Web Proxy',
-          arguments: ['burstcode.web.proxyUrl']
-        }
-      }),
-      new BasicNode('leaf', t('web.braveKey'), {
-        description: braveKey ? t('web.configured') : t('web.notConfigured'),
-        icon: braveKey ? 'key' : 'warning',
-        tooltip: t('web.braveKey.tip'),
-        command: {
-          command: 'workbench.action.openSettings',
-          title: 'Configure Brave Search API Key',
-          arguments: ['burstcode.web.braveApiKey']
-        }
-      }),
-      new BasicNode('leaf', t('web.braveTest'), {
-        description: braveKey ? t('web.braveTest.ready') : t('web.braveTest.needKey'),
-        icon: 'beaker',
-        tooltip: t('web.braveTest.tip'),
-        command: {
-          command: 'burstcode.web.testBrave',
-          title: 'Test Brave Search'
+          title: t('web.proxy'),
+          arguments: ['@id:burstcode.web.proxyUrl']
         }
       })
     ];

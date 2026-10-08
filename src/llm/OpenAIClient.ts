@@ -13,6 +13,10 @@ export interface LLMConfig {
   supportsVision?: boolean;
   /** Whether reasoning should be enabled for this chat request. */
   reasoningEnabled?: boolean;
+  /** Whether web search is available for this chat request. */
+  webSearchEnabled?: boolean;
+  /** Auto prefers native search and falls back only on explicit rejection before stream output. */
+  webSearchMode?: 'auto' | 'native' | 'gateway';
   /** Gateway-supported reasoning effort for this chat request; undefined means Auto. */
   reasoningEffort?: string;
   /** Skip TLS cert verification for the configured baseURL (self-signed corporate endpoints). */
@@ -653,7 +657,12 @@ export function readLLMConfig(): LLMConfig {
     model: p.model || p.models[0] || DEFAULT_MODEL,
     temperature: p.temperature,
     contextWindow: p.contextWindow,
-    allowSelfSignedCerts: p.allowSelfSignedCerts
+    allowSelfSignedCerts: p.allowSelfSignedCerts,
+    webSearchEnabled: vscode.workspace.getConfiguration('burstcode.web').get<boolean>('enabled') !== false,
+    webSearchMode: (() => {
+      const mode = vscode.workspace.getConfiguration('burstcode.web').get<string>('searchMode');
+      return mode === 'native' || mode === 'gateway' ? mode : 'auto';
+    })()
   };
 }
 
@@ -1379,8 +1388,19 @@ function sanitizeEmptyContentBlocks(messages: ChatMessage[]): ChatMessage[] {
   });
 }
 
+export function isNativeWebSearchRejectedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /web_search_options/i.test(message) && /unsupported|not supported|unknown|unrecognized|unexpected|not allowed|not permitted|extra inputs|不支持|非法/i.test(message);
+}
+
+export function selectWebSearchTools(tools: ToolDef[], native: boolean): ToolDef[] | undefined {
+  const selected = native ? tools.filter(tool => tool.function.name !== 'web_search') : tools;
+  return selected.length ? selected : undefined;
+}
+
 export class OpenAIClient {
   private client: OpenAI;
+  private nativeSearchRejected = false;
 
   constructor(private readonly config: LLMConfig, private readonly logger: Logger) {
     const modelLower = config.model.toLowerCase();
@@ -1441,13 +1461,19 @@ export class OpenAIClient {
     const isGemini = modelLower.includes('gemini');
     const supportsTemperature = !modelLower.includes('claude');
 
+    const searchEnabled = this.config.webSearchEnabled !== false;
+    const searchMode = this.config.webSearchMode ?? 'gateway';
+    let useNativeSearch = searchEnabled && (searchMode === 'native' || (searchMode === 'auto' && !this.nativeSearchRejected));
     const buildRequest = (
       requestMessages: ChatMessage[] = safeMessages
     ): OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & Record<string, unknown> => ({
       model: this.config.model,
-      messages: requestMessages,
-      tools: tools.length ? tools : undefined,
-      tool_choice: tools.length ? 'auto' : undefined,
+      messages: useNativeSearch
+        ? [...requestMessages, { role: 'system' as const, content: 'Public web search is provided natively by the provider through web_search_options for this request. Use that capability when external evidence is needed; do not claim it is unavailable because no web_search function is listed. Private account tools are not a substitute for public web evidence.' }]
+        : requestMessages,
+      tools: searchEnabled ? selectWebSearchTools(tools, useNativeSearch) : tools,
+      ...(useNativeSearch ? { web_search_options: {} } : {}),
+      tool_choice: selectWebSearchTools(tools, useNativeSearch) ? 'auto' : undefined,
       // Encourage the model to batch independent tool calls into a single
       // assistant message. OpenAI GPT-4o / o-series default to true but
       // some OpenAI-compatible backends (DashScope, certain vLLM builds,
@@ -1455,7 +1481,7 @@ export class OpenAIClient {
       // multiple tool_calls per turn. Do not send it to Gemini translators:
       // native GenerateContentRequest has no equivalent field and may reject
       // the whole request as INVALID_ARGUMENT.
-      parallel_tool_calls: tools.length && !isGemini ? true : undefined,
+      parallel_tool_calls: selectWebSearchTools(tools, useNativeSearch) && !isGemini ? true : undefined,
       ...(supportsTemperature ? { temperature: this.config.temperature } : {}),
       // Carry both reasoning dialects used by supported OpenAI-compatible gateways:
       // ZenMux consumes the top-level fields, while vLLM/Transformers gateways may
@@ -1753,20 +1779,23 @@ export class OpenAIClient {
     };
 
     try {
-      if (isGemini) {
-        for await (const c of streamGeminiDirect(this.config, buildRequest(), ac.signal)) {
-          yield c;
-        }
-        return;
-      }
-
+      const streamOnce = (request: ReturnType<typeof buildRequest>) => isGemini
+        ? streamGeminiDirect(this.config, request, ac.signal)
+        : streamSdkOnce(this.client, request, ac.signal);
       let emitted = false;
       try {
-        for await (const c of streamSdkOnce(this.client, buildRequest(), ac.signal)) {
+        for await (const c of streamOnce(buildRequest())) {
           emitted = true;
           yield c;
         }
       } catch (error) {
+        if (!emitted && useNativeSearch && searchMode === 'auto' && isNativeWebSearchRejectedError(error)) {
+          this.nativeSearchRejected = true;
+          useNativeSearch = false;
+          this.logger.warn('Provider explicitly rejected web_search_options; falling back to gateway search.');
+          for await (const c of streamOnce(buildRequest())) yield c;
+          return;
+        }
         // Last-resort compatibility at the actual HTTP boundary. Capability
         // metadata can be stale or simply wrong; if a provider explicitly says
         // its message schema does not accept image_url, retry the untouched turn
@@ -1778,7 +1807,7 @@ export class OpenAIClient {
         this.logger.warn(
           `Provider rejected image_url for model ${this.config.model}; retrying once with text-only history.`
         );
-        for await (const c of streamSdkOnce(this.client, buildRequest(textOnlyMessages), ac.signal)) {
+        for await (const c of streamOnce(buildRequest(textOnlyMessages))) {
           yield c;
         }
       }

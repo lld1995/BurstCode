@@ -6,9 +6,10 @@
  */
 import { test, describe, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import * as net from 'net';
+import * as http from 'http';
+import { AddressInfo } from 'net';
 // These are imported after vscode mock is in cache (preload script runs first)
-import { getProxyUrl, openTunnel, fetchUrl, htmlToText } from '../agent/tools/web';
+import { fetchUrl, htmlToText, webSearchTool } from '../agent/tools/web';
 
 const vscodeMock = require('./vscode-mock') as {
   __setConfig: (section: string, values: Record<string, unknown>) => void;
@@ -16,9 +17,9 @@ const vscodeMock = require('./vscode-mock') as {
 };
 
 // ---------------------------------------------------------------------------
-// getProxyUrl()
+// fetchUrl() and pure HTML parsing
 // ---------------------------------------------------------------------------
-describe('getProxyUrl', () => {
+describe('fetchUrl and htmlToText', () => {
   beforeEach(() => {
     vscodeMock.__clearAll();
     delete process.env.HTTPS_PROXY;
@@ -27,197 +28,8 @@ describe('getProxyUrl', () => {
     delete process.env.http_proxy;
   });
 
-  test('returns null when no proxy configured', () => {
-    const result = getProxyUrl();
-    assert.equal(result, null);
-  });
-
-  test('burstcode.web.proxyUrl takes highest priority', () => {
-    vscodeMock.__setConfig('burstcode.web', { proxyUrl: 'http://127.0.0.1:7890' });
-    vscodeMock.__setConfig('http', { proxy: 'http://other:9999' });
-    process.env.HTTP_PROXY = 'http://env:8888';
-    const result = getProxyUrl();
-    assert.ok(result, 'should return a URL');
-    assert.equal(result!.hostname, '127.0.0.1');
-    assert.equal(result!.port, '7890');
-  });
-
-  test('falls back to http.proxy VS Code setting when burstcode setting empty', () => {
-    vscodeMock.__setConfig('burstcode.web', { proxyUrl: '' });
-    vscodeMock.__setConfig('http', { proxy: 'http://vsproxy:3128' });
-    const result = getProxyUrl();
-    assert.ok(result);
-    assert.equal(result!.hostname, 'vsproxy');
-    assert.equal(result!.port, '3128');
-  });
-
-  test('falls back to HTTPS_PROXY env var', () => {
-    vscodeMock.__setConfig('burstcode.web', { proxyUrl: '' });
-    process.env.HTTPS_PROXY = 'http://envproxy:7777';
-    const result = getProxyUrl();
-    assert.ok(result);
-    assert.equal(result!.hostname, 'envproxy');
-    assert.equal(result!.port, '7777');
-  });
-
-  test('falls back to HTTP_PROXY when HTTPS_PROXY not set', () => {
-    process.env.HTTP_PROXY = 'http://httpproxy:4321';
-    const result = getProxyUrl();
-    assert.ok(result);
-    assert.equal(result!.hostname, 'httpproxy');
-  });
-
-  test('returns null for invalid proxy URL', () => {
-    vscodeMock.__setConfig('burstcode.web', { proxyUrl: 'not-a-url' });
-    const result = getProxyUrl();
-    assert.equal(result, null);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// openTunnel() — mock TCP server that acts as an HTTP proxy
-// ---------------------------------------------------------------------------
-describe('openTunnel', () => {
-  test('resolves with a socket when proxy returns 200', async () => {
-    const server = net.createServer((client) => {
-      let buf = '';
-      client.on('data', (chunk: Buffer) => {
-        buf += chunk.toString();
-        if (buf.includes('\r\n\r\n')) {
-          client.write('HTTP/1.1 200 Connection established\r\n\r\n');
-        }
-      });
-    });
-    const port = await new Promise<number>((resolve) => {
-      server.listen(0, '127.0.0.1', () => resolve((server.address() as net.AddressInfo).port));
-    });
-
-    try {
-      const proxy = new URL(`http://127.0.0.1:${port}`);
-      const socket = await openTunnel(proxy, 'example.com', 80, false);
-      assert.ok(socket, 'socket should be returned');
-      socket.destroy();
-    } finally {
-      server.close();
-    }
-  });
-
-  test('rejects when proxy returns non-200', async () => {
-    const server = net.createServer((client) => {
-      let buf = '';
-      client.on('data', (chunk: Buffer) => {
-        buf += chunk.toString();
-        if (buf.includes('\r\n\r\n')) {
-          client.write('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n');
-          client.end();
-        }
-      });
-    });
-    const port = await new Promise<number>((resolve) => {
-      server.listen(0, '127.0.0.1', () => resolve((server.address() as net.AddressInfo).port));
-    });
-
-    try {
-      const proxy = new URL(`http://127.0.0.1:${port}`);
-      await assert.rejects(
-        () => openTunnel(proxy, 'example.com', 80, false),
-        /Proxy CONNECT rejected/
-      );
-    } finally {
-      server.close();
-    }
-  });
-
-  test('sends Proxy-Authorization header when credentials in proxy URL', async () => {
-    let receivedHeaders = '';
-    const server = net.createServer((client) => {
-      client.on('data', (chunk: Buffer) => {
-        receivedHeaders += chunk.toString();
-        if (receivedHeaders.includes('\r\n\r\n')) {
-          client.write('HTTP/1.1 200 Connection established\r\n\r\n');
-        }
-      });
-    });
-    const port = await new Promise<number>((resolve) => {
-      server.listen(0, '127.0.0.1', () => resolve((server.address() as net.AddressInfo).port));
-    });
-
-    try {
-      const proxy = new URL(`http://user:pass@127.0.0.1:${port}`);
-      const socket = await openTunnel(proxy, 'example.com', 80, false);
-      socket.destroy();
-      assert.ok(receivedHeaders.includes('Proxy-Authorization: Basic'), 'should send auth header');
-    } finally {
-      server.close();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// fetchUrl() proxy path — mock proxy+target server
-// ---------------------------------------------------------------------------
-describe('fetchUrl via proxy', () => {
-  beforeEach(() => {
-    vscodeMock.__clearAll();
-    delete process.env.HTTPS_PROXY;
-    delete process.env.HTTP_PROXY;
-  });
-
-  test('fetches JSON body through proxy (no TLS)', async () => {
-    const proxyServer = net.createServer((client) => {
-      let buf = Buffer.alloc(0);
-      let tunnelled = false;
-      client.on('data', (chunk: Buffer) => {
-        buf = Buffer.concat([buf, chunk]);
-        if (!tunnelled) {
-          if (buf.toString('ascii').includes('\r\n\r\n')) {
-            tunnelled = true;
-            buf = Buffer.alloc(0);
-            client.write('HTTP/1.1 200 Connection established\r\n\r\n');
-          }
-        } else {
-          if (buf.toString('ascii').includes('\r\n\r\n')) {
-          const body = JSON.stringify({ ok: true });
-            const resp = Buffer.from(
-              `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`
-            );
-            client.write(resp);
-            client.end();
-          }
-        }
-      });
-    });
-
-    const port = await new Promise<number>((resolve) => {
-      proxyServer.listen(0, '127.0.0.1', () => resolve((proxyServer.address() as net.AddressInfo).port));
-    });
-
-    try {
-      vscodeMock.__setConfig('burstcode.web', { proxyUrl: `http://127.0.0.1:${port}` });
-      const result = await fetchUrl('http://example.com/api/test');
-      assert.equal(result.statusCode, 200);
-      assert.match(result.mimeType, /application\/json/);
-      const json = JSON.parse(result.body.toString());
-      assert.equal(json.ok, true);
-    } finally {
-      proxyServer.close();
-    }
-  });
-
-  test('rejects when proxy TCP connection is refused', async () => {
-    // Find a free port then close the server so nothing listens there
-    const tempServer = net.createServer();
-    const freePort = await new Promise<number>((resolve) => {
-      tempServer.listen(0, '127.0.0.1', () => {
-        resolve((tempServer.address() as net.AddressInfo).port);
-        tempServer.close();
-      });
-    });
-    vscodeMock.__setConfig('burstcode.web', { proxyUrl: `http://127.0.0.1:${freePort}` });
-    await assert.rejects(
-      () => fetchUrl('http://example.com/'),
-      (err: Error) => err.message.length > 0
-    );
+  test('rejects invalid URLs', async () => {
+    await assert.rejects(() => fetchUrl('not-a-url'), /Invalid URL/);
   });
 });
 
@@ -251,5 +63,64 @@ describe('htmlToText', () => {
     const html = '<p>No links here</p>';
     const { links } = htmlToText(html, 'https://example.com');
     assert.equal(links.length, 0);
+  });
+});
+
+
+describe('gateway web search', () => {
+  for (const inherit of [true, false]) {
+    test(`POST search with ${inherit ? 'inherited' : 'dedicated'} configuration`, async () => {
+      vscodeMock.__clearAll();
+      let received: unknown;
+      let authorization: string | undefined;
+      let requestPath: string | undefined;
+      let method: string | undefined;
+      const server = http.createServer((req, res) => {
+        authorization = req.headers.authorization;
+        requestPath = req.url;
+        method = req.method;
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          received = JSON.parse(body);
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ results: [{ title: 'Result', url: 'https://example.com/', snippet: 'Snippet' }] }));
+        });
+      });
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/`;
+      vscodeMock.__setConfig('burstcode.llm', { 'chat.baseURL': inherit ? base : 'http://invalid.test/v1', 'chat.apiKey': 'chat-key' });
+      vscodeMock.__setConfig('burstcode.web', { inheritChatConfig: inherit, searchBaseURL: inherit ? 'http://invalid.test/v1' : base, searchApiKey: 'dedicated-key' });
+      try {
+        const result = await webSearchTool.execute({ query: 'test query', maxResults: 3 }, {
+          cancellation: { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+          emitProgress() {}
+        });
+        assert.equal(result.isError, undefined, result.content);
+        assert.equal(method, 'POST');
+        assert.equal(requestPath, '/v1/web_search');
+        assert.equal(authorization, `Bearer ${inherit ? 'chat-key' : 'dedicated-key'}`);
+        assert.deepEqual(received, { query: 'test query', count: 3 });
+        assert.match(result.content, /Snippet/);
+      } finally {
+        await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+        vscodeMock.__clearAll();
+      }
+    });
+  }
+
+  test('requires a dedicated API key when inheritance is disabled', async () => {
+    vscodeMock.__clearAll();
+    vscodeMock.__setConfig('burstcode.web', {
+      inheritChatConfig: false,
+      searchBaseURL: 'http://127.0.0.1:1/v1',
+      searchApiKey: ''
+    });
+    const result = await webSearchTool.execute({ query: 'missing key' }, {
+      cancellation: { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      emitProgress() {}
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content, /dedicated web-search API key/i);
   });
 });

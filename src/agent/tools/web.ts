@@ -4,6 +4,7 @@ import * as net from 'net';
 import * as tls from 'tls';
 import * as vscode from 'vscode';
 import { Tool, ToolContext, ToolResult } from './types';
+import { readChatProfile } from '../../llm/OpenAIClient';
 
 const MAX_REDIRECTS = 6;
 const TIMEOUT_MS = 25_000;
@@ -22,9 +23,6 @@ function getConfiguredProxyUrl(): string {
   return (vscode.workspace.getConfiguration('burstcode.web').get<string>('proxyUrl') ?? '').trim();
 }
 
-function getBraveApiKey(): string {
-  return (vscode.workspace.getConfiguration('burstcode.web').get<string>('braveApiKey') ?? '').trim();
-}
 
 /** Read proxy URL from BurstCode/VS Code settings or process environment variables. */
 export function getProxyUrl(): URL | null {
@@ -144,7 +142,7 @@ export function openTunnel(
     socket.setTimeout(TIMEOUT_MS, () => fail(new Error('Proxy connection timed out')));
   });
 }
-export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}, cancellation?: vscode.CancellationToken): Promise<FetchResult> {
+export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}, cancellation?: vscode.CancellationToken, requestBody?: string): Promise<FetchResult> {
   return new Promise((resolve, reject) => {
     let parsed: URL;
     try {
@@ -164,6 +162,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
       'Accept-Encoding': 'identity',
       'Connection': 'close',
       ...headers,
+      ...(requestBody === undefined ? {} : { 'Content-Length': String(Buffer.byteLength(requestBody)) }),
     };
 
     const handleResponse = (res: http.IncomingMessage) => {
@@ -175,7 +174,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
         try { next = new URL(res.headers.location, targetUrl).href; }
         catch { reject(new Error(`Redirect to invalid URL: ${res.headers.location}`)); return; }
         res.resume();
-        fetchUrl(next, redirectsLeft - 1, headers, cancellation).then(resolve).catch(reject);
+        fetchUrl(next, redirectsLeft - 1, headers, cancellation, requestBody).then(resolve).catch(reject);
         return;
       }
 
@@ -222,7 +221,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
           const headerLines = Object.entries(reqHeaders)
             .map(([k, v]) => `${k}: ${v}`)
             .join('\r\n');
-          const rawRequest = `GET ${path} HTTP/1.1\r\nHost: ${parsed.hostname}\r\n${headerLines}\r\nConnection: close\r\n\r\n`;
+          const rawRequest = `${requestBody === undefined ? 'GET' : 'POST'} ${path} HTTP/1.1\r\nHost: ${parsed.hostname}\r\n${headerLines}\r\nConnection: close\r\n\r\n${requestBody ?? ''}`;
 
           const chunks: Buffer[] = [];
           socket.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -252,7 +251,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
               let next: string;
               try { next = new URL(resHeaders['location'], targetUrl).href; }
               catch { reject(new Error(`Redirect to invalid URL: ${resHeaders['location']}`)); return; }
-              fetchUrl(next, redirectsLeft - 1, headers, cancellation).then(resolve).catch(reject);
+              fetchUrl(next, redirectsLeft - 1, headers, cancellation, requestBody).then(resolve).catch(reject);
               return;
             }
             resolve({
@@ -273,7 +272,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
         hostname: parsed.hostname,
         port: targetPort,
         path,
-        method: 'GET',
+        method: requestBody === undefined ? 'GET' : 'POST',
         headers: reqHeaders,
         rejectUnauthorized: false,
         timeout: TIMEOUT_MS,
@@ -299,7 +298,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
         rejectAndDestroy(new Error('Request cancelled'));
         return;
       }
-      req.end();
+      req.end(requestBody);
     }
   });
 }
@@ -442,7 +441,7 @@ function decodeHtmlEntities(s: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// web_search — DuckDuckGo HTML scrape (no API key needed)
+// web_search — gateway REST API
 // ---------------------------------------------------------------------------
 
 interface SearchResult {
@@ -451,22 +450,11 @@ interface SearchResult {
   snippet: string;
 }
 
-async function fetchSearchPage(url: string, headers: Record<string, string> = {}, cancellation?: vscode.CancellationToken): Promise<string> {
-  const res = await fetchUrl(url, MAX_REDIRECTS, headers, cancellation);
-  if (res.statusCode >= 400) {
-    const detail = summarizeResponseBody(res.body.toString('utf-8'));
-    throw new Error(`search provider returned HTTP ${res.statusCode}${detail ? ` — ${detail}` : ''}`);
-  }
-  return res.body.toString('utf-8');
-}
-
 function summarizeResponseBody(body: string, maxChars = 500): string {
   const raw = body.trim();
   if (!raw) return '';
-
   try {
-    const parsed = JSON.parse(raw) as unknown;
-    const json = JSON.stringify(parsed);
+    const json = JSON.stringify(JSON.parse(raw));
     return json.length > maxChars ? `${json.slice(0, maxChars)}…` : json;
   } catch {
     const text = raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -474,186 +462,39 @@ function summarizeResponseBody(body: string, maxChars = 500): string {
   }
 }
 
-function describeBraveStatus(statusCode: number): string {
-  switch (statusCode) {
-    case 400:
-    case 422:
-      return 'bad request / invalid query parameters';
-    case 401:
-      return 'API key is invalid or missing';
-    case 403:
-      return 'API key is not allowed to access Brave Search, or the subscription is inactive';
-    case 408:
-      return 'request timed out';
-    case 429:
-      return 'rate limit or monthly quota exhausted';
-    default:
-      if (statusCode >= 500) return 'Brave Search server error';
-      return 'unexpected Brave Search response';
-  }
+function normalizeSearchResults(payload: unknown, maxResults: number): SearchResult[] {
+  const root = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+  const raw = Array.isArray(root.results) ? root.results : Array.isArray(root.data) ? root.data : [];
+  return raw.map((item) => {
+    const value = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+    return {
+      title: String(value.title ?? value.name ?? '').trim(),
+      url: String(value.url ?? value.link ?? '').trim(),
+      snippet: String(value.snippet ?? value.description ?? value.content ?? '').trim()
+    };
+  }).filter((item) => item.title && /^https?:\/\//i.test(item.url)).slice(0, maxResults);
 }
 
-function parseDuckDuckGoResults(html: string, maxResults: number): SearchResult[] {
-  const results: SearchResult[] = [];
+async function gatewaySearch(query: string, maxResults: number, cancellation?: vscode.CancellationToken): Promise<SearchResult[]> {
+  const web = vscode.workspace.getConfiguration('burstcode.web');
+  const configuredBase = (web.get<string>('searchBaseURL') ?? '').trim();
+  const inheritChatConfig = web.get<boolean>('inheritChatConfig') !== false;
+  const chat = inheritChatConfig ? await readChatProfile() : undefined;
+  const baseURL = inheritChatConfig ? (chat?.baseURL ?? '') : configuredBase;
+  const apiKey = inheritChatConfig ? (chat?.apiKey ?? '').trim() : (web.get<string>('searchApiKey') ?? '').trim();
+  if (!baseURL) throw new Error('No web-search gateway URL configured');
+  if (!apiKey) throw new Error(inheritChatConfig
+    ? 'No chat API key configured for inherited web search'
+    : 'No dedicated web-search API key configured');
 
-  // Each result block: <div class="result ..."> contains <a class="result__a"> and <a class="result__snippet">
-  const blockRe = /<div[^>]+class="[^"]*result[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
-  let bm: RegExpExecArray | null;
-  while ((bm = blockRe.exec(html)) !== null && results.length < maxResults) {
-    const block = bm[1];
-
-    // Extract href from result__a (DDG uses redirect URLs — extract uddg param for real URL)
-    const linkM = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(block);
-    if (!linkM) continue;
-
-    let url = linkM[1];
-    // DDG wraps real URLs in /l/?uddg=<encoded>
-    const uddg = url.match(/[?&]uddg=([^&]+)/);
-    if (uddg) {
-      try { url = decodeURIComponent(uddg[1]); } catch { /* keep original */ }
-    }
-    if (url.startsWith('/')) {
-      try { url = new URL(url, 'https://duckduckgo.com').href; } catch { continue; }
-    }
-    if (!url.startsWith('http')) continue;
-
-    const title = decodeHtmlEntities(linkM[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim());
-
-    // Snippet
-    const snipM = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i.exec(block);
-    const snippet = snipM
-      ? decodeHtmlEntities(snipM[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim())
-      : '';
-
-    if (title && url) results.push({ title, url, snippet });
-  }
-
-  return results;
-}
-
-function parseBingResults(html: string, maxResults: number): SearchResult[] {
-  const results: SearchResult[] = [];
-  const blockRe = /<li\s+class="b_algo"[^>]*>([\s\S]*?)(?=<li\s+class="b_algo"|<\/ol>|<\/main>|$)/gi;
-  let bm: RegExpExecArray | null;
-  while ((bm = blockRe.exec(html)) !== null && results.length < maxResults) {
-    const block = bm[1];
-    const linkM = /<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/h2>/i.exec(block);
-    if (!linkM) continue;
-
-    const url = decodeHtmlEntities(linkM[1]);
-    if (!url.startsWith('http')) continue;
-
-    const title = decodeHtmlEntities(linkM[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim());
-    const snipM = /<p[^>]*>([\s\S]*?)<\/p>/i.exec(block);
-    const snippet = snipM
-      ? decodeHtmlEntities(snipM[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim())
-      : '';
-
-    if (title && url) results.push({ title, url, snippet });
-  }
-  return results;
-}
-
-function parseBraveResults(json: string, maxResults: number): SearchResult[] {
-  const payload = JSON.parse(json) as {
-    web?: { results?: Array<{ title?: string; url?: string; description?: string }> };
-  };
-  const raw = payload.web?.results ?? [];
-  return raw
-    .map((r) => ({
-      title: decodeHtmlEntities(String(r.title ?? '').replace(/<[^>]+>/g, '').trim()),
-      url: String(r.url ?? '').trim(),
-      snippet: decodeHtmlEntities(String(r.description ?? '').replace(/<[^>]+>/g, '').trim()),
-    }))
-    .filter((r) => r.title && r.url.startsWith('http'))
-    .slice(0, maxResults);
-}
-
-async function duckduckgoSearch(query: string, maxResults: number, cancellation?: vscode.CancellationToken): Promise<SearchResult[]> {
-  const encoded = encodeURIComponent(query);
-  const braveKey = getBraveApiKey();
-  const attempts: Array<{
-    name: string;
-    url: string;
-    headers?: Record<string, string>;
-    parse: (body: string, maxResults: number) => SearchResult[];
-  }> = [];
-
-  if (braveKey) {
-    attempts.push({
-      name: 'Brave Search',
-      url: `https://api.search.brave.com/res/v1/web/search?q=${encoded}`,
-      headers: {
-        'Accept': 'application/json',
-        'X-Subscription-Token': braveKey,
-      },
-      parse: parseBraveResults,
-    });
-  }
-
-  attempts.push(
-    { name: 'DuckDuckGo HTML', url: `https://html.duckduckgo.com/html/?q=${encoded}&kl=wt-wt`, parse: parseDuckDuckGoResults },
-    { name: 'DuckDuckGo', url: `https://duckduckgo.com/html/?q=${encoded}&kl=wt-wt`, parse: parseDuckDuckGoResults },
-    { name: 'Bing', url: `https://www.bing.com/search?q=${encoded}`, parse: parseBingResults },
-  );
-  const failures: string[] = [];
-
-  for (const attempt of attempts) {
-    try {
-      const body = await fetchSearchPage(attempt.url, attempt.headers, cancellation);
-      const results = attempt.parse(body, maxResults);
-      if (results.length > 0) return results;
-      failures.push(`${attempt.name}: no parseable results`);
-    } catch (err) {
-      const message = String((err as Error).message ?? err) || 'unknown error';
-      failures.push(`${attempt.name}: ${message}`);
-    }
-  }
-
-  throw new Error(failures.join('; '));
-}
-
-export async function testBraveSearchApi(query = 'BurstCode', cancellation?: vscode.CancellationToken): Promise<SearchResult[]> {
-  const braveKey = getBraveApiKey();
-  if (!braveKey) {
-    throw new Error('burstcode.web.braveApiKey is not configured');
-  }
-
-  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}`;
-  let response: FetchResult;
-  try {
-    response = await fetchUrl(url, MAX_REDIRECTS, {
-      'Accept': 'application/json',
-      'X-Subscription-Token': braveKey,
-    }, cancellation);
-  } catch (err) {
-    console.error('[BurstCode Brave] fetchUrl error:', err);
-    const msg = err instanceof Error
-      ? `${err.message}${err.cause ? ` (cause: ${String(err.cause)})` : ''}`
-      : String(err);
-    throw new Error(`transport/proxy request failed: ${msg}`);
-  }
-
-  const body = response.body.toString('utf-8');
-  if (response.statusCode >= 400) {
-    const reason = describeBraveStatus(response.statusCode);
-    const detail = summarizeResponseBody(body);
-    throw new Error(`HTTP ${response.statusCode} (${reason})${detail ? ` — ${detail}` : ''}`);
-  }
-
-  let results: SearchResult[];
-  try {
-    results = parseBraveResults(body, 3);
-  } catch (err) {
-    const msg = String((err as Error).message ?? err).trim();
-    const detail = summarizeResponseBody(body);
-    throw new Error(`Brave Search returned invalid JSON${msg ? `: ${msg}` : ''}${detail ? ` — ${detail}` : ''}`);
-  }
-
-  if (results.length === 0) {
-    const detail = summarizeResponseBody(body);
-    throw new Error(`Brave Search returned no parseable results${detail ? ` — ${detail}` : ''}`);
-  }
+  const response = await fetchUrl(`${baseURL.replace(/\/+$/, '')}/web_search`, MAX_REDIRECTS, {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {})
+  }, cancellation, JSON.stringify({ query, count: maxResults }));
+  const text = response.body.toString('utf-8');
+  if (response.statusCode >= 400) throw new Error(`gateway returned HTTP ${response.statusCode}${summarizeResponseBody(text) ? ` — ${summarizeResponseBody(text)}` : ''}`);
+  const results = normalizeSearchResults(JSON.parse(text), maxResults);
   return results;
 }
 
@@ -664,64 +505,30 @@ export const webSearchTool: Tool = {
     type: 'function',
     function: {
       name: 'web_search',
-      description:
-        'Search the web via Brave Search (when burstcode.web.braveApiKey is configured), DuckDuckGo, and Bing, then return a list of result titles, URLs, and snippets. ' +
-        'Use this when you need to find documentation, error solutions, API references, or any information not available in the workspace. ' +
-        'After getting results, call read_webpage with a specific URL to read the full content.',
+      description: 'Retrieve public external information through the configured gateway REST API, returning result titles, URLs, and snippets. Use when answering requires evidence from the public web rather than private account data. After getting results, call read_webpage with a specific URL to read the full content.',
       parameters: {
         type: 'object',
         properties: {
-          query: {
-            type: 'string',
-            description: 'The search query. Be specific — include library name, version, error message, etc.'
-          },
-          maxResults: {
-            type: 'number',
-            description: 'Maximum number of results to return (default 8, max 20).'
-          }
+          query: { type: 'string', description: 'The search query.' },
+          maxResults: { type: 'number', description: 'Maximum number of results to return (default 8, max 20).' }
         },
         required: ['query']
       }
     }
   },
-
   async execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
     const query = String(args.query ?? '').trim();
     if (!query) return { content: 'web_search: query is required', isError: true };
-
     const maxResults = Math.min(Math.max(1, Number(args.maxResults) || 8), 20);
-
     ctx.emitProgress(`Searching: ${query} …`);
-
-    let results: SearchResult[];
     try {
-      results = await duckduckgoSearch(query, maxResults, ctx.cancellation);
+      const results = await gatewaySearch(query, maxResults, ctx.cancellation);
+      if (ctx.cancellation.isCancellationRequested) return { content: 'web_search: cancelled', isError: true };
+      const lines = results.map((result, index) => `${index + 1}. **${result.title}**\n   URL: ${result.url}${result.snippet ? `\n   ${result.snippet}` : ''}`);
+      return { content: `# Web search: "${query}" (${results.length} results)\n\n${lines.join('\n\n')}`, meta: { query, count: results.length } };
     } catch (err) {
-      return {
-        content: `web_search: search failed — ${String((err as Error).message ?? err)}`,
-        isError: true
-      };
+      return { content: `web_search: search failed — ${String((err as Error).message ?? err)}`, isError: true };
     }
-
-    if (ctx.cancellation.isCancellationRequested) {
-      return { content: 'web_search: cancelled', isError: true };
-    }
-
-    if (results.length === 0) {
-      return {
-        content: `web_search: no results found for "${query}". Try rephrasing or using read_webpage with a known URL.`,
-        meta: { query, count: 0 }
-      };
-    }
-
-    const lines = results.map((r, i) =>
-      `${i + 1}. **${r.title}**\n   URL: ${r.url}${r.snippet ? '\n   ' + r.snippet : ''}`
-    );
-
-    return {
-      content: `# Web search: "${query}" (${results.length} results)\n\n${lines.join('\n\n')}`,
-      meta: { query, count: results.length }
-    };
   }
 };
 

@@ -76,6 +76,7 @@ interface RunOptions {
   useRules?: boolean;
   useSkills?: boolean;
   useMcp?: boolean;
+  useWebSearch?: boolean;
   reasoningEnabled?: boolean;
   reasoningEffort?: string;
 }
@@ -1019,7 +1020,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async handleMessage(msg: InboundMessage): Promise<void> {
     switch (msg.type) {
       case 'send': {
-        const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttachment[]; useRules?: boolean; useSkills?: boolean; useMcp?: boolean; reasoningEnabled?: boolean; reasoningEffort?: string };
+const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttachment[]; useRules?: boolean; useSkills?: boolean; useMcp?: boolean; useWebSearch?: boolean; reasoningEnabled?: boolean; reasoningEffort?: string };
         const images = Array.isArray(payload.images)
           ? payload.images
               .filter((img): img is ChatImageAttachment => {
@@ -1050,6 +1051,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           useRules: payload.useRules !== false,
           useSkills: payload.useSkills !== false,
           useMcp: payload.useMcp !== false,
+          useWebSearch: payload.useWebSearch !== false,
           reasoningEnabled: payload.reasoningEnabled === true,
           reasoningEffort: typeof payload.reasoningEffort === 'string' ? payload.reasoningEffort : undefined
         });
@@ -1982,7 +1984,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ...this.llmConfigForSession(session),
       supportsVision: activeModelSupportsVision,
       reasoningEnabled: opts.reasoningEnabled === true,
-      reasoningEffort
+      reasoningEffort,
+      webSearchEnabled: opts.useWebSearch !== false && vscode.workspace.getConfiguration('burstcode.web').get<boolean>('enabled') !== false
     };
     const client = new OpenAIClient(llmCfg, this.logger);
     const bridge = new LspBridge(
@@ -2034,8 +2037,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const systemPrompt = await systemPromptPromise;
     const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
+    const webCfg = vscode.workspace.getConfiguration('burstcode.web');
+    const webSearchEnabled = webCfg.get<boolean>('enabled') !== false;
+    const webSearchMode = webCfg.get<string>('searchMode') === 'native'
+      ? 'native'
+      : webCfg.get<string>('searchMode') === 'gateway'
+        ? 'gateway'
+        : 'auto';
     const readWindowTracker = createReadWindowTracker();
-    const coreReadTools: Tool[] = [buildCollectContextTool(this.applier, session.id, readWindowTracker), buildReadFileTool(this.applier, session.id, readWindowTracker), listDirTool, grepSearchTool, workspaceOutlineTool, webSearchTool, readWebpageTool];
+    const coreReadTools: Tool[] = [
+      buildCollectContextTool(this.applier, session.id, readWindowTracker),
+      buildReadFileTool(this.applier, session.id, readWindowTracker),
+      listDirTool,
+      grepSearchTool,
+      workspaceOutlineTool,
+      ...(webSearchEnabled && webSearchMode !== 'native' ? [webSearchTool] : []),
+      ...(webSearchEnabled ? [readWebpageTool] : [])
+    ];
     const writeFileTool = buildWriteFileTool(this.applier, session.id, messageIndex);
     const lspTools = buildLspTools(bridge, this.depGuard);
     const editTools = buildEditTools(this.applier, askUser, session.id, messageIndex);
@@ -3043,6 +3061,10 @@ setTimeout(() => {
           <input id="mcpToggle" type="checkbox" checked>
           <span class="track"></span><span class="txt">MCP</span>
         </label>
+        <label class="toggle" title="Enable web search for this run">
+          <input id="webSearchToggle" type="checkbox" checked>
+          <span class="track"></span><span class="txt">Web</span>
+        </label>
       </div>
       <button id="bgStatus" type="button" data-phase="disabled" title="Background explorer disabled — click to open activity log">
         <span class="dot" aria-hidden="true"></span>
@@ -3084,6 +3106,7 @@ const imagePreviewClose = document.getElementById('imagePreviewClose');
 const rulesToggle = document.getElementById('rulesToggle');
 const skillsToggle = document.getElementById('skillsToggle');
 const mcpToggle = document.getElementById('mcpToggle');
+const webSearchToggle = document.getElementById('webSearchToggle');
 const attachImageInput = document.getElementById('attachImageInput');
 const attachImageBtn = document.getElementById('attachImageBtn');
 const sendBtn = document.getElementById('sendBtn');
@@ -6717,7 +6740,7 @@ sendBtn.addEventListener('click', () => {
     // the server respond with an appropriate error if needed.
     console.warn('[burstcode] current model not flagged as vision-capable; sending anyway');
   }
-  vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
+vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, useWebSearch: !!webSearchToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
   pastedImages = [];
   renderAttachments();
   input.value = '';
@@ -6727,7 +6750,7 @@ sendBtn.addEventListener('click', () => {
 queueBtn.addEventListener('click', () => {
   const text = input.value.trim();
   if (!text) return;
-  vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
+vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, useWebSearch: !!webSearchToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
   input.value = '';
   autosizeInput();
   updateQueueButton();
