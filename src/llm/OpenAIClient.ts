@@ -1390,7 +1390,14 @@ function sanitizeEmptyContentBlocks(messages: ChatMessage[]): ChatMessage[] {
 
 export function isNativeWebSearchRejectedError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /web_search_options/i.test(message) && /unsupported|not supported|unknown|unrecognized|unexpected|not allowed|not permitted|extra inputs|不支持|非法/i.test(message);
+  const status = error && typeof error === 'object' && 'status' in error
+    ? Number((error as { status?: unknown }).status)
+    : Number.NaN;
+  const isGone = status === 410 || /\b410\b/.test(message);
+  return isGone || (
+    /web_search_options/i.test(message) &&
+    /unsupported|not supported|unknown|unrecognized|unexpected|not allowed|not permitted|extra inputs|不支持|非法/i.test(message)
+  );
 }
 
 export function selectWebSearchTools(tools: ToolDef[], native: boolean): ToolDef[] | undefined {

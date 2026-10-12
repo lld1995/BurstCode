@@ -4,6 +4,7 @@ import {
   ChatMessage,
   getCachedFetchedModels,
   isImageContentRejectedError,
+  isNativeWebSearchRejectedError,
   modelRecordSupportsVision,
   prepareMessagesForModel
 } from '../llm/OpenAIClient';
@@ -188,6 +189,18 @@ describe('modelRecordSupportsVision', () => {
     assert.equal(modelRecordSupportsVision({ input_modalities: ['file', 'image', 'text', 'video'] }), true);
     assert.equal(modelRecordSupportsVision({ supports_multimodal: true }), true);
     assert.equal(modelRecordSupportsVision({ input_modalities: 'text,image' }), false);
+  });
+});
+
+describe('native web-search fallback detection', () => {
+  test('treats an upstream 410 as native search rejection', () => {
+    assert.equal(isNativeWebSearchRejectedError(new Error('Upstream error: 410')), true);
+    assert.equal(isNativeWebSearchRejectedError({ status: 410, message: 'Gone' }), true);
+  });
+
+  test('keeps requiring web_search_options for descriptive schema rejections', () => {
+    assert.equal(isNativeWebSearchRejectedError(new Error('web_search_options is not supported')), true);
+    assert.equal(isNativeWebSearchRejectedError(new Error('Upstream error: 400')), false);
   });
 });
 
