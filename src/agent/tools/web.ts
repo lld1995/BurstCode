@@ -142,7 +142,7 @@ export function openTunnel(
     socket.setTimeout(TIMEOUT_MS, () => fail(new Error('Proxy connection timed out')));
   });
 }
-export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}, cancellation?: vscode.CancellationToken, requestBody?: string): Promise<FetchResult> {
+export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}, cancellation?: vscode.CancellationToken, requestBody?: string, useProxy = true): Promise<FetchResult> {
   return new Promise((resolve, reject) => {
     let parsed: URL;
     try {
@@ -174,7 +174,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
         try { next = new URL(res.headers.location, targetUrl).href; }
         catch { reject(new Error(`Redirect to invalid URL: ${res.headers.location}`)); return; }
         res.resume();
-        fetchUrl(next, redirectsLeft - 1, headers, cancellation, requestBody).then(resolve).catch(reject);
+        fetchUrl(next, redirectsLeft - 1, headers, cancellation, requestBody, useProxy).then(resolve).catch(reject);
         return;
       }
 
@@ -193,7 +193,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
       res.on('error', reject);
     };
 
-    const proxy = getProxyUrl();
+    const proxy = useProxy ? getProxyUrl() : null;
 
     if (proxy) {
       // openTunnel handles CONNECT + TLS; send plain HTTP/1.1 directly over the socket
@@ -251,7 +251,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
               let next: string;
               try { next = new URL(resHeaders['location'], targetUrl).href; }
               catch { reject(new Error(`Redirect to invalid URL: ${resHeaders['location']}`)); return; }
-              fetchUrl(next, redirectsLeft - 1, headers, cancellation, requestBody).then(resolve).catch(reject);
+              fetchUrl(next, redirectsLeft - 1, headers, cancellation, requestBody, useProxy).then(resolve).catch(reject);
               return;
             }
             resolve({
@@ -462,15 +462,20 @@ function summarizeResponseBody(body: string, maxChars = 500): string {
   }
 }
 
+function truncateSearchText(value: string, maxChars: number): string {
+  const text = value.trim();
+  return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+}
+
 function normalizeSearchResults(payload: unknown, maxResults: number): SearchResult[] {
   const root = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
   const raw = Array.isArray(root.results) ? root.results : Array.isArray(root.data) ? root.data : [];
   return raw.map((item) => {
     const value = item && typeof item === 'object' ? item as Record<string, unknown> : {};
     return {
-      title: String(value.title ?? value.name ?? '').trim(),
-      url: String(value.url ?? value.link ?? '').trim(),
-      snippet: String(value.snippet ?? value.description ?? value.content ?? '').trim()
+      title: truncateSearchText(String(value.title ?? value.name ?? ''), 300),
+      url: truncateSearchText(String(value.url ?? value.link ?? ''), 2000),
+      snippet: truncateSearchText(String(value.snippet ?? value.description ?? value.content ?? ''), 4096)
     };
   }).filter((item) => item.title && /^https?:\/\//i.test(item.url)).slice(0, maxResults);
 }
@@ -491,7 +496,7 @@ async function gatewaySearch(query: string, maxResults: number, cancellation?: v
     Accept: 'application/json',
     'Content-Type': 'application/json',
     ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {})
-  }, cancellation, JSON.stringify({ query, count: maxResults }));
+  }, cancellation, JSON.stringify({ query, count: maxResults }), false);
   const text = response.body.toString('utf-8');
   if (response.statusCode >= 400) throw new Error(`gateway returned HTTP ${response.statusCode}${summarizeResponseBody(text) ? ` — ${summarizeResponseBody(text)}` : ''}`);
   const results = normalizeSearchResults(JSON.parse(text), maxResults);
