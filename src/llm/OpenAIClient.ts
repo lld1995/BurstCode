@@ -1394,7 +1394,10 @@ export function isNativeWebSearchRejectedError(error: unknown): boolean {
     ? Number((error as { status?: unknown }).status)
     : Number.NaN;
   const isGone = status === 410 || /\b410\b/.test(message);
-  return isGone || (
+  // Backends whose chat template only allows a leading system message reject
+  // the trailing native-search system note with this exact phrase.
+  const isSystemPosition = /system message must be at the beginning/i.test(message);
+  return isGone || isSystemPosition || (
     /web_search_options/i.test(message) &&
     /unsupported|not supported|unknown|unrecognized|unexpected|not allowed|not permitted|extra inputs|不支持|非法/i.test(message)
   );
@@ -1475,8 +1478,25 @@ export class OpenAIClient {
       requestMessages: ChatMessage[] = safeMessages
     ): OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & Record<string, unknown> => ({
       model: this.config.model,
+      // Merge the native-search note into the LEADING system message instead of
+      // appending one at the end: several OpenAI-compatible backends (e.g. the
+      // vLLM qwen3.x chat templates behind sub2api-style gateways) reject any
+      // system message that is not the first message with
+      // "System message must be at the beginning." (upstream 400, wrapped by
+      // the gateway into an HTTP 200 body with code:500), which used to kill
+      // every request whenever native web search was active.
       messages: useNativeSearch
-        ? [...requestMessages, { role: 'system' as const, content: 'Public web search is provided natively by the provider through web_search_options for this request. Use that capability when external evidence is needed; do not claim it is unavailable because no web_search function is listed. Private account tools are not a substitute for public web evidence.' }]
+        ? (() => {
+            const note = 'Public web search is provided natively by the provider through web_search_options for this request. Use that capability when external evidence is needed; do not claim it is unavailable because no web_search function is listed. Private account tools are not a substitute for public web evidence.';
+            const merged = [...requestMessages];
+            const first = merged[0];
+            if (first && first.role === 'system' && typeof first.content === 'string') {
+              merged[0] = { ...first, content: `${first.content}\n\n${note}` };
+            } else {
+              merged.unshift({ role: 'system' as const, content: note });
+            }
+            return merged;
+          })()
         : requestMessages,
       tools: searchEnabled ? selectWebSearchTools(tools, useNativeSearch) : tools,
       ...(useNativeSearch ? { web_search_options: {} } : {}),
@@ -1510,6 +1530,12 @@ export class OpenAIClient {
               : {}),
             chat_template_kwargs: {
               thinking: this.config.reasoningEnabled === true,
+              // Qwen3-family chat templates (qwen3 / qwen3.8 on vLLM) switch
+              // thinking via `enable_thinking`, NOT `thinking` — sending only
+              // `thinking` silently leaves thinking ON. Emit both spellings:
+              // Jinja templates ignore unknown kwargs, so other backends that
+              // use either name keep working.
+              enable_thinking: this.config.reasoningEnabled === true,
               ...(this.config.reasoningEnabled === true && this.config.reasoningEffort
                 ? { reasoning_effort: this.config.reasoningEffort }
                 : {})
@@ -1533,6 +1559,20 @@ export class OpenAIClient {
       const splitter = new ThinkSplitter();
 
       for await (const part of stream) {
+        // Some OpenAI-compatible gateways (sub2api → vLLM wrappers) report
+        // upstream failures as an SSE frame with HTTP 200:
+        //   {"type":"error","content":"发生未知错误: ...","stop":true}
+        // Such frames carry no `choices`, so without this check they are
+        // silently skipped and the run ends with empty output and no error.
+        const errFrame = part as typeof part & { type?: string; error?: unknown; message?: unknown; content?: unknown };
+        if (errFrame.type === 'error' || errFrame.error) {
+          const detail = typeof errFrame.content === 'string'
+            ? errFrame.content
+            : typeof errFrame.message === 'string'
+              ? errFrame.message
+              : JSON.stringify(errFrame.error ?? part);
+          throw new Error(detail || 'Upstream returned an error frame.');
+        }
         const choice = part.choices?.[0];
         if (!choice) continue;
         const delta = choice.delta;
