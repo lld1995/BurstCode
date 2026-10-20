@@ -8,6 +8,7 @@ import { readChatProfile } from '../../llm/OpenAIClient';
 
 const MAX_REDIRECTS = 6;
 const TIMEOUT_MS = 25_000;
+const SEARCH_TIMEOUT_MS = 3 * 60_000;
 const MAX_BODY_BYTES = 3 * 1024 * 1024; // 3 MB cap on raw download
 const DEFAULT_MAX_CHARS = 12_000;
 const USER_AGENT = 'Mozilla/5.0 (compatible; BurstCode-Agent/1.0; +https://github.com/lld1995/BurstCode)';
@@ -142,7 +143,7 @@ export function openTunnel(
     socket.setTimeout(TIMEOUT_MS, () => fail(new Error('Proxy connection timed out')));
   });
 }
-export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}, cancellation?: vscode.CancellationToken, requestBody?: string, useProxy = true): Promise<FetchResult> {
+export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, headers: Record<string, string> = {}, cancellation?: vscode.CancellationToken, requestBody?: string, useProxy = true, timeoutMs = TIMEOUT_MS): Promise<FetchResult> {
   return new Promise((resolve, reject) => {
     let parsed: URL;
     try {
@@ -174,7 +175,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
         try { next = new URL(res.headers.location, targetUrl).href; }
         catch { reject(new Error(`Redirect to invalid URL: ${res.headers.location}`)); return; }
         res.resume();
-        fetchUrl(next, redirectsLeft - 1, headers, cancellation, requestBody, useProxy).then(resolve).catch(reject);
+        fetchUrl(next, redirectsLeft - 1, headers, cancellation, requestBody, useProxy, timeoutMs).then(resolve).catch(reject);
         return;
       }
 
@@ -209,7 +210,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
             socket.destroy();
             reject(err);
           };
-          const timer = setTimeout(() => settleReject(new Error(`Request timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS);
+          const timer = setTimeout(() => settleReject(new Error(`Request timed out after ${timeoutMs}ms`)), timeoutMs);
           let cancellationDisposable: vscode.Disposable | undefined;
           cancellationDisposable = cancellation?.onCancellationRequested(() => settleReject(new Error('Request cancelled')));
           if (cancellation?.isCancellationRequested) {
@@ -251,7 +252,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
               let next: string;
               try { next = new URL(resHeaders['location'], targetUrl).href; }
               catch { reject(new Error(`Redirect to invalid URL: ${resHeaders['location']}`)); return; }
-              fetchUrl(next, redirectsLeft - 1, headers, cancellation, requestBody, useProxy).then(resolve).catch(reject);
+              fetchUrl(next, redirectsLeft - 1, headers, cancellation, requestBody, useProxy, timeoutMs).then(resolve).catch(reject);
               return;
             }
             resolve({
@@ -275,7 +276,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
         method: requestBody === undefined ? 'GET' : 'POST',
         headers: reqHeaders,
         rejectUnauthorized: false,
-        timeout: TIMEOUT_MS,
+        timeout: timeoutMs,
       }, handleResponse);
       let settled = false;
       let cancellationDisposable: vscode.Disposable | undefined;
@@ -292,7 +293,7 @@ export function fetchUrl(targetUrl: string, redirectsLeft = MAX_REDIRECTS, heade
         cancellationDisposable?.dispose();
         reject(err);
       });
-      req.on('timeout', () => rejectAndDestroy(new Error(`Request timed out after ${TIMEOUT_MS}ms`)));
+      req.on('timeout', () => rejectAndDestroy(new Error(`Request timed out after ${timeoutMs}ms`)));
       cancellationDisposable = cancellation?.onCancellationRequested(() => rejectAndDestroy(new Error('Request cancelled')));
       if (cancellation?.isCancellationRequested) {
         rejectAndDestroy(new Error('Request cancelled'));
@@ -492,11 +493,12 @@ async function gatewaySearch(query: string, maxResults: number, cancellation?: v
     ? 'No chat API key configured for inherited web search'
     : 'No dedicated web-search API key configured');
 
+  // Gateway search must bypass all configured/system proxies; only webpage fetching may use one.
   const response = await fetchUrl(`${baseURL.replace(/\/+$/, '')}/web_search`, MAX_REDIRECTS, {
     Accept: 'application/json',
     'Content-Type': 'application/json',
     ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {})
-  }, cancellation, JSON.stringify({ query, count: maxResults }), false);
+  }, cancellation, JSON.stringify({ query, count: maxResults }), false, SEARCH_TIMEOUT_MS);
   const text = response.body.toString('utf-8');
   if (response.statusCode >= 400) throw new Error(`gateway returned HTTP ${response.statusCode}${summarizeResponseBody(text) ? ` — ${summarizeResponseBody(text)}` : ''}`);
   const results = normalizeSearchResults(JSON.parse(text), maxResults);
@@ -506,6 +508,8 @@ async function gatewaySearch(query: string, maxResults: number, cancellation?: v
 export const webSearchTool: Tool = {
   name: 'web_search',
   parallelSafe: true,
+  // The AgentLoop's default 30s batch safety timeout must not cancel a 3-minute search.
+  noTimeout: true,
   schema: {
     type: 'function',
     function: {
