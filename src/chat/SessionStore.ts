@@ -193,7 +193,8 @@ export function buildTranscriptRange(
   messages: ChatMessage[],
   checkpoints: SessionCheckpoint[] | undefined,
   requestedStart: number,
-  requestedEnd: number
+  requestedEnd: number,
+  textOnly = false
 ): { entries: TranscriptEntry[]; total: number } {
   const start = Math.max(0, Math.floor(requestedStart));
   const end = Number.isFinite(requestedEnd)
@@ -276,7 +277,7 @@ export function buildTranscriptRange(
         // Parsing giant propose_edit/write_file arguments dominates session
         // switching. Parse only calls that are actually part of this page.
         let parsedArgs: unknown;
-        if (retained) {
+        if (retained && !textOnly) {
           try { parsedArgs = JSON.parse(c.function.arguments); } catch { parsedArgs = undefined; }
         }
         const entry: TranscriptEntry = {

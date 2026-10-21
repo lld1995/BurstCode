@@ -16,6 +16,7 @@ const imagePreviewClose = document.getElementById('imagePreviewClose');
 const rulesToggle = document.getElementById('rulesToggle');
 const skillsToggle = document.getElementById('skillsToggle');
 const mcpToggle = document.getElementById('mcpToggle');
+const webSearchToggle = document.getElementById('webSearchToggle');
 const attachImageInput = document.getElementById('attachImageInput');
 const attachImageBtn = document.getElementById('attachImageBtn');
 const sendBtn = document.getElementById('sendBtn');
@@ -147,6 +148,24 @@ let runStartedAt = 0;
 let elapsedTimer = null;
 let currentIter = 0;
 let lastUserActivityPostAt = 0;
+let currentFindQuery = '';
+let currentFindMatches = [];
+let currentFindIndex = -1;
+let currentFindBar = null;
+let findRequestId = 0;
+let findTimer = null;
+let findPending = false;
+let findTargetEl = null;
+let findScrollFrame = 0;
+let pendingHistoryMatch = null;
+let findSavedAutoScroll = true;
+let findSavedScrollTop = 0;
+let findPage = null;
+let findPageStart = -1;
+let findPageEnd = -1;
+let findPageRequest = 0;
+const findMarkedRoots = new Set();
+const findOpenedDetails = new Set();
 
 // Auto-follow scrolling. We only push the log to the bottom when the user
 // is already (close to) at the bottom. As soon as the user scrolls up, we
@@ -312,8 +331,8 @@ log.addEventListener('touchmove', markManualScrollIntent, { passive: true });
 log.addEventListener('pointerdown', markManualScrollIntent, { passive: true });
 log.addEventListener('scroll', () => {
   const atBottom = isLogAtBottom();
-  if (Date.now() - lastManualScrollAt < 800 || atBottom) autoScroll = atBottom;
-  if (log.scrollTop < 120) requestOlderTranscript();
+  if (!currentFindBar && (Date.now() - lastManualScrollAt < 800 || atBottom)) autoScroll = atBottom;
+  if (!currentFindBar && log.scrollTop < 120) requestOlderTranscript();
   scheduleLogVirtualization();
 }, { passive: true });
 if (typeof ResizeObserver !== 'undefined') {
@@ -334,7 +353,7 @@ let loadingOlderTranscript = false;
 const virtParked = new WeakMap(); // el -> DocumentFragment of parked children
 function isLogVirtCandidate(el) {
   if (!el || el.nodeType !== 1) return false;
-  if (el.classList.contains('empty-state')) return false;
+  if (el.classList.contains('empty-state') || el.classList.contains('find-page')) return false;
   // Keep live streaming nodes fully mounted so partial updates keep working.
   if (el === activeAssistantEl || el === activeReasoningEl || el === activeStreamingToolEl) return false;
   if (el.dataset && el.dataset.streaming === 'true') return false;
@@ -373,6 +392,210 @@ function pinLogVirtualization(el) {
   virtPinnedEls.add(el);
   expandLogItem(el);
 }
+function clearFindMarks() {
+  if (window.CSS && CSS.highlights) { CSS.highlights.delete('chat-find'); CSS.highlights.delete('chat-find-active'); }
+  findMarkedRoots.forEach((root) => {
+    const parked = virtParked.get(root);
+    [root, parked].filter(Boolean).forEach((parent) => parent.querySelectorAll('mark.chat-find').forEach((mark) => mark.replaceWith(document.createTextNode(mark.textContent))));
+    root.classList.remove('find-current');
+  });
+  findMarkedRoots.clear();
+}
+function findRanges(root) {
+  const nodes = [];
+  let text = '';
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      return node.parentElement && node.parentElement.closest('button, summary, .msg-actions, .user-actions, .gutter, .copy, .find-source-label') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  while (walker.nextNode()) { const node = walker.currentNode; nodes.push({ node, start: text.length }); text += node.data; }
+  const ranges = [];
+  const query = currentFindQuery.toLowerCase();
+  if (!query || !nodes.length) return ranges;
+  const lower = text.toLowerCase();
+  let from = 0;
+  while ((from = lower.indexOf(query, from)) !== -1) {
+    const end = from + query.length;
+    const first = nodes.find((item) => item.start + item.node.length > from);
+    const last = nodes.find((item) => item.start + item.node.length >= end);
+    if (first && last) {
+      const range = document.createRange();
+      range.setStart(first.node, from - first.start); range.setEnd(last.node, end - last.start); ranges.push(range);
+    }
+    from = end;
+  }
+  return ranges;
+}
+function updateFindMarks() {
+  clearFindMarks();
+  if (!currentFindQuery) return;
+  const ranges = [];
+  const roots = findPage ? Array.from(findPage.children) : Array.from(log.children);
+  roots.forEach((root) => {
+    if (root.classList.contains('virt-collapsed')) return;
+    ranges.push(...findRanges(root));
+    findMarkedRoots.add(root);
+  });
+  if (window.CSS && CSS.highlights && window.Highlight) {
+    const highlight = new Highlight(); ranges.forEach((range) => highlight.add(range)); CSS.highlights.set('chat-find', highlight);
+  } else {
+    // Older Electron versions: bounded plain-text search pages have one text
+    // node per entry, so wrapping ranges never damages Markdown/action nodes.
+    ranges.reverse().forEach((range) => {
+      if (range.startContainer === range.endContainer) { const mark = document.createElement('mark'); mark.className = 'chat-find'; range.surroundContents(mark); }
+    });
+  }
+}
+function requestCurrentFind() {
+  clearTimeout(findTimer); ++findPageRequest;
+  if (findScrollFrame) cancelAnimationFrame(findScrollFrame);
+  findScrollFrame = 0;
+  const requestId = ++findRequestId;
+  currentFindMatches = []; currentFindIndex = -1; findPending = !!currentFindQuery;
+  clearFindMarks(); updateFindCounter();
+  if (!currentFindQuery) {
+    if (findPage) { findPage.remove(); findPage = null; log.classList.remove('find-mode'); log.scrollTop = findSavedScrollTop; }
+    return;
+  }
+  findTimer = setTimeout(() => {
+    const id = loadedTranscriptSessionId || sessionsCache.activeId;
+    if (!id) { findPending = false; updateFindCounter(); return; }
+    vscode.postMessage({ type: 'find-in-session', payload: { id, query: currentFindQuery, requestId } });
+  }, 180);
+}
+function revealFindMatch() {
+  const match = currentFindMatches[currentFindIndex];
+  if (!match) return;
+  autoScroll = false;
+  if (pendingScrollFrame) { cancelAnimationFrame(pendingScrollFrame); pendingScrollFrame = 0; pendingScrollForce = false; }
+  let root = findPage && findPage.querySelector('[data-transcript-index="' + match.index + '"]');
+  // Use a text-faithful bounded page so count and navigation agree even for
+  // Markdown links, folded tools, truncated previews and parked DOM fragments.
+  if (!root) {
+    vscode.postMessage({ type: 'load-transcript-match', payload: { id: loadedTranscriptSessionId || sessionsCache.activeId, index: match.index, requestId: ++findPageRequest } });
+    return;
+  }
+  if (findTargetEl) unpinLogVirtualization(findTargetEl);
+  findTargetEl = root; pinLogVirtualization(root);
+  [root, ...root.querySelectorAll('details')].forEach((det) => {
+    if (det.tagName === 'DETAILS' && !det.open) { findOpenedDetails.add(det); det.open = true; }
+  });
+  // Restore first, then allow layout/virtualization to settle before measuring text.
+  if (findScrollFrame) cancelAnimationFrame(findScrollFrame);
+  findScrollFrame = requestAnimationFrame(() => {
+    findScrollFrame = requestAnimationFrame(() => {
+      findScrollFrame = 0;
+      if (!root.isConnected || !currentFindBar) return;
+      updateFindMarks();
+      let ranges = findRanges(root);
+      // Rich tool previews may truncate output or hide Markdown syntax; expose only
+      // this entry's original text when its indexed occurrence is not rendered.
+      if (!ranges[match.occurrence] && root._findSource) {
+        let source = root.querySelector('.find-source');
+        if (!source) { source = document.createElement('pre'); source.className = 'find-source'; source.textContent = root._findSource; root.appendChild(source); }
+        ranges = findRanges(source);
+      }
+      const range = ranges[match.occurrence] || ranges[0];
+      if (range && window.CSS && CSS.highlights && window.Highlight) CSS.highlights.set('chat-find-active', new Highlight(range));
+      else if (range) { const mark = range.startContainer.parentElement.closest('mark.chat-find'); if (mark) mark.classList.add('active'); }
+      root.classList.add('find-current'); findMarkedRoots.add(root);
+      const rect = range ? range.getBoundingClientRect() : root.getBoundingClientRect();
+      const viewport = log.getBoundingClientRect();
+      log.scrollTop += rect.top - viewport.top - log.clientHeight * 0.4;
+      // Scroll nested code/tool containers as well, without scrolling the Webview.
+      if (range) {
+        let parent = range.startContainer.parentElement;
+        while (parent && parent !== log) {
+          if (parent.scrollHeight > parent.clientHeight + 1 && getComputedStyle(parent).overflowY.match(/auto|scroll/)) {
+            parent.scrollTop += range.getBoundingClientRect().top - parent.getBoundingClientRect().top - parent.clientHeight * 0.4;
+          }
+          parent = parent.parentElement;
+        }
+      }
+      updateFindCounter();
+    });
+  });
+}
+function updateFindCounter() {
+  if (!currentFindBar) return;
+  const count = currentFindMatches.length;
+  const label = currentFindBar.querySelector('.find-count');
+  if (label) label.textContent = findPending ? 'Searching…' : currentFindQuery ? (count ? (currentFindIndex + 1) + ' / ' + count : '0 / 0') : '';
+  currentFindBar.querySelectorAll('[data-find-nav]').forEach((button) => { button.disabled = findPending || !count; });
+}
+function moveFind(delta) {
+  if (!currentFindMatches.length) return;
+  currentFindIndex = (currentFindIndex + delta + currentFindMatches.length) % currentFindMatches.length;
+  updateFindCounter();
+  revealFindMatch();
+}
+function closeFindBar() {
+  if (!currentFindBar) return;
+  clearTimeout(findTimer); ++findRequestId; ++findPageRequest;
+  if (findScrollFrame) cancelAnimationFrame(findScrollFrame);
+  findScrollFrame = 0;
+  clearFindMarks();
+  if (findTargetEl) unpinLogVirtualization(findTargetEl);
+  findTargetEl = null;
+  findOpenedDetails.forEach((det) => { if (det.isConnected) det.open = false; }); findOpenedDetails.clear();
+  if (findPage) findPage.remove();
+  findPage = null; findPageStart = -1; findPageEnd = -1;
+  log.classList.remove('find-mode');
+  currentFindBar.remove(); currentFindBar = null;
+  currentFindQuery = ''; currentFindMatches = []; currentFindIndex = -1; findPending = false;
+  autoScroll = findSavedAutoScroll; log.scrollTop = findSavedScrollTop;
+  scheduleLogVirtualization();
+}
+function mountFindPage(payload) {
+  clearFindMarks();
+  if (findTargetEl) unpinLogVirtualization(findTargetEl);
+  if (findPage) findPage.remove();
+  findPage = document.createElement('div'); findPage.className = 'find-page';
+  findPageStart = payload.transcriptOffset; findPageEnd = findPageStart + payload.transcript.length;
+  payload.transcript.forEach((entry, offset) => {
+    const root = document.createElement('div');
+    root.className = 'msg ' + (entry.kind === 'tool' || entry.kind === 'reasoning' ? 'find-tool-entry' : entry.kind);
+    root.dataset.transcriptIndex = String(findPageStart + offset);
+    const label = document.createElement('div'); label.className = 'find-source-label'; label.textContent = entry.name || entry.kind;
+    const text = document.createElement('div'); text.className = 'find-entry-text';
+    // Plain text keeps occurrence offsets exact even across Markdown syntax and
+    // tool previews that normally truncate output. Only one bounded page exists.
+    text.textContent = entry.text || '';
+    root.append(label, text); findPage.appendChild(root);
+  });
+  log.appendChild(findPage); log.classList.add('find-mode');
+  autoScroll = false; revealFindMatch();
+} 
+function openFindBar() {
+  if (currentFindBar) { currentFindBar.querySelector('input').focus(); return; }
+  historyEl.classList.remove('open');
+  findSavedAutoScroll = autoScroll; findSavedScrollTop = log.scrollTop; autoScroll = false;
+  const bar = document.createElement('div');
+  bar.className = 'find-bar';
+  const findInput = document.createElement('input');
+  findInput.type = 'search';
+  findInput.placeholder = 'Find in current chat';
+  findInput.setAttribute('aria-label', 'Find in current chat');
+  const count = document.createElement('span');
+  count.className = 'find-count';
+  const prev = document.createElement('button'); prev.type = 'button'; prev.textContent = '↑'; prev.title = 'Previous match';
+  const next = document.createElement('button'); next.type = 'button'; next.textContent = '↓'; next.title = 'Next match';
+  const close = document.createElement('button'); close.type = 'button'; close.textContent = '×'; close.title = 'Close search';
+  prev.dataset.findNav = 'previous'; next.dataset.findNav = 'next';
+  prev.setAttribute('aria-label', 'Previous match'); next.setAttribute('aria-label', 'Next match'); close.setAttribute('aria-label', 'Close search');
+  count.setAttribute('aria-live', 'polite');
+  findInput.addEventListener('input', (ev) => { if (ev.isComposing) return; currentFindQuery = findInput.value; requestCurrentFind(); });
+  findInput.addEventListener('compositionend', () => { currentFindQuery = findInput.value; requestCurrentFind(); });
+  findInput.addEventListener('keydown', (ev) => {
+    if (ev.isComposing) return;
+    if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); moveFind(ev.shiftKey ? -1 : 1); }
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); closeFindBar(); input.focus(); }
+  });
+  prev.onclick = () => moveFind(-1); next.onclick = () => moveFind(1); close.onclick = closeFindBar;
+  bar.append(findInput, count, prev, next, close); log.parentElement.insertBefore(bar, log);
+  currentFindBar = bar; updateFindCounter(); findInput.focus();
+}
 function unpinLogVirtualization(el) {
   if (!el) return;
   try { virtPinnedEls.delete(el); } catch (_) {}
@@ -385,6 +608,7 @@ function scheduleLogVirtualization() {
   });
 }
 function updateLogVirtualization() {
+  if (findPage) return;
   const kids = Array.from(log.children || []);
   if (kids.length <= VIRT_MIN_ITEMS) {
     for (const el of kids) {
@@ -425,7 +649,7 @@ function scheduleScrollToBottom(force) {
     const didForce = pendingScrollForce;
     const shouldScroll = didForce || autoScroll;
     pendingScrollForce = false;
-    if (!shouldScroll) return;
+    if (!shouldScroll || currentFindBar) return;
     // First pass: capture the current scrollHeight.
     const h0 = log.scrollHeight;
     log.scrollTop = h0;
@@ -433,6 +657,7 @@ function scheduleScrollToBottom(force) {
     // bottom content is truly visible. This fixes the "scrollbar moved but
     // content didn't" race caused by async layout.
     requestAnimationFrame(() => {
+      if (currentFindBar) return;
       const h1 = log.scrollHeight;
       if (h1 > h0) {
         log.scrollTop = h1;
@@ -523,7 +748,7 @@ function forceScrollToBottom() {
   // addUserMsg(). Those renderers force-scroll for genuinely new prompts, but a
   // queued forced rAF here would override renderTranscript's viewport restore
   // after older messages are prepended.
-  if (renderingTranscript) return;
+  if (renderingTranscript || currentFindBar) return;
   autoScroll = true;
   scheduleScrollToBottom(true);
 }
@@ -886,8 +1111,80 @@ function renderTabs() {
   }
 }
 
+let historySearchQuery = '';
+const historySearchScope = 'all';
+let historySearchResults = [];
+let historySearchInputEl = null;
+function renderHistorySearchPanel() {
+  const wrap = document.createElement('div');
+  wrap.className = 'search';
+  const header = document.createElement('div');
+  header.className = 'search-heading';
+  header.innerHTML = '<span class="search-heading-title">Conversation history</span><span class="search-heading-hint">Search every chat</span>';
+  wrap.appendChild(header);
+  const inputRow = document.createElement('div');
+  inputRow.className = 'search-input-row';
+  const icon = document.createElement('span');
+  icon.className = 'search-icon';
+  icon.textContent = '⌕';
+  const inputEl = document.createElement('input');
+  historySearchInputEl = inputEl;
+  inputEl.type = 'search';
+  inputEl.placeholder = 'Search conversations…';
+  inputEl.value = historySearchQuery;
+  inputEl.addEventListener('input', () => {
+    historySearchQuery = inputEl.value;
+    historySearchResults = [];
+    vscode.postMessage({ type: 'search-transcripts', payload: { query: historySearchQuery, scope: 'all', sessionId: sessionsCache.activeId } });
+  });
+  inputRow.append(icon, inputEl);
+  wrap.appendChild(inputRow);
+  return wrap;
+}
+function renderHistorySearchResults() {
+  if (!historySearchQuery.trim()) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'search-results';
+  if (!historySearchResults.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No matching messages.';
+    wrap.appendChild(empty);
+    return wrap;
+  }
+  historySearchResults.forEach((r) => {
+    const item = document.createElement('div');
+    item.className = 'search-result';
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = (r.title || 'Chat') + ' · ' + (r.kind || 'message');
+    const text = document.createElement('div');
+    text.className = 'text';
+    text.textContent = r.text || '';
+    item.appendChild(meta);
+    item.appendChild(text);
+    item.onclick = () => {
+      pendingHistoryMatch = { sessionId: r.sessionId, index: r.index, query: historySearchQuery.trim() };
+      vscode.postMessage({ type: 'load-session', payload: { id: r.sessionId } });
+      historyEl.classList.remove('open');
+    };
+    wrap.appendChild(item);
+  });
+  return wrap;
+}
 function renderHistory() {
-  historyEl.innerHTML = '';
+  // Keep controls mounted so responses cannot interrupt focus or IME input.
+  let searchPanel = historyEl.querySelector('.search');
+  if (!searchPanel) {
+    searchPanel = renderHistorySearchPanel();
+    historyEl.appendChild(searchPanel);
+  }
+  Array.from(historyEl.children).forEach((child) => {
+    if (child !== searchPanel) child.remove();
+  });
+  const resultWrap = renderHistorySearchResults();
+  if (resultWrap) historyEl.appendChild(resultWrap);
+  if (historySearchQuery.trim()) return;
   const list = sessionsCache.sessions || [];
   if (list.length === 0) {
     const e = document.createElement('div');
@@ -1233,7 +1530,7 @@ function buildLessonEditor(existing) {
 }
 
 function requestOlderTranscript() {
-  if (loadingOlderTranscript || !loadedTranscriptSessionId || loadedTranscriptOffset <= 0) return;
+  if (currentFindBar || loadingOlderTranscript || !loadedTranscriptSessionId || loadedTranscriptOffset <= 0) return;
   loadingOlderTranscript = true;
   const btn = log.querySelector('.transcript-loader button');
   if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
@@ -1265,6 +1562,7 @@ function renderTranscript(entries, preserveViewport) {
   if (preserveViewport) autoScroll = false;
   log.innerHTML = '';
   renderingTranscript = true;
+  clearFindMarks();
   toolElements.clear();
   activeAssistantEl = null;
   activeReasoningEl = null;
@@ -1275,13 +1573,14 @@ function renderTranscript(entries, preserveViewport) {
     showEmptyState();
     return;
   }
-  entries.forEach((e) => {
+  entries.forEach((e, index) => {
     if (e.kind === 'user') addUserMsg(e.text, e.messageIndex, e.checkpointRef, undefined, e.imageCount, e.imageUrls);
     else if (e.kind === 'assistant') addAssistantMsg(e.text);
     else if (e.kind === 'reasoning') addReasoningMsg(e.text, { open: false, streaming: false });
     else if (e.kind === 'tool') {
       const det = document.createElement('details');
       det.className = 'tool';
+      det.open = false;
       det.dataset.error = String(!!e.isError);
       const sum = document.createElement('summary');
       sum.textContent = (e.isError ? '⚠ ' : '✓ ') + (e.name || 'tool');
@@ -1300,6 +1599,8 @@ function renderTranscript(entries, preserveViewport) {
         det.appendChild(pre);
       }
     }
+    const root = log.lastElementChild;
+    if (root) { root.dataset.transcriptIndex = String(loadedTranscriptOffset + index); root._findSource = e.text || ''; }
   });
   renderingTranscript = false;
   addTranscriptLoader();
@@ -2359,6 +2660,12 @@ function updateSendButton() {
 function updateQueueButton() {
   queueBtn.classList.toggle('show', busy && input.value.trim().length > 0);
 }
+window.addEventListener('keydown', (ev) => {
+  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'f') {
+    ev.preventDefault(); ev.stopPropagation(); openFindBar();
+  }
+  if (ev.key === 'Escape' && currentFindBar) { ev.preventDefault(); ev.stopPropagation(); closeFindBar(); input.focus(); }
+}, true);
 
 function setBusy(v) {
   busy = v;
@@ -2400,6 +2707,7 @@ window.addEventListener('message', (e) => {
       rollbackOverlay.classList.remove('active');
       break;
     case 'reset':
+      closeFindBar();
       rollbackOverlay.classList.remove('active');
       log.innerHTML = '';
       loadedTranscript = [];
@@ -2431,7 +2739,13 @@ window.addEventListener('message', (e) => {
       loadedTranscriptTotal = Math.max(loadedTranscript.length, Number(msg.payload.transcriptTotal) || 0);
       loadingOlderTranscript = false;
       renderTranscript(loadedTranscript, false);
+      updateFindMarks();
+      updateFindCounter();
       renderPlan(msg.payload.plan || []);
+      if (pendingHistoryMatch && pendingHistoryMatch.sessionId === loadedTranscriptSessionId) {
+        openFindBar(); currentFindQuery = pendingHistoryMatch.query;
+        currentFindBar.querySelector('input').value = currentFindQuery; requestCurrentFind();
+      }
       runningTools.clear();
       currentIter = 0;
       const loadedStatus = String((msg.payload && msg.payload.status) || 'idle');
@@ -2456,6 +2770,8 @@ window.addEventListener('message', (e) => {
       loadedTranscriptTotal = Math.max(loadedTranscript.length, Number(msg.payload.transcriptTotal) || 0);
       loadingOlderTranscript = false;
       renderTranscript(loadedTranscript, true);
+      updateFindMarks();
+      updateFindCounter();
       break;
     }
     case 'live-state-replay': {
@@ -2480,6 +2796,34 @@ window.addEventListener('message', (e) => {
     }
     case 'plan-update':
       renderPlan(msg.payload.steps || []);
+      break;
+    case 'session-find-results': {
+      const payload = msg.payload || {};
+      if (!currentFindBar || payload.requestId !== findRequestId || payload.id !== (loadedTranscriptSessionId || sessionsCache.activeId) || payload.query !== currentFindQuery) break;
+      findPending = false;
+      currentFindMatches = Array.isArray(payload.matches) ? payload.matches : [];
+      currentFindIndex = 0;
+      if (pendingHistoryMatch && pendingHistoryMatch.sessionId === payload.id) {
+        const index = currentFindMatches.findIndex((match) => match.index === pendingHistoryMatch.index);
+        if (index >= 0) currentFindIndex = index;
+        pendingHistoryMatch = null;
+      }
+      if (!currentFindMatches.length) currentFindIndex = -1;
+      updateFindCounter(); revealFindMatch();
+      break;
+    }
+    case 'transcript-match': {
+      const payload = msg.payload || {};
+      if (!currentFindBar || payload.id !== (loadedTranscriptSessionId || sessionsCache.activeId) || payload.requestId !== findPageRequest) break;
+      const match = currentFindMatches[currentFindIndex];
+      if (!match || match.index !== payload.targetIndex) break;
+      mountFindPage(payload);
+      break;
+    }
+    case 'transcript-search-results':
+      if (!msg.payload || msg.payload.query !== historySearchQuery.trim()) break;
+      historySearchResults = Array.isArray(msg.payload.results) ? msg.payload.results : [];
+      if (historyEl.classList.contains('open')) renderHistory();
       break;
     case 'sessions':
       sessionsCache = msg.payload || { sessions: [], activeId: null, openIds: [] };
@@ -2906,6 +3250,9 @@ window.addEventListener('message', (e) => {
           preserveToolScrollableAutoScroll(det, pre);
         }
         delete det.dataset.streaming;
+        // Keep completed collect_context / run_shell and other tool output
+        // compact by default; users can expand the details summary on demand.
+        det.open = false;
         if (activeStreamingToolEl === det) activeStreamingToolEl = null;
         unpinLogVirtualization(det);
       }
@@ -3649,7 +3996,7 @@ sendBtn.addEventListener('click', () => {
     // the server respond with an appropriate error if needed.
     console.warn('[burstcode] current model not flagged as vision-capable; sending anyway');
   }
-  vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
+vscode.postMessage({ type: 'send', payload: { text, images: pastedImages, useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, useWebSearch: !!webSearchToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
   pastedImages = [];
   renderAttachments();
   input.value = '';
@@ -3659,7 +4006,7 @@ sendBtn.addEventListener('click', () => {
 queueBtn.addEventListener('click', () => {
   const text = input.value.trim();
   if (!text) return;
-  vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
+vscode.postMessage({ type: 'send', payload: { text, images: [], useRules: !!rulesToggle.checked, useSkills: !!skillsToggle.checked, useMcp: !!mcpToggle.checked, useWebSearch: !!webSearchToggle.checked, reasoningEnabled: !!reasoningToggle.checked, reasoningEffort: reasoningEffortValue } });
   input.value = '';
   autosizeInput();
   updateQueueButton();
@@ -3795,7 +4142,10 @@ function renderModelPickerLabel() {
     labelEl.innerHTML = '<span class="ep">No model selected</span>';
     return;
   }
-  labelEl.innerHTML = '<span class="model">' + escapeHtml(a.model) + '</span>';
+  const eye = currentModelSupportsVision
+    ? '<span class="selected-model-eye" title="视觉模型" aria-label="视觉模型"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/></svg></span>'
+    : '';
+  labelEl.innerHTML = '<span class="model">' + escapeHtml(a.model) + '</span>' + eye;
 }
 
 function renderModelPicker() {
@@ -3882,7 +4232,15 @@ function renderModelPicker() {
       name.title = r.id;
       const badge = document.createElement('span');
       badge.className = 'badge';
-      badge.textContent = r.supportsVision ? (r.source === 'manual' ? 'manual · VL' : 'fetched · VL') : (r.source === 'manual' ? 'manual' : 'fetched');
+      badge.textContent = r.source === 'manual' ? 'manual' : 'fetched';
+      if (r.supportsVision) {
+        const eye = document.createElement('span');
+        eye.className = 'vision-eye';
+        eye.title = '视觉模型';
+        eye.setAttribute('aria-label', '视觉模型');
+        eye.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/></svg>';
+        badge.appendChild(eye);
+      }
       row.appendChild(check);
       row.appendChild(name);
       row.appendChild(badge);
