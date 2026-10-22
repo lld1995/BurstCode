@@ -443,7 +443,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly gitCheckpoint: GitCheckpoint,
     private readonly workspaceIndex: WorkspaceIndex
   ) {
-    this.sessions = new SessionStore(context.workspaceState);
+    const workspaceId = vscode.workspace.workspaceFile?.toString()
+      ?? vscode.workspace.workspaceFolders?.map(f => f.uri.toString()).sort().join('|') ?? '';
+    this.sessions = new SessionStore(context.workspaceState, context.globalState, workspaceId, vscode.workspace.name ?? 'Empty window');
     this.lessons = new LessonStore(context.workspaceState);
     // VS Code can be killed/reloaded while a run is persisted as "running".
     // In-memory CancellationTokenSources do not survive that restart, so those
@@ -680,7 +682,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           title: ctx.session.title,
           createdAt: ctx.session.createdAt,
           updatedAt: Date.now(),
-          status: 'running'
+          status: 'running',
+          scope: ctx.session.scope,
+          workspaceId: ctx.session.workspaceId,
+          originWorkspace: ctx.session.originWorkspace
         });
       }
     }
@@ -688,6 +693,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: 'sessions',
       payload: {
         sessions,
+        workspaceName: vscode.workspace.name ?? 'Empty window',
         activeId: this.currentSession?.id,
         // The tab strip filters by this set; the history overlay ignores it
         // and shows every persisted session.
@@ -989,6 +995,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       createdAt: now,
       updatedAt: now,
       messages: [],
+      scope: 'workspace',
+      workspaceId: this.sessions.workspaceId,
+      originWorkspace: vscode.workspace.name ?? 'Empty window',
       plan: [],
       llm: { model: readLLMConfig().model }
     };
@@ -1158,6 +1167,20 @@ const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttach
       case 'load-session':
         await this.loadSession(String((msg.payload as { id: string })?.id ?? ''));
         break;
+      case 'move-session': {
+        const payload = msg.payload as { id?: string; scope?: string };
+        const id = String(payload?.id ?? '');
+        if (payload?.scope !== 'global' && payload?.scope !== 'workspace') break;
+        if (this.runs.has(id) || this.applier.pendingHunksFrom(0, id) > 0) {
+          vscode.window.showWarningMessage('请先停止任务并处理待审阅的编辑，再移动对话。');
+          break;
+        }
+        if (this.currentSession?.id === id) await this.persistCurrentSession();
+        await this.sessions.move(id, payload.scope);
+        if (this.currentSession?.id === id) this.currentSession = this.sessions.get(id);
+        this.broadcastSessions();
+        break;
+      }
       case 'load-older-transcript': {
         const payload = (msg.payload ?? {}) as { id?: string; before?: number };
         const id = String(payload.id ?? '').trim();
@@ -1245,12 +1268,12 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
           this.post({ type: 'transcript-search-results', payload: { query: '', scope: payload.scope === 'current' ? 'current' : 'all', results: [] } });
           break;
         }
-        const scope = payload.scope === 'current' ? 'current' : 'all';
+        const scope = ['current', 'workspace', 'global'].includes(payload.scope ?? '') ? payload.scope! : 'all';
         const requestedId = String(payload.sessionId ?? '').trim();
         const currentId = requestedId || this.currentSession?.id || '';
         const candidates = scope === 'current'
           ? (currentId ? [this.runs.get(currentId)?.session ?? this.sessions.get(currentId)] : [])
-          : this.sessions.list().map((meta) => this.runs.get(meta.id)?.session ?? this.sessions.get(meta.id));
+          : this.sessions.list().filter(meta => scope === 'all' || (meta.scope ?? 'workspace') === scope).map((meta) => this.runs.get(meta.id)?.session ?? this.sessions.get(meta.id));
         const results: Array<{ sessionId: string; title: string; kind: string; text: string; index: number; matchCount: number }> = [];
         for (const session of candidates) {
           if (!session) continue;
@@ -1778,6 +1801,15 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
     // Pending edits from EARLIER turns are left untouched: the user may still
     // be reviewing them and the restore-to-this-checkpoint preserves their
     // on-disk state.
+    const targetCheckpoint = this.currentSession.checkpoints?.find(cp => cp.messageIndex === messageIndex && cp.ref === ref);
+    if (targetCheckpoint && targetCheckpoint.workspaceId !== this.sessions.workspaceId) {
+      vscode.window.showWarningMessage('此回滚点属于其他工作区，请在原工作区中执行回滚。');
+      return;
+    }
+    if (ref && !targetCheckpoint) {
+      vscode.window.showWarningMessage('无法确认回滚点的工作区归属。');
+      return;
+    }
     const pendingFromHere = this.applier.pendingHunksFrom(messageIndex, this.currentSession.id);
     if (pendingFromHere > 0) {
       const choice = await vscode.window.showWarningMessage(
@@ -1816,7 +1848,7 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
       // survives an extension reload (in-memory tracker starts empty then).
       const sessionScope = new Set(this.applier.touchedFilesFrom(this.currentSession.id, messageIndex));
       for (const cp of this.currentSession.checkpoints ?? []) {
-        if (cp.messageIndex < messageIndex) continue;
+        if (cp.messageIndex < messageIndex || cp.workspaceId !== this.sessions.workspaceId) continue;
         for (const p of cp.touchedFiles ?? []) sessionScope.add(p);
       }
 
@@ -2033,7 +2065,8 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
           ref: info.ref,
           sha: info.sha,
           createdAt: info.createdAt,
-          label: info.label
+          label: info.label,
+          workspaceId: this.sessions.workspaceId
         };
         session.checkpoints = [...(session.checkpoints ?? []), entry];
         // Update the webview rollback button with the actual ref now that
@@ -2120,7 +2153,8 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
     // Send run-start immediately to update UI before awaiting system prompt
     postLive({ type: 'run-start' });
 
-    const systemPrompt = await systemPromptPromise;
+    const systemPrompt = (await systemPromptPromise) + '\n\n当前操作工作区：' + (vscode.workspace.name ?? 'Empty window')
+      + '\n会话可能包含其他项目的历史消息和工具结果；它们仅作背景，不代表当前文件状态或操作授权。所有新操作以当前 workspace_root、规则和工具读取结果为准，禁止按历史路径直接修改其他项目。';
     const agentCfg = vscode.workspace.getConfiguration('burstcode.agent');
     const webCfg = vscode.workspace.getConfiguration('burstcode.web');
     const webSearchEnabled = webCfg.get<boolean>('enabled') !== false;
@@ -3001,49 +3035,57 @@ setTimeout(() => {
   .find-page .find-entry-text { line-height: 1.55; }
   mark.chat-find { background: #3b82f6; color: #fff; }
   mark.chat-find.active { background: #f97316; color: #fff; }
-  #history .search { position: sticky; top: 0; z-index: 2; padding: 14px; border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 70%, transparent); background: color-mix(in srgb, var(--vscode-editorWidget-background) 96%, var(--vscode-focusBorder)); box-shadow: 0 8px 20px rgba(0,0,0,0.16); }
-  #history .search-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin: 0 2px 9px; }
-  #history .search-heading-title { color: var(--vscode-foreground); font-size: 0.82em; font-weight: 700; letter-spacing: 0.04em; }
-  #history .search-heading-hint { color: var(--vscode-descriptionForeground); font-size: 0.72em; white-space: nowrap; }
-  #history .search-input-row { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px; box-sizing: border-box; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: 9px; transition: border-color 0.16s, box-shadow 0.16s; }
-  #history .search-input-row:focus-within { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-focusBorder) 22%, transparent); }
-  #history .search-icon { color: var(--vscode-descriptionForeground); font-size: 19px; line-height: 1; transform: translateY(-1px); }
-  #history .search input { flex: 1; width: auto; min-width: 0; height: 32px; padding: 0; background: transparent; color: var(--vscode-input-foreground); border: none; outline: none; font: inherit; }
+  #history .search { position: sticky; top: 0; z-index: 2; padding: 18px 16px 14px; border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 55%, transparent); background: color-mix(in srgb, var(--vscode-editorWidget-background) 94%, var(--vscode-focusBorder)); box-shadow: 0 12px 28px rgba(0,0,0,0.18); }
+  #history .search-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin: 0 2px 14px; }
+  #history .search-heading-title { color: var(--vscode-foreground); font-size: 1.02em; font-weight: 700; letter-spacing: -0.01em; }
+  #history .search-heading-hint { color: var(--vscode-descriptionForeground); font-size: 0.72em; white-space: nowrap; padding-top: 3px; }
+  #history .search-input-row { display: flex; align-items: center; gap: 9px; height: 38px; padding: 0 11px; box-sizing: border-box; background: color-mix(in srgb, var(--vscode-input-background) 92%, transparent); border: 1px solid color-mix(in srgb, var(--vscode-input-border) 72%, transparent); border-radius: 10px; transition: border-color 0.16s, box-shadow 0.16s, background 0.16s; }
+  #history .search-input-row:focus-within { border-color: var(--vscode-focusBorder); background: var(--vscode-input-background); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-focusBorder) 18%, transparent); }
+  #history .search-icon { color: var(--vscode-descriptionForeground); font-size: 18px; line-height: 1; transform: translateY(-1px); }
+  #history .search input { flex: 1; width: auto; min-width: 0; height: 34px; padding: 0; background: transparent; color: var(--vscode-input-foreground); border: none; outline: none; font: inherit; }
   #history .search input:focus { outline: none; }
-  #history .scope { display: none; }
-  #history .scope button.active { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: color-mix(in srgb, var(--vscode-button-background) 80%, white); box-shadow: 0 2px 7px color-mix(in srgb, var(--vscode-button-background) 35%, transparent); }
+  #history .scope { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 12px; padding: 3px; background: color-mix(in srgb, var(--vscode-input-background) 72%, transparent); border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 55%, transparent); border-radius: 10px; }
+  #history .scope button { cursor: pointer; min-height: 30px; padding: 5px 9px; background: transparent; color: var(--vscode-descriptionForeground); border: 0; border-radius: 7px; font: inherit; font-size: 0.78em; transition: color 0.15s, background 0.15s, box-shadow 0.15s; }
+  #history .scope button:hover { color: var(--vscode-foreground); background: color-mix(in srgb, var(--vscode-list-hoverBackground) 75%, transparent); }
+  #history .scope button.active { background: var(--vscode-editorWidget-background); color: var(--vscode-foreground); box-shadow: 0 2px 8px rgba(0,0,0,0.2); font-weight: 600; }
   #history .search-results { border-bottom: 1px solid var(--vscode-panel-border); }
-  #history .search-result { display: block; padding: 7px 10px; cursor: pointer; border-bottom: 1px solid var(--vscode-panel-border); }
+  #history .search-result { display: block; padding: 10px 14px; cursor: pointer; border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 55%, transparent); }
   #history .search-result:hover { background: var(--vscode-list-hoverBackground); }
-  #history .search-result .meta { font-size: 0.74em; opacity: 0.65; margin-bottom: 2px; }
-  #history .search-result .text { font-size: 0.84em; white-space: pre-wrap; word-break: break-word; }
-  #history .empty { padding: 14px; opacity: 0.7; text-align: center; }
-  #history .item { display: flex; align-items: center; padding: 7px 10px; cursor: pointer; border-bottom: 1px solid var(--vscode-panel-border); gap: 6px; }
-  #history .item:last-child { border-bottom: none; }
-  #history .item:hover { background: var(--vscode-list-hoverBackground); }
-  #history .item.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
-  #history .item .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.9em; }
-  #history .item .time { font-size: 0.78em; opacity: 0.6; margin-left: 6px; }
-  #history .item .del { background: transparent; border: none; color: var(--vscode-foreground); padding: 2px 6px; border-radius: 4px; opacity: 0.5; cursor: pointer; }
-  #history .item .del:hover { background: var(--vscode-toolbar-hoverBackground); opacity: 1; color: var(--vscode-errorForeground); }
-  /* Status badge for each session in the history list. Color-coded dot +
-     short label; layout mirrors the bottom status pill so it feels native. */
-  #history .item .status { display: inline-flex; align-items: center; gap: 4px; font-size: 0.72em; padding: 1px 6px; border-radius: 999px; border: 1px solid transparent; flex-shrink: 0; opacity: 0.85; user-select: none; }
-  #history .item .status .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+  #history .search-result .meta { font-size: 0.72em; opacity: 0.65; margin-bottom: 4px; }
+  #history .search-result .text { font-size: 0.84em; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+  #history .empty { margin: 18px 14px; padding: 26px 16px; color: var(--vscode-descriptionForeground); text-align: center; border: 1px dashed color-mix(in srgb, var(--vscode-panel-border) 70%, transparent); border-radius: 12px; background: color-mix(in srgb, var(--vscode-editorWidget-background) 65%, transparent); }
+  #history .item { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "main actions" "meta actions"; align-items: center; margin: 7px 10px; padding: 11px 10px 10px 13px; cursor: pointer; gap: 3px 10px; border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 58%, transparent); border-radius: 11px; background: color-mix(in srgb, var(--vscode-editorWidget-background) 82%, transparent); transition: transform 0.15s, border-color 0.15s, background 0.15s, box-shadow 0.15s; }
+  #history .item:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--vscode-focusBorder) 55%, var(--vscode-panel-border)); background: var(--vscode-list-hoverBackground); box-shadow: 0 6px 16px rgba(0,0,0,0.12); }
+  #history .item.active { border-color: color-mix(in srgb, var(--vscode-focusBorder) 70%, var(--vscode-panel-border)); background: color-mix(in srgb, var(--vscode-list-activeSelectionBackground) 38%, var(--vscode-editorWidget-background)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--vscode-focusBorder) 18%, transparent); }
+  #history .item .title { grid-area: main; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.9em; font-weight: 600; letter-spacing: -0.01em; }
+  #history .item .meta { grid-area: meta; display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--vscode-descriptionForeground); font-size: 0.72em; }
+  #history .item .time { font-size: inherit; opacity: 0.82; }
+  #history .item .actions { grid-area: actions; display: flex; align-items: center; gap: 3px; }
+  #history .item .del, #history .item .move, #history .item .stop { background: transparent; border: 1px solid transparent; color: var(--vscode-descriptionForeground); padding: 5px; border-radius: 7px; cursor: pointer; opacity: 0; transition: opacity 0.15s, background 0.15s, color 0.15s; }
+  #history .item:hover .del, #history .item:hover .move, #history .item:hover .stop, #history .item.active .del, #history .item.active .move { opacity: 0.8; }
+  #history .item .del:hover, #history .item .move:hover, #history .item .stop:hover { background: var(--vscode-toolbar-hoverBackground); border-color: var(--vscode-panel-border); color: var(--vscode-foreground); opacity: 1; }
+  #history .item .del:hover { color: var(--vscode-errorForeground); }
+  #history .item .move { font-size: 0; }
+  #history .item .move::before { content: '↗'; font-size: 14px; }
+  #history .item .stop svg { width: 10px; height: 10px; }
+  #history .item .status { display: inline-flex; align-items: center; gap: 4px; font-size: 0.92em; padding: 2px 7px; border-radius: 999px; border: 1px solid transparent; flex-shrink: 0; opacity: 0.9; user-select: none; }
+  #history .item .status .dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
   #history .item .status[data-state="running"] { color: var(--vscode-charts-blue); border-color: color-mix(in srgb, var(--vscode-charts-blue) 35%, transparent); background: color-mix(in srgb, var(--vscode-charts-blue) 12%, transparent); }
   #history .item .status[data-state="running"] .dot { animation: histPulse 1.1s ease-in-out infinite; }
   #history .item .status[data-state="completed"] { color: var(--vscode-charts-green); border-color: color-mix(in srgb, var(--vscode-charts-green) 30%, transparent); background: color-mix(in srgb, var(--vscode-charts-green) 10%, transparent); }
   #history .item .status[data-state="stopped"] { color: var(--vscode-charts-orange, #d18616); border-color: color-mix(in srgb, var(--vscode-charts-orange, #d18616) 30%, transparent); background: color-mix(in srgb, var(--vscode-charts-orange, #d18616) 10%, transparent); }
   #history .item .status[data-state="error"] { color: var(--vscode-errorForeground); border-color: color-mix(in srgb, var(--vscode-errorForeground) 35%, transparent); background: color-mix(in srgb, var(--vscode-errorForeground) 12%, transparent); }
-  #history .item .status[data-state="idle"] { color: var(--vscode-descriptionForeground); opacity: 0.55; }
   @keyframes histPulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(0.7); } }
-  /* Stop button only visible for running sessions. */
-  #history .item .stop { background: transparent; border: 1px solid transparent; color: var(--vscode-descriptionForeground); padding: 2px 6px; border-radius: 4px; cursor: pointer; opacity: 0; transition: opacity 0.15s, background 0.15s, color 0.15s; display: inline-flex; align-items: center; }
-  #history .item .stop:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-charts-red); border-color: var(--vscode-panel-border); opacity: 1; }
-  #history .item:hover .stop { opacity: 0.65; }
-  #history .item .stop svg { width: 10px; height: 10px; }
 
-  /* ============ Lessons overlay (top-bar) ============ */
+  #history .item .origin { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #history .item.active .meta { color: color-mix(in srgb, var(--vscode-list-activeSelectionForeground) 78%, transparent); }
+  #history .item .origin::before { content: '·'; margin-right: 7px; opacity: 0.55; }
+  #history .item .move:disabled { opacity: 0.2; cursor: default; }
+  @media (max-width: 360px) {
+    #history .search { padding-left: 12px; padding-right: 12px; }
+    #history .item { margin-left: 6px; margin-right: 6px; }
+    #history .search-heading-hint { display: none; }
+  }
   #lessons { display: none; position: absolute; top: 44px; left: 12px; right: 12px; max-height: 70vh; overflow-y: auto; background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-editorWidget-border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); z-index: 11; }
   #lessons.open { display: block; }
   #lessons .head { display: flex; align-items: center; gap: 6px; padding: 8px 12px 6px; border-bottom: 1px solid var(--vscode-panel-border); position: sticky; top: 0; background: var(--vscode-editorWidget-background); z-index: 1; }
@@ -4478,7 +4520,7 @@ function renderTabs() {
 }
 
 let historySearchQuery = '';
-const historySearchScope = 'all';
+let historySearchScope = 'workspace';
 let historySearchResults = [];
 let historySearchInputEl = null;
 function renderHistorySearchPanel() {
@@ -4488,6 +4530,21 @@ function renderHistorySearchPanel() {
   header.className = 'search-heading';
   header.innerHTML = '<span class="search-heading-title">Conversation history</span><span class="search-heading-hint">Search every chat</span>';
   wrap.appendChild(header);
+  const scopes = document.createElement('div');
+  scopes.className = 'scope';
+  [['workspace', '当前工作区'], ['global', '全局']].forEach(([value, label]) => {
+    const button = document.createElement('button');
+    button.textContent = label;
+    button.dataset.scope = value;
+    button.onclick = () => {
+      historySearchScope = value;
+      historySearchResults = [];
+      if (historySearchQuery.trim()) vscode.postMessage({ type: 'search-transcripts', payload: { query: historySearchQuery, scope: historySearchScope } });
+      renderHistory();
+    };
+    scopes.appendChild(button);
+  });
+  wrap.appendChild(scopes);
   const inputRow = document.createElement('div');
   inputRow.className = 'search-input-row';
   const icon = document.createElement('span');
@@ -4501,7 +4558,9 @@ function renderHistorySearchPanel() {
   inputEl.addEventListener('input', () => {
     historySearchQuery = inputEl.value;
     historySearchResults = [];
-    vscode.postMessage({ type: 'search-transcripts', payload: { query: historySearchQuery, scope: 'all', sessionId: sessionsCache.activeId } });
+    renderHistory();
+    if (!historySearchQuery.trim()) return;
+    vscode.postMessage({ type: 'search-transcripts', payload: { query: historySearchQuery, scope: historySearchScope, sessionId: sessionsCache.activeId } });
   });
   inputRow.append(icon, inputEl);
   wrap.appendChild(inputRow);
@@ -4548,10 +4607,11 @@ function renderHistory() {
   Array.from(historyEl.children).forEach((child) => {
     if (child !== searchPanel) child.remove();
   });
+  searchPanel.querySelectorAll('[data-scope]').forEach(button => button.classList.toggle('active', button.dataset.scope === historySearchScope));
   const resultWrap = renderHistorySearchResults();
   if (resultWrap) historyEl.appendChild(resultWrap);
   if (historySearchQuery.trim()) return;
-  const list = sessionsCache.sessions || [];
+  const list = (sessionsCache.sessions || []).filter(s => (s.scope || 'workspace') === historySearchScope);
   if (list.length === 0) {
     const e = document.createElement('div');
     e.className = 'empty';
@@ -4572,8 +4632,9 @@ function renderHistory() {
     const title = document.createElement('div');
     title.className = 'title';
     title.textContent = s.title;
-    // Status badge \u2014 only rendered for non-trivial states. Idle sessions
-    // keep the list visually quiet.
+    title.title = s.title;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
     const state = String(s.status || 'idle');
     if (state !== 'idle') {
       const badge = document.createElement('span');
@@ -4583,43 +4644,40 @@ function renderHistory() {
       dot.className = 'dot';
       const lbl = document.createElement('span');
       lbl.textContent = STATUS_LABELS[state] || state;
-      badge.appendChild(dot);
-      badge.appendChild(lbl);
-      item.appendChild(badge);
+      badge.append(dot, lbl);
+      meta.appendChild(badge);
     }
+    const origin = document.createElement('span');
+    origin.className = 'origin';
+    origin.textContent = s.scope === 'global' ? (s.originWorkspace || 'Global') : 'This workspace';
+    origin.title = s.scope === 'global' ? '来源：' + (s.originWorkspace || '全局') : '当前工作区';
+    meta.appendChild(origin);
     const time = document.createElement('span');
     time.className = 'time';
     time.textContent = formatTime(s.updatedAt);
-    // Per-row stop button \u2014 only meaningful while running. Stays in the
-    // DOM but hidden otherwise so layout doesn't jump on state transitions.
+    meta.appendChild(time);
+    const actions = document.createElement('div');
+    actions.className = 'actions';
     const stop = document.createElement('button');
     stop.className = 'stop';
     stop.title = 'Stop this run';
     stop.innerHTML = '<svg viewBox="0 0 10 10" fill="currentColor" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7" rx="1"/></svg>';
     stop.style.display = state === 'running' ? '' : 'none';
-    stop.onclick = (ev) => {
-      ev.stopPropagation();
-      vscode.postMessage({ type: 'cancel-session', payload: { id: s.id } });
-    };
+    stop.onclick = (ev) => { ev.stopPropagation(); vscode.postMessage({ type: 'cancel-session', payload: { id: s.id } }); };
+    const move = document.createElement('button');
+    move.className = 'move';
+    move.title = s.scope === 'global' ? '移至当前工作区' : '移至全局';
+    move.setAttribute('aria-label', move.title);
+    move.disabled = state === 'running';
+    move.onclick = (ev) => { ev.stopPropagation(); vscode.postMessage({ type: 'move-session', payload: { id: s.id, scope: s.scope === 'global' ? 'workspace' : 'global' } }); };
     const del = document.createElement('button');
     del.className = 'del';
-    del.textContent = '\u2715';
+    del.textContent = '×';
     del.title = 'Delete this chat';
-    // Backend pops a VS Code modal to confirm; webview confirm() is a no-op
-    // inside vscode webviews so we just fire the intent and let the host
-    // gate it with a native dialog.
-    del.onclick = (ev) => {
-      ev.stopPropagation();
-      vscode.postMessage({ type: 'delete-session', payload: { id: s.id } });
-    };
-    item.appendChild(title);
-    item.appendChild(time);
-    item.appendChild(stop);
-    item.appendChild(del);
-    item.onclick = () => {
-      vscode.postMessage({ type: 'load-session', payload: { id: s.id } });
-      historyEl.classList.remove('open');
-    };
+    del.onclick = (ev) => { ev.stopPropagation(); vscode.postMessage({ type: 'delete-session', payload: { id: s.id } }); };
+    actions.append(stop, move, del);
+    item.append(title, meta, actions);
+    item.onclick = () => { vscode.postMessage({ type: 'load-session', payload: { id: s.id } }); historyEl.classList.remove('open'); };
     historyEl.appendChild(item);
   });
 }
@@ -6220,7 +6278,7 @@ window.addEventListener('message', (e) => {
       break;
     }
     case 'transcript-search-results':
-      if (!msg.payload || msg.payload.query !== historySearchQuery.trim()) break;
+      if (!msg.payload || msg.payload.query !== historySearchQuery.trim() || msg.payload.scope !== historySearchScope) break;
       historySearchResults = Array.isArray(msg.payload.results) ? msg.payload.results : [];
       if (historyEl.classList.contains('open')) renderHistory();
       break;
@@ -6232,6 +6290,16 @@ window.addEventListener('message', (e) => {
       // on every broadcast \u2014 status badges, active highlight, ordering all
       // depend on the latest payload.
       renderTabs();
+      const activeSession = (sessionsCache.sessions || []).find(s => s.id === sessionsCache.activeId);
+      let workspaceNotice = document.getElementById('session-workspace-notice');
+      if (!workspaceNotice) {
+        workspaceNotice = document.createElement('div');
+        workspaceNotice.id = 'session-workspace-notice';
+        workspaceNotice.style.cssText = 'padding:4px 12px;font-size:11px;color:var(--vscode-descriptionForeground);border-bottom:1px solid var(--vscode-panel-border)';
+        tabsEl.after(workspaceNotice);
+      }
+      workspaceNotice.style.display = activeSession?.scope === 'global' ? '' : 'none';
+      workspaceNotice.textContent = '全局会话 · 当前操作工作区：' + (sessionsCache.workspaceName || 'Empty window');
       if (historyEl.classList.contains('open')) renderHistory();
       break;
     case 'lessons': {

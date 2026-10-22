@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import * as http from 'http';
 import { AddressInfo } from 'net';
 // These are imported after vscode mock is in cache (preload script runs first)
-import { fetchUrl, htmlToText, webSearchTool } from '../agent/tools/web';
+import { fetchUrl, htmlToText, webSearchTool, readWebpageTool } from '../agent/tools/web';
 
 const vscodeMock = require('./vscode-mock') as {
   __setConfig: (section: string, values: Record<string, unknown>) => void;
@@ -64,6 +64,78 @@ describe('htmlToText', () => {
     const { links } = htmlToText(html, 'https://example.com');
     assert.equal(links.length, 0);
   });
+});
+
+
+describe('read_webpage direct-first proxy fallback', () => {
+  for (const scenario of ['direct success', 'HTTP fallback', 'network fallback', 'both fail', 'no proxy', 'cancelled']) {
+    test(scenario, async () => {
+      vscodeMock.__clearAll();
+      const envKeys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'] as const;
+      const savedEnv = envKeys.map(key => process.env[key]);
+      for (const key of envKeys) delete process.env[key];
+      let directRequests = 0;
+      let proxyRequests = 0;
+      const cancellation = {
+        isCancellationRequested: scenario === 'cancelled',
+        onCancellationRequested: () => ({ dispose() {} })
+      };
+      const server = http.createServer((_req, res) => {
+        directRequests++;
+        if (scenario === 'network fallback') {
+          res.destroy();
+          return;
+        }
+        res.writeHead(scenario === 'direct success' ? 200 : 403, { 'Content-Type': 'text/plain' });
+        res.end('direct page');
+      });
+      const proxy = http.createServer();
+      proxy.on('connect', (_req, socket) => {
+        proxyRequests++;
+        socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        socket.once('data', () => {
+          const status = scenario === 'both fail' ? '502 Bad Gateway' : '200 OK';
+          socket.end(`HTTP/1.1 ${status}\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\nproxy page`);
+        });
+      });
+      try {
+        await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+        await new Promise<void>(resolve => proxy.listen(0, '127.0.0.1', resolve));
+        if (scenario !== 'no proxy') {
+          vscodeMock.__setConfig('burstcode.web', {
+            proxyUrl: `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`
+          });
+        }
+        const result = await readWebpageTool.execute({
+          url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/page`
+        }, { cancellation, emitProgress() {} });
+        assert.equal(directRequests, scenario === 'cancelled' ? 0 : 1);
+        assert.equal(proxyRequests, ['HTTP fallback', 'network fallback', 'both fail'].includes(scenario) ? 1 : 0);
+        if (scenario === 'both fail') {
+          assert.equal(result.isError, true);
+          assert.match(result.content, /direct: .*HTTP 403.*proxy: .*HTTP 502/);
+        } else if (scenario === 'no proxy') {
+          assert.equal(result.isError, true);
+          assert.match(result.content, /HTTP 403/);
+        } else if (scenario === 'cancelled') {
+          assert.equal(result.isError, true);
+          assert.match(result.content, /cancelled/);
+        } else {
+          assert.equal(result.isError, undefined, result.content);
+          assert.match(result.content, scenario === 'direct success' ? /direct page/ : /proxy page/);
+        }
+      } finally {
+        await Promise.all([server, proxy].map(instance => new Promise<void>((resolve, reject) => {
+          instance.close(err => err ? reject(err) : resolve());
+        })));
+        vscodeMock.__clearAll();
+        envKeys.forEach((key, index) => {
+          if (savedEnv[index] === undefined) delete process.env[key];
+          else process.env[key] = savedEnv[index];
+        });
+      }
+    });
+  }
 });
 
 

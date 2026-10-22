@@ -20,6 +20,9 @@ export interface SessionMeta {
   createdAt: number;
   updatedAt: number;
   status?: SessionStatus;
+  scope?: 'workspace' | 'global';
+  workspaceId?: string;
+  originWorkspace?: string;
 }
 
 /**
@@ -48,6 +51,7 @@ export interface SessionCheckpoint {
    * reload (the in-memory tracker in HunkApplier is rebuilt empty on restart).
    */
   touchedFiles?: string[];
+  workspaceId?: string;
 }
 
 export interface SessionLLMState {
@@ -68,60 +72,99 @@ export function isTerminalStatus(s: SessionStatus | undefined): boolean {
 
 const KEY_INDEX = 'burstcode.sessions.index';
 const KEY_SESSION_PREFIX = 'burstcode.session.';
-const MAX_SESSIONS = 100;
+// Shared storage must not evict histories belonging to other workspaces.
 
 /**
- * Persist chat sessions in workspace state. Keeps a small index Memento entry
- * (newest first) plus one entry per session keyed by id.
+ * Persist sessions in shared state with explicit workspace/global ownership.
+ * Legacy workspace entries are promoted on first save; reads remain compatible.
  */
 export class SessionStore {
-  constructor(private readonly state: vscode.Memento) {}
+  constructor(
+    private readonly state: vscode.Memento,
+    private readonly globalState?: vscode.Memento,
+    readonly workspaceId = '',
+    private readonly workspaceName = ''
+  ) {}
+
+  private get storage(): vscode.Memento { return this.globalState ?? this.state; }
+  private get indexKey(): string { return this.globalState ? 'burstcode.sessions.shared.index' : KEY_INDEX; }
+
+  private all(): SessionMeta[] {
+    const shared: SessionMeta[] = this.storage.get<SessionMeta[]>(this.indexKey) ?? [];
+    if (!this.globalState) return shared;
+    const ids = new Set(shared.map(s => s.id));
+    const legacy: SessionMeta[] = this.state.get<SessionMeta[]>(KEY_INDEX) ?? [];
+    return [...shared, ...legacy.filter(s => !ids.has(s.id)).map(s => ({
+      ...s, scope: 'workspace' as const, workspaceId: this.workspaceId, originWorkspace: this.workspaceName
+    }))];
+  }
+
+  async move(id: string, scope: 'workspace' | 'global'): Promise<void> {
+    const session = this.get(id);
+    if (!session) return;
+    session.scope = scope;
+    session.workspaceId = this.workspaceId;
+    await this.save(session);
+  }
 
   list(): SessionMeta[] {
-    const arr = this.state.get<SessionMeta[]>(KEY_INDEX) ?? [];
-    return arr.slice().sort((a, b) => b.updatedAt - a.updatedAt);
+    return this.all().filter(s => s.scope === 'global' || !s.workspaceId || s.workspaceId === this.workspaceId)
+      .sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   get(id: string): Session | undefined {
-    return this.state.get<Session>(KEY_SESSION_PREFIX + id);
+    if (!this.list().some(s => s.id === id)) return undefined;
+    const shared = this.storage.get<Session>(KEY_SESSION_PREFIX + id);
+    if (shared) {
+      const copy = JSON.parse(JSON.stringify(shared)) as Session;
+      copy.checkpoints = copy.checkpoints?.map(cp => ({ ...cp, workspaceId: cp.workspaceId ?? copy.workspaceId }));
+      return copy;
+    }
+    const legacy = this.state.get<Session>(KEY_SESSION_PREFIX + id);
+    if (!legacy) return undefined;
+    return { ...JSON.parse(JSON.stringify(legacy)), scope: 'workspace', workspaceId: this.workspaceId,
+      originWorkspace: this.workspaceName,
+      checkpoints: legacy.checkpoints?.map((cp: SessionCheckpoint) => ({ ...cp, workspaceId: this.workspaceId })) };
   }
 
   async save(session: Session): Promise<void> {
-    const idx = this.state.get<SessionMeta[]>(KEY_INDEX) ?? [];
+    session.scope ??= 'workspace';
+    session.workspaceId ??= this.workspaceId;
+    session.originWorkspace ??= this.workspaceName;
+    const idx: SessionMeta[] = this.storage.get<SessionMeta[]>(this.indexKey) ?? [];
     const meta: SessionMeta = {
       id: session.id,
       title: session.title,
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
-      status: session.status
+      status: session.status,
+      scope: session.scope,
+      workspaceId: session.workspaceId,
+      originWorkspace: session.originWorkspace
     };
     const without = idx.filter((m) => m.id !== session.id);
     without.unshift(meta);
-    // Trim oldest if we exceed cap.
-    let trimmed = without;
-    if (trimmed.length > MAX_SESSIONS) {
-      const drop = trimmed.slice(MAX_SESSIONS);
-      trimmed = trimmed.slice(0, MAX_SESSIONS);
-      for (const m of drop) {
-        await this.state.update(KEY_SESSION_PREFIX + m.id, undefined);
-      }
+    // Persist content before publishing its index; never evict another workspace's history.
+    await this.storage.update(KEY_SESSION_PREFIX + session.id, session);
+    await this.storage.update(this.indexKey, without);
+    if (this.globalState) {
+      await this.state.update(KEY_INDEX, (this.state.get<SessionMeta[]>(KEY_INDEX) ?? []).filter((s: SessionMeta) => s.id !== session.id));
+      await this.state.update(KEY_SESSION_PREFIX + session.id, undefined);
     }
-    await this.state.update(KEY_INDEX, trimmed);
-    await this.state.update(KEY_SESSION_PREFIX + session.id, session);
   }
 
   async delete(id: string): Promise<void> {
-    const idx = (this.state.get<SessionMeta[]>(KEY_INDEX) ?? []).filter((m) => m.id !== id);
-    await this.state.update(KEY_INDEX, idx);
-    await this.state.update(KEY_SESSION_PREFIX + id, undefined);
+    if (!this.get(id)) return;
+    await this.storage.update(this.indexKey, (this.storage.get<SessionMeta[]>(this.indexKey) ?? []).filter((m: SessionMeta) => m.id !== id));
+    await this.storage.update(KEY_SESSION_PREFIX + id, undefined);
+    if (this.globalState) {
+      await this.state.update(KEY_INDEX, (this.state.get<SessionMeta[]>(KEY_INDEX) ?? []).filter((m: SessionMeta) => m.id !== id));
+      await this.state.update(KEY_SESSION_PREFIX + id, undefined);
+    }
   }
 
   async clear(): Promise<void> {
-    const idx = this.state.get<SessionMeta[]>(KEY_INDEX) ?? [];
-    for (const m of idx) {
-      await this.state.update(KEY_SESSION_PREFIX + m.id, undefined);
-    }
-    await this.state.update(KEY_INDEX, []);
+    for (const m of this.list()) await this.delete(m.id);
   }
 }
 

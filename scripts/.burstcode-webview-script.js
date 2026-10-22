@@ -1238,7 +1238,7 @@ function renderTabs() {
 }
 
 let historySearchQuery = '';
-const historySearchScope = 'all';
+let historySearchScope = 'workspace';
 let historySearchResults = [];
 let historySearchInputEl = null;
 function renderHistorySearchPanel() {
@@ -1248,6 +1248,21 @@ function renderHistorySearchPanel() {
   header.className = 'search-heading';
   header.innerHTML = '<span class="search-heading-title">Conversation history</span><span class="search-heading-hint">Search every chat</span>';
   wrap.appendChild(header);
+  const scopes = document.createElement('div');
+  scopes.className = 'scope';
+  [['workspace', '当前工作区'], ['global', '全局']].forEach(([value, label]) => {
+    const button = document.createElement('button');
+    button.textContent = label;
+    button.dataset.scope = value;
+    button.onclick = () => {
+      historySearchScope = value;
+      historySearchResults = [];
+      if (historySearchQuery.trim()) vscode.postMessage({ type: 'search-transcripts', payload: { query: historySearchQuery, scope: historySearchScope } });
+      renderHistory();
+    };
+    scopes.appendChild(button);
+  });
+  wrap.appendChild(scopes);
   const inputRow = document.createElement('div');
   inputRow.className = 'search-input-row';
   const icon = document.createElement('span');
@@ -1261,7 +1276,9 @@ function renderHistorySearchPanel() {
   inputEl.addEventListener('input', () => {
     historySearchQuery = inputEl.value;
     historySearchResults = [];
-    vscode.postMessage({ type: 'search-transcripts', payload: { query: historySearchQuery, scope: 'all', sessionId: sessionsCache.activeId } });
+    renderHistory();
+    if (!historySearchQuery.trim()) return;
+    vscode.postMessage({ type: 'search-transcripts', payload: { query: historySearchQuery, scope: historySearchScope, sessionId: sessionsCache.activeId } });
   });
   inputRow.append(icon, inputEl);
   wrap.appendChild(inputRow);
@@ -1308,10 +1325,11 @@ function renderHistory() {
   Array.from(historyEl.children).forEach((child) => {
     if (child !== searchPanel) child.remove();
   });
+  searchPanel.querySelectorAll('[data-scope]').forEach(button => button.classList.toggle('active', button.dataset.scope === historySearchScope));
   const resultWrap = renderHistorySearchResults();
   if (resultWrap) historyEl.appendChild(resultWrap);
   if (historySearchQuery.trim()) return;
-  const list = sessionsCache.sessions || [];
+  const list = (sessionsCache.sessions || []).filter(s => (s.scope || 'workspace') === historySearchScope);
   if (list.length === 0) {
     const e = document.createElement('div');
     e.className = 'empty';
@@ -1332,8 +1350,9 @@ function renderHistory() {
     const title = document.createElement('div');
     title.className = 'title';
     title.textContent = s.title;
-    // Status badge — only rendered for non-trivial states. Idle sessions
-    // keep the list visually quiet.
+    title.title = s.title;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
     const state = String(s.status || 'idle');
     if (state !== 'idle') {
       const badge = document.createElement('span');
@@ -1343,43 +1362,40 @@ function renderHistory() {
       dot.className = 'dot';
       const lbl = document.createElement('span');
       lbl.textContent = STATUS_LABELS[state] || state;
-      badge.appendChild(dot);
-      badge.appendChild(lbl);
-      item.appendChild(badge);
+      badge.append(dot, lbl);
+      meta.appendChild(badge);
     }
+    const origin = document.createElement('span');
+    origin.className = 'origin';
+    origin.textContent = s.scope === 'global' ? (s.originWorkspace || 'Global') : 'This workspace';
+    origin.title = s.scope === 'global' ? '来源：' + (s.originWorkspace || '全局') : '当前工作区';
+    meta.appendChild(origin);
     const time = document.createElement('span');
     time.className = 'time';
     time.textContent = formatTime(s.updatedAt);
-    // Per-row stop button — only meaningful while running. Stays in the
-    // DOM but hidden otherwise so layout doesn't jump on state transitions.
+    meta.appendChild(time);
+    const actions = document.createElement('div');
+    actions.className = 'actions';
     const stop = document.createElement('button');
     stop.className = 'stop';
     stop.title = 'Stop this run';
     stop.innerHTML = '<svg viewBox="0 0 10 10" fill="currentColor" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7" rx="1"/></svg>';
     stop.style.display = state === 'running' ? '' : 'none';
-    stop.onclick = (ev) => {
-      ev.stopPropagation();
-      vscode.postMessage({ type: 'cancel-session', payload: { id: s.id } });
-    };
+    stop.onclick = (ev) => { ev.stopPropagation(); vscode.postMessage({ type: 'cancel-session', payload: { id: s.id } }); };
+    const move = document.createElement('button');
+    move.className = 'move';
+    move.title = s.scope === 'global' ? '移至当前工作区' : '移至全局';
+    move.setAttribute('aria-label', move.title);
+    move.disabled = state === 'running';
+    move.onclick = (ev) => { ev.stopPropagation(); vscode.postMessage({ type: 'move-session', payload: { id: s.id, scope: s.scope === 'global' ? 'workspace' : 'global' } }); };
     const del = document.createElement('button');
     del.className = 'del';
-    del.textContent = '✕';
+    del.textContent = '×';
     del.title = 'Delete this chat';
-    // Backend pops a VS Code modal to confirm; webview confirm() is a no-op
-    // inside vscode webviews so we just fire the intent and let the host
-    // gate it with a native dialog.
-    del.onclick = (ev) => {
-      ev.stopPropagation();
-      vscode.postMessage({ type: 'delete-session', payload: { id: s.id } });
-    };
-    item.appendChild(title);
-    item.appendChild(time);
-    item.appendChild(stop);
-    item.appendChild(del);
-    item.onclick = () => {
-      vscode.postMessage({ type: 'load-session', payload: { id: s.id } });
-      historyEl.classList.remove('open');
-    };
+    del.onclick = (ev) => { ev.stopPropagation(); vscode.postMessage({ type: 'delete-session', payload: { id: s.id } }); };
+    actions.append(stop, move, del);
+    item.append(title, meta, actions);
+    item.onclick = () => { vscode.postMessage({ type: 'load-session', payload: { id: s.id } }); historyEl.classList.remove('open'); };
     historyEl.appendChild(item);
   });
 }
@@ -2980,7 +2996,7 @@ window.addEventListener('message', (e) => {
       break;
     }
     case 'transcript-search-results':
-      if (!msg.payload || msg.payload.query !== historySearchQuery.trim()) break;
+      if (!msg.payload || msg.payload.query !== historySearchQuery.trim() || msg.payload.scope !== historySearchScope) break;
       historySearchResults = Array.isArray(msg.payload.results) ? msg.payload.results : [];
       if (historyEl.classList.contains('open')) renderHistory();
       break;
@@ -2992,6 +3008,16 @@ window.addEventListener('message', (e) => {
       // on every broadcast — status badges, active highlight, ordering all
       // depend on the latest payload.
       renderTabs();
+      const activeSession = (sessionsCache.sessions || []).find(s => s.id === sessionsCache.activeId);
+      let workspaceNotice = document.getElementById('session-workspace-notice');
+      if (!workspaceNotice) {
+        workspaceNotice = document.createElement('div');
+        workspaceNotice.id = 'session-workspace-notice';
+        workspaceNotice.style.cssText = 'padding:4px 12px;font-size:11px;color:var(--vscode-descriptionForeground);border-bottom:1px solid var(--vscode-panel-border)';
+        tabsEl.after(workspaceNotice);
+      }
+      workspaceNotice.style.display = activeSession?.scope === 'global' ? '' : 'none';
+      workspaceNotice.textContent = '全局会话 · 当前操作工作区：' + (sessionsCache.workspaceName || 'Empty window');
       if (historyEl.classList.contains('open')) renderHistory();
       break;
     case 'lessons': {

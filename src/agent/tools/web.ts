@@ -590,11 +590,36 @@ export const readWebpageTool: Tool = {
 
     ctx.emitProgress(`Fetching ${url} …`);
 
+    const fetchPage = async (useProxy: boolean): Promise<FetchResult> => {
+      const response = await fetchUrl(url, MAX_REDIRECTS, {}, ctx.cancellation, undefined, useProxy);
+      if (response.statusCode >= 400) {
+        throw new Error(`server returned HTTP ${response.statusCode} for ${response.finalUrl}`);
+      }
+      return response;
+    };
+    const errorMessage = (err: unknown) => String((err as Error)?.message ?? err);
     let result: FetchResult;
     try {
-      result = await fetchUrl(url, MAX_REDIRECTS, {}, ctx.cancellation);
-    } catch (err) {
-      return { content: `read_webpage: fetch failed — ${String((err as Error).message ?? err)}`, isError: true };
+      result = await fetchPage(false);
+    } catch (directError) {
+      if (ctx.cancellation.isCancellationRequested) {
+        return { content: 'read_webpage: cancelled', isError: true };
+      }
+      if (!getProxyUrl()) {
+        return { content: `read_webpage: fetch failed — ${errorMessage(directError)}`, isError: true };
+      }
+      ctx.emitProgress('Direct fetch failed; retrying with configured proxy …');
+      try {
+        result = await fetchPage(true);
+      } catch (proxyError) {
+        if (ctx.cancellation.isCancellationRequested) {
+          return { content: 'read_webpage: cancelled', isError: true };
+        }
+        return {
+          content: `read_webpage: fetch failed — direct: ${errorMessage(directError)}; proxy: ${errorMessage(proxyError)}`,
+          isError: true
+        };
+      }
     }
 
     if (ctx.cancellation.isCancellationRequested) {
@@ -602,13 +627,6 @@ export const readWebpageTool: Tool = {
     }
 
     const { body, mimeType, finalUrl, statusCode } = result;
-
-    if (statusCode >= 400) {
-      return {
-        content: `read_webpage: server returned HTTP ${statusCode} for ${finalUrl}`,
-        isError: true
-      };
-    }
 
     const mime = mimeType.toLowerCase();
     let text: string;
