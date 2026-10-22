@@ -3571,6 +3571,7 @@ log.addEventListener('scroll', () => {
   const atBottom = isLogAtBottom();
   if (!currentFindBar && (Date.now() - lastManualScrollAt < 800 || atBottom)) autoScroll = atBottom;
   if (!currentFindBar && log.scrollTop < 120) requestOlderTranscript();
+  updateQuestionNavActive();
   scheduleLogVirtualization();
 }, { passive: true });
 if (typeof ResizeObserver !== 'undefined') {
@@ -3630,6 +3631,29 @@ function renderQuestionNav() {
     button.onclick = () => revealQuestion(entry);
     questionNav.appendChild(button);
   });
+  if (typeof updateQuestionNavActive === 'function') updateQuestionNavActive();
+}
+function updateQuestionNavActive() {
+  if (!questionEntries.length || !questionNav || currentFindBar) return;
+  const viewportTop = log.getBoundingClientRect().top + 18;
+  const visibleQuestions = Array.from(log.querySelectorAll('.msg.user[data-message-index]'))
+    .map((el) => ({ el, top: el.getBoundingClientRect().top, index: Number(el.dataset.messageIndex) }))
+    .filter((item) => Number.isFinite(item.index) && item.top <= viewportTop + 1)
+    .sort((a, b) => b.top - a.top);
+  const fallback = Array.from(log.querySelectorAll('.msg.user[data-message-index]'))
+    .map((el) => ({ el, top: el.getBoundingClientRect().top, index: Number(el.dataset.messageIndex) }))
+    .filter((item) => Number.isFinite(item.index) && item.top < log.getBoundingClientRect().bottom)
+    .sort((a, b) => a.top - b.top)[0];
+  const current = visibleQuestions[0] || fallback;
+  if (!current) return;
+  const activeEntry = questionEntries.findIndex((entry) => entry.messageIndex === current.index);
+  if (activeEntry < 0 || questionTarget === current.index) return;
+  questionTarget = current.index;
+  Array.from(questionNav.children).forEach((tag, index) => {
+    tag.classList.toggle('active', index === activeEntry);
+  });
+  const tag = questionNav.children[activeEntry];
+  if (tag && tag.scrollIntoView) tag.scrollIntoView({ block: 'nearest' });
 }
 function leaveQuestionPage() {
   ++questionRequest;
