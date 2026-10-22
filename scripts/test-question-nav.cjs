@@ -50,4 +50,36 @@ assert.equal(sent[0].payload.purpose, 'question');
 assert.equal(sent[0].payload.id, 'session-A');
 assert.equal(context.findPageRequest, 1);
 assert.ok(script.includes('payload.requestId === questionRequest'));
-console.log('PASS: question preview truncation, Unicode, owning-turn search markers, clear markers, bounded navigation and stale-response guard');
+// Scrolling to the bottom must prefer the last turn over the viewport top.
+context.currentFindBar = null;
+context.findPage = null;
+let atBottom = false;
+context.isLogAtBottom = () => atBottom;
+context.log.getBoundingClientRect = () => ({ top: 0, bottom: 600 });
+context.log.querySelectorAll = () => [
+  { dataset: { messageIndex: '1' }, getBoundingClientRect: () => ({ top: -20 }) },
+  { dataset: { messageIndex: '90' }, getBoundingClientRect: () => ({ top: 240 }) },
+  { dataset: { messageIndex: '500' }, getBoundingClientRect: () => ({ top: 460 }) }
+];
+vm.runInContext(fn('updateQuestionNavActive'), context);
+context.updateQuestionNavActive();
+assert.equal(context.questionTarget, 1);
+atBottom = true;
+context.updateQuestionNavActive();
+assert.equal(context.questionTarget, 500);
+assert.ok(context.questionNav.children[2].classList.contains('active'));
+// A new prompt is appended while the viewport still contains older turns.
+context.questionEntries.push({ index: 251, messageIndex: 501, text: 'new prompt' });
+context.renderQuestionNav();
+assert.equal(context.questionTarget, 501);
+assert.ok(context.questionNav.children[3].classList.contains('active'));
+atBottom = false;
+context.updateQuestionNavActive();
+assert.equal(context.questionTarget, 1);
+// A historical question page's bottom is not the live transcript bottom.
+context.findPage = {};
+atBottom = true;
+context.updateQuestionNavActive();
+assert.equal(context.questionTarget, 1);
+assert.ok(fn('scheduleScrollToBottom').includes('updateQuestionNavActive();'));
+console.log('PASS: question preview, search markers, navigation, bottom activation, new prompts and historical-page guard');

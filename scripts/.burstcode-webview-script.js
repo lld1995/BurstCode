@@ -406,7 +406,11 @@ function updateQuestionNavActive() {
     .map((el) => ({ el, top: el.getBoundingClientRect().top, index: Number(el.dataset.messageIndex) }))
     .filter((item) => Number.isFinite(item.index) && item.top < log.getBoundingClientRect().bottom)
     .sort((a, b) => a.top - b.top)[0];
-  const current = visibleQuestions[0] || fallback;
+  // At the live transcript bottom the newest turn owns the viewport, even
+  // when several short turns fit on screen or its prompt is below the top edge.
+  const current = !findPage && isLogAtBottom()
+    ? { index: questionEntries[questionEntries.length - 1].messageIndex }
+    : visibleQuestions[0] || fallback;
   if (!current) return;
   const activeEntry = questionEntries.findIndex((entry) => entry.messageIndex === current.index);
   if (activeEntry < 0 || questionTarget === current.index) return;
@@ -769,6 +773,7 @@ function scheduleScrollToBottom(force) {
     // First pass: capture the current scrollHeight.
     const h0 = log.scrollHeight;
     log.scrollTop = h0;
+    updateQuestionNavActive();
     // Second pass (next frame): if scrollHeight grew, scroll again so the
     // bottom content is truly visible. This fixes the "scrollbar moved but
     // content didn't" race caused by async layout.
@@ -787,6 +792,7 @@ function scheduleScrollToBottom(force) {
         if (didForce || autoScroll) log.scrollTop = log.scrollHeight;
         autoScroll = isLogAtBottom();
       }
+      updateQuestionNavActive();
       scheduleLogVirtualization();
     });
   });
@@ -1671,25 +1677,36 @@ function addTranscriptLoader() {
   log.insertBefore(wrap, log.firstChild);
 }
 
-function renderTranscript(entries, preserveViewport) {
+function renderTranscript(entries, preserveViewport, prepend) {
   const oldHeight = preserveViewport ? log.scrollHeight : 0;
   const oldTop = preserveViewport ? log.scrollTop : 0;
   const previousAutoScroll = autoScroll;
   if (preserveViewport) autoScroll = false;
-  log.innerHTML = '';
+  // Older pages must not rebuild the live tail from loadedTranscript: that
+  // snapshot predates newly sent prompts and in-flight streaming content.
+  const liveTail = prepend ? document.createDocumentFragment() : null;
+  if (liveTail) {
+    const loader = log.querySelector('.transcript-loader');
+    if (loader) loader.remove();
+    while (log.firstChild) liveTail.appendChild(log.firstChild);
+  } else {
+    log.innerHTML = '';
+  }
   renderingTranscript = true;
   clearFindMarks();
-  toolElements.clear();
-  activeAssistantEl = null;
-  activeReasoningEl = null;
-  activeStreamingToolEl = null;
-  virtPinnedEls = new WeakSet();
-  if (!entries || entries.length === 0) {
+  if (!prepend) {
+    toolElements.clear();
+    activeAssistantEl = null;
+    activeReasoningEl = null;
+    activeStreamingToolEl = null;
+    virtPinnedEls = new WeakSet();
+  }
+  if ((!entries || entries.length === 0) && !prepend) {
     renderingTranscript = false;
     showEmptyState();
     return;
   }
-  entries.forEach((e, index) => {
+  (entries || []).forEach((e, index) => {
     if (e.kind === 'user') addUserMsg(e.text, e.messageIndex, e.checkpointRef, undefined, e.imageCount, e.imageUrls);
     else if (e.kind === 'assistant') addAssistantMsg(e.text);
     else if (e.kind === 'reasoning') addReasoningMsg(e.text, { open: false, streaming: false });
@@ -1718,6 +1735,7 @@ function renderTranscript(entries, preserveViewport) {
     const root = log.lastElementChild;
     if (root) { root.dataset.transcriptIndex = String(loadedTranscriptOffset + index); root._findSource = e.text || ''; }
   });
+  if (liveTail) log.appendChild(liveTail);
   renderingTranscript = false;
   addTranscriptLoader();
   if (preserveViewport) {
@@ -2895,7 +2913,7 @@ window.addEventListener('message', (e) => {
       loadedTranscriptOffset = Math.max(0, Number(msg.payload.transcriptOffset) || 0);
       loadedTranscriptTotal = Math.max(loadedTranscript.length, Number(msg.payload.transcriptTotal) || 0);
       loadingOlderTranscript = false;
-      renderTranscript(loadedTranscript, true);
+      renderTranscript(older, true, true);
       updateFindMarks();
       updateFindCounter();
       break;
