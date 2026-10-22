@@ -373,11 +373,14 @@ function questionForIndex(index) {
 function renderQuestionNav() {
   questionTooltip.hidden = true;
   const hits = new Set(currentFindQuery ? currentFindMatches.map((match) => questionForIndex(match.index)) : []);
+  const currentHit = currentFindQuery && currentFindIndex >= 0 && currentFindMatches[currentFindIndex]
+    ? questionForIndex(currentFindMatches[currentFindIndex].index) : -1;
   questionNav.replaceChildren();
   questionEntries.forEach((entry, i) => {
     const button = document.createElement('button');
     button.type = 'button'; button.className = 'question-tag'; button.textContent = '';
     button.classList.toggle('search-hit', hits.has(i));
+    button.classList.toggle('search-current', currentHit === i);
     button.classList.toggle('active', questionTarget === entry.messageIndex);
     const preview = questionPreview(entry.text);
     button.setAttribute('aria-label', '提问：' + preview + (hits.has(i) ? '（搜索命中）' : ''));
@@ -645,6 +648,7 @@ function updateFindCounter() {
 function moveFind(delta) {
   if (!currentFindMatches.length) return;
   currentFindIndex = (currentFindIndex + delta + currentFindMatches.length) % currentFindMatches.length;
+  renderQuestionNav();
   updateFindCounter();
   revealFindMatch();
 }

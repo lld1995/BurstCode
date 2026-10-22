@@ -2690,6 +2690,8 @@ setTimeout(() => {
   .question-tag:hover, .question-tag:focus-visible { transform: scale(1.35); background: var(--vscode-textLink-foreground); outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-focusBorder) 45%, transparent); }
   .question-tag.active { background: var(--vscode-textLink-foreground); box-shadow: 0 0 0 1px var(--vscode-focusBorder); }
   .question-tag.search-hit { background: #f2cf55; box-shadow: 0 0 0 1px #b89728; }
+  .question-tag.search-current { width: 24px; height: 9px; min-height: 9px; flex-basis: 9px; background: #ffb000; box-shadow: 0 0 0 2px #ffe08a, 0 0 10px #ffb000cc; transform: scale(1.1); z-index: 1; }
+  .question-tag.search-current:hover, .question-tag.search-current:focus-visible { transform: scale(1.3); }
   #questionTooltip { position: fixed; z-index: 100; pointer-events: none; max-width: min(320px, calc(100vw - 54px)); padding: 10px 13px; border: 1px solid var(--vscode-focusBorder); border-left: 3px solid var(--vscode-textLink-foreground); border-radius: 7px; background: color-mix(in srgb, var(--vscode-editorHoverWidget-background, #252526) 88%, var(--vscode-focusBorder)); color: var(--vscode-editorHoverWidget-foreground, #ffffff); box-shadow: 0 8px 24px #0008; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
   #questionTooltip[hidden] { display: none; }
   .question-return { margin-bottom: 12px; cursor: pointer; color: var(--vscode-textLink-foreground); background: transparent; border: 1px solid var(--vscode-panel-border); border-radius: 5px; padding: 4px 10px; }
@@ -3611,11 +3613,14 @@ function questionForIndex(index) {
 function renderQuestionNav() {
   questionTooltip.hidden = true;
   const hits = new Set(currentFindQuery ? currentFindMatches.map((match) => questionForIndex(match.index)) : []);
+  const currentHit = currentFindQuery && currentFindIndex >= 0 && currentFindMatches[currentFindIndex]
+    ? questionForIndex(currentFindMatches[currentFindIndex].index) : -1;
   questionNav.replaceChildren();
   questionEntries.forEach((entry, i) => {
     const button = document.createElement('button');
     button.type = 'button'; button.className = 'question-tag'; button.textContent = '';
     button.classList.toggle('search-hit', hits.has(i));
+    button.classList.toggle('search-current', currentHit === i);
     button.classList.toggle('active', questionTarget === entry.messageIndex);
     const preview = questionPreview(entry.text);
     button.setAttribute('aria-label', '提问：' + preview + (hits.has(i) ? '（搜索命中）' : ''));
@@ -3883,6 +3888,7 @@ function updateFindCounter() {
 function moveFind(delta) {
   if (!currentFindMatches.length) return;
   currentFindIndex = (currentFindIndex + delta + currentFindMatches.length) % currentFindMatches.length;
+  renderQuestionNav();
   updateFindCounter();
   revealFindMatch();
 }
