@@ -1202,8 +1202,18 @@ const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttach
         this.post({ type: 'session-find-results', payload: { id, query: payload.query, requestId: payload.requestId, matches } });
         break;
       }
+      case 'request-question-nav': {
+        const session = this.currentSession && (this.runs.get(this.currentSession.id)?.session ?? this.currentSession);
+        if (!session) break;
+        const entries = buildTranscriptRange(session.messages, undefined, 0, Infinity, true).entries;
+        const questions = entries.flatMap((entry, index) => entry.kind === 'user'
+          ? [{ index, messageIndex: entry.messageIndex, text: Array.from(entry.text || '[图片提问]').slice(0, 161).join('') }]
+          : []);
+        this.post({ type: 'question-nav', payload: { id: session.id, questions } });
+        break;
+      }
       case 'load-transcript-match': {
-        const payload = (msg.payload ?? {}) as { id?: string; index?: number; requestId?: number };
+        const payload = (msg.payload ?? {}) as { id?: string; index?: number; requestId?: number; purpose?: string };
         const id = String(payload.id ?? '').trim();
         const target = Math.max(0, Math.floor(Number(payload.index) || 0));
         if (!id || this.currentSession?.id !== id) break;
@@ -1217,7 +1227,7 @@ const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttach
         const page = buildTranscriptRange(session.messages, undefined, start, end, true);
         this.post({
           type: 'transcript-match',
-          payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTotal: total, targetIndex: target, requestId: payload.requestId }
+payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTotal: total, targetIndex: target, requestId: payload.requestId, purpose: payload.purpose }
         });
         break;
       }
@@ -2669,7 +2679,21 @@ setTimeout(() => {
   /* Note: no scroll-behavior:smooth so that auto-follow detection (which
      compares scrollTop against scrollHeight on every scroll event) is not
      fooled by intermediate frames of a smooth-scroll animation. */
-  #log { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; overflow-anchor: none; padding: 16px 14px 16px; }
+  #conversation { position: relative; display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+  #log { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; overflow-anchor: none; padding: 16px 14px 16px 38px; }
+  #questionNav { position: absolute; left: 2px; top: 50%; bottom: auto; width: 30px; max-height: calc(100% - 24px); box-sizing: border-box; z-index: 8; display: flex; flex-direction: column; align-items: center; gap: 5px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--vscode-scrollbarSlider-background) transparent; padding: 8px 0; transform: translateY(-50%); }
+  #questionNav::-webkit-scrollbar { width: 3px; }
+  #questionNav::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 3px; }
+  #questionNav::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
+  #questionNav:empty { display: none; }
+  .question-tag { flex: 0 0 5px; width: 16px; height: 5px; min-height: 5px; padding: 0; border: none; border-radius: 1px; background: var(--vscode-descriptionForeground); color: transparent; cursor: pointer; font: inherit; transition: transform 160ms ease, background 160ms ease, box-shadow 160ms ease; }
+  .question-tag:hover, .question-tag:focus-visible { transform: scale(1.35); background: var(--vscode-textLink-foreground); outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-focusBorder) 45%, transparent); }
+  .question-tag.active { background: var(--vscode-textLink-foreground); box-shadow: 0 0 0 1px var(--vscode-focusBorder); }
+  .question-tag.search-hit { background: #f2cf55; box-shadow: 0 0 0 1px #b89728; }
+  #questionTooltip { position: fixed; z-index: 100; pointer-events: none; max-width: min(320px, calc(100vw - 54px)); padding: 10px 13px; border: 1px solid var(--vscode-focusBorder); border-left: 3px solid var(--vscode-textLink-foreground); border-radius: 7px; background: color-mix(in srgb, var(--vscode-editorHoverWidget-background, #252526) 88%, var(--vscode-focusBorder)); color: var(--vscode-editorHoverWidget-foreground, #ffffff); box-shadow: 0 8px 24px #0008; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+  #questionTooltip[hidden] { display: none; }
+  .question-return { margin-bottom: 12px; cursor: pointer; color: var(--vscode-textLink-foreground); background: transparent; border: 1px solid var(--vscode-panel-border); border-radius: 5px; padding: 4px 10px; }
+  @media (prefers-reduced-motion: reduce) { .question-tag { transition: none; } }
   /* Off-screen log items keep their measured height but drop heavy DOM (markdown/code/diff)
      so long multi-turn chats stay scrollable without freezing the webview. */
   #log > .virt-item { contain: layout style; }
@@ -3104,11 +3128,15 @@ setTimeout(() => {
   <div id="lessons"></div>
   <div id="status" data-state="idle" data-active="false"><span class="dot"></span><span class="label">Idle</span><span class="elapsed"></span></div>
   <div id="plan"></div>
+  <div id="conversation">
+  <nav id="questionNav" aria-label="提问定位"></nav>
+  <div id="questionTooltip" role="tooltip" hidden></div>
   <div id="log">
     <div class="empty-state">
       <div class="title">BurstCode</div>
       <div class="hint">Ask anything about your codebase, or describe a change to make.</div>
     </div>
+  </div>
   </div>
   <div id="pendingBanner">
     <div class="header">
@@ -3561,6 +3589,96 @@ let loadedTranscriptOffset = 0;
 let loadedTranscriptTotal = 0;
 let loadingOlderTranscript = false;
 const virtParked = new WeakMap(); // el -> DocumentFragment of parked children
+const questionNav = document.getElementById('questionNav');
+const questionTooltip = document.getElementById('questionTooltip');
+let questionEntries = [];
+let questionRequest = 0;
+let questionTarget = null;
+let questionPageScroll = 0;
+function questionPreview(text) {
+  const chars = Array.from(String(text || '[图片提问]').replace(/\\s+/g, ' ').trim());
+  return chars.slice(0, 160).join('') + (chars.length > 160 ? '…' : '');
+}
+function questionForIndex(index) {
+  let owner = -1;
+  for (let i = 0; i < questionEntries.length; i++) {
+    if (questionEntries[i].index > index) break;
+    owner = i;
+  }
+  return owner;
+}
+function renderQuestionNav() {
+  questionTooltip.hidden = true;
+  const hits = new Set(currentFindQuery ? currentFindMatches.map((match) => questionForIndex(match.index)) : []);
+  questionNav.replaceChildren();
+  questionEntries.forEach((entry, i) => {
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'question-tag'; button.textContent = '';
+    button.classList.toggle('search-hit', hits.has(i));
+    button.classList.toggle('active', questionTarget === entry.messageIndex);
+    const preview = questionPreview(entry.text);
+    button.setAttribute('aria-label', '提问：' + preview + (hits.has(i) ? '（搜索命中）' : ''));
+    const show = () => {
+      questionTooltip.textContent = (i + 1) + '. ' + preview; questionTooltip.hidden = false;
+      const rect = button.getBoundingClientRect();
+      questionTooltip.style.left = (rect.right + 9) + 'px';
+      questionTooltip.style.top = Math.max(8, Math.min(rect.top, window.innerHeight - questionTooltip.offsetHeight - 8)) + 'px';
+    };
+    button.addEventListener('mouseenter', show); button.addEventListener('focus', show);
+    button.addEventListener('mouseleave', () => { questionTooltip.hidden = true; });
+    button.addEventListener('blur', () => { questionTooltip.hidden = true; });
+    button.onclick = () => revealQuestion(entry);
+    questionNav.appendChild(button);
+  });
+}
+function leaveQuestionPage() {
+  ++questionRequest;
+  if (findPage) { findPage.remove(); findPage = null; }
+  log.classList.remove('find-mode'); log.scrollTop = questionPageScroll;
+  scheduleLogVirtualization();
+}
+function scrollToQuestion(root) {
+  autoScroll = false;
+  if (pendingScrollFrame) { cancelAnimationFrame(pendingScrollFrame); pendingScrollFrame = 0; pendingScrollForce = false; }
+  pinLogVirtualization(root);
+  requestAnimationFrame(() => {
+    if (!root.isConnected) return;
+    log.scrollTop += root.getBoundingClientRect().top - log.getBoundingClientRect().top - 18;
+    unpinLogVirtualization(root);
+  });
+}
+function revealQuestion(entry) {
+  questionTooltip.hidden = true; questionTarget = entry.messageIndex; renderQuestionNav();
+  ++findPageRequest;
+  if (findScrollFrame) { cancelAnimationFrame(findScrollFrame); findScrollFrame = 0; }
+  const root = Array.from(log.children).find((el) => el.classList.contains('user') && Number(el.dataset.messageIndex) === entry.messageIndex);
+  if (root && !currentFindBar) {
+    if (findPage) leaveQuestionPage();
+    ++questionRequest; scrollToQuestion(root); return;
+  }
+  vscode.postMessage({ type: 'load-transcript-match', payload: { id: loadedTranscriptSessionId || sessionsCache.activeId, index: entry.index, requestId: ++questionRequest, purpose: 'question' } });
+}
+function mountQuestionPage(payload) {
+  if (!findPage) questionPageScroll = log.scrollTop;
+  clearFindMarks();
+  if (findTargetEl) { unpinLogVirtualization(findTargetEl); findTargetEl = null; }
+  if (findPage) findPage.remove();
+  findPage = document.createElement('div'); findPage.className = 'find-page';
+  if (!currentFindBar) {
+    const back = document.createElement('button'); back.className = 'question-return'; back.textContent = '返回最新对话';
+    back.onclick = leaveQuestionPage; findPage.appendChild(back);
+  }
+  let target = null;
+  payload.transcript.forEach((entry, offset) => {
+    const root = document.createElement('div'); root.className = 'msg ' + (entry.kind === 'user' ? 'user' : 'find-tool-entry');
+    root.dataset.transcriptIndex = String(payload.transcriptOffset + offset);
+    const text = document.createElement('div'); text.className = 'find-entry-text'; text.textContent = entry.text || '[图片提问]'; root.appendChild(text);
+    findPage.appendChild(root);
+    if (payload.transcriptOffset + offset === payload.targetIndex) target = root;
+  });
+  log.appendChild(findPage); log.classList.add('find-mode');
+  updateFindMarks(); if (target) scrollToQuestion(target);
+}
 function isLogVirtCandidate(el) {
   if (!el || el.nodeType !== 1) return false;
   if (el.classList.contains('empty-state') || el.classList.contains('find-page')) return false;
@@ -3658,12 +3776,12 @@ function updateFindMarks() {
   }
 }
 function requestCurrentFind() {
-  clearTimeout(findTimer); ++findPageRequest;
+  clearTimeout(findTimer); ++findPageRequest; ++questionRequest;
   if (findScrollFrame) cancelAnimationFrame(findScrollFrame);
   findScrollFrame = 0;
   const requestId = ++findRequestId;
   currentFindMatches = []; currentFindIndex = -1; findPending = !!currentFindQuery;
-  clearFindMarks(); updateFindCounter();
+  clearFindMarks(); updateFindCounter(); renderQuestionNav();
   if (!currentFindQuery) {
     if (findPage) { findPage.remove(); findPage = null; log.classList.remove('find-mode'); log.scrollTop = findSavedScrollTop; }
     return;
@@ -3754,6 +3872,7 @@ function closeFindBar() {
   log.classList.remove('find-mode');
   currentFindBar.remove(); currentFindBar = null;
   currentFindQuery = ''; currentFindMatches = []; currentFindIndex = -1; findPending = false;
+  ++questionRequest; renderQuestionNav();
   autoScroll = findSavedAutoScroll; log.scrollTop = findSavedScrollTop;
   scheduleLogVirtualization();
 }
@@ -3780,6 +3899,7 @@ function mountFindPage(payload) {
 function openFindBar() {
   if (currentFindBar) { currentFindBar.querySelector('input').focus(); return; }
   historyEl.classList.remove('open');
+  if (findPage) leaveQuestionPage();
   findSavedAutoScroll = autoScroll; findSavedScrollTop = log.scrollTop; autoScroll = false;
   const bar = document.createElement('div');
   bar.className = 'find-bar';
@@ -5730,6 +5850,13 @@ function addUserMsg(text, messageIndex, checkpointRef, checkpointError, imageCou
 
   if (actions.childElementCount > 0) el.appendChild(actions);
   log.appendChild(observeLogChild(el));
+  if (!renderingTranscript && typeof messageIndex === 'number') {
+    if (findPage && !currentFindBar) leaveQuestionPage();
+    questionEntries.push({ index: loadedTranscriptTotal, messageIndex, text });
+    renderQuestionNav();
+    vscode.postMessage({ type: 'request-question-nav' });
+    if (currentFindQuery) requestCurrentFind();
+  }
   // The user just submitted a prompt; jump them to the bottom regardless of
   // where they were reading, and re-arm auto-follow for the upcoming run.
   forceScrollToBottom();
@@ -5918,12 +6045,14 @@ window.addEventListener('message', (e) => {
       break;
     case 'reset':
       closeFindBar();
+      if (findPage) leaveQuestionPage();
       rollbackOverlay.classList.remove('active');
       log.innerHTML = '';
       loadedTranscript = [];
       loadedTranscriptSessionId = '';
       loadedTranscriptOffset = 0;
       loadedTranscriptTotal = 0;
+      questionEntries = []; questionTarget = null; ++questionRequest; renderQuestionNav();
       loadingOlderTranscript = false;
       activeAssistantEl = null;
       activeReasoningEl = null;
@@ -5949,6 +6078,7 @@ window.addEventListener('message', (e) => {
       loadedTranscriptTotal = Math.max(loadedTranscript.length, Number(msg.payload.transcriptTotal) || 0);
       loadingOlderTranscript = false;
       renderTranscript(loadedTranscript, false);
+      vscode.postMessage({ type: 'request-question-nav' });
       updateFindMarks();
       updateFindCounter();
       renderPlan(msg.payload.plan || []);
@@ -6019,11 +6149,22 @@ window.addEventListener('message', (e) => {
         pendingHistoryMatch = null;
       }
       if (!currentFindMatches.length) currentFindIndex = -1;
-      updateFindCounter(); revealFindMatch();
+      renderQuestionNav(); updateFindCounter(); revealFindMatch();
+      break;
+    }
+    case 'question-nav': {
+      const payload = msg.payload || {};
+      if (payload.id !== (loadedTranscriptSessionId || sessionsCache.activeId)) break;
+      questionEntries = Array.isArray(payload.questions) ? payload.questions : [];
+      renderQuestionNav();
       break;
     }
     case 'transcript-match': {
       const payload = msg.payload || {};
+      if (payload.purpose === 'question') {
+        if (payload.id === (loadedTranscriptSessionId || sessionsCache.activeId) && payload.requestId === questionRequest) mountQuestionPage(payload);
+        break;
+      }
       if (!currentFindBar || payload.id !== (loadedTranscriptSessionId || sessionsCache.activeId) || payload.requestId !== findPageRequest) break;
       const match = currentFindMatches[currentFindIndex];
       if (!match || match.index !== payload.targetIndex) break;
@@ -6723,6 +6864,8 @@ window.addEventListener('message', (e) => {
       break;
     case 'done': {
       setBusy(false);
+      vscode.postMessage({ type: 'request-question-nav' });
+      if (currentFindQuery) requestCurrentFind();
       const reason = (msg.payload && msg.payload.reason) || 'stop';
       const labels = {
         stop: 'Done',
