@@ -1028,6 +1028,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async handleMessage(msg: InboundMessage): Promise<void> {
     switch (msg.type) {
+      case 'copy-text': {
+        const payload = msg.payload as { requestId?: string; text?: string } | undefined;
+        if (typeof payload?.text !== 'string' || typeof payload.requestId !== 'string') return;
+        try {
+          await vscode.env.clipboard.writeText(payload.text);
+          this.post({ type: 'copy-text-result', payload: { requestId: payload.requestId, ok: true } });
+        } catch (err) {
+          this.logger.warn('Clipboard write failed', String(err));
+          this.post({ type: 'copy-text-result', payload: { requestId: payload.requestId, ok: false } });
+          void vscode.window.showWarningMessage('复制失败：无法写入系统剪贴板，请重试。');
+        }
+        return;
+      }
       case 'send': {
 const payload = (msg.payload ?? {}) as { text?: string; images?: ChatImageAttachment[]; useRules?: boolean; useSkills?: boolean; useMcp?: boolean; useWebSearch?: boolean; reasoningEnabled?: boolean; reasoningEffort?: string };
         const images = Array.isArray(payload.images)
@@ -5835,19 +5848,55 @@ function applyInline(s) {  // [label](file:path:line) — primary file link form
   return s;
 }
 
+// Webview Clipboard API can reject on focus/permission changes. Use the host
+// clipboard and acknowledge actual completion rather than reporting false success.
+const pendingTextCopies = new Map();
+let textCopySequence = 0;
+function copyText(text) {
+  return new Promise((resolve) => {
+    const requestId = String(++textCopySequence);
+    const timer = setTimeout(() => {
+      pendingTextCopies.delete(requestId);
+      resolve(false);
+    }, 10000);
+    pendingTextCopies.set(requestId, { resolve, timer });
+    vscode.postMessage({ type: 'copy-text', payload: { requestId, text } });
+  });
+}
+function handleCopyTextResult(payload) {
+  const pending = payload && pendingTextCopies.get(payload.requestId);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingTextCopies.delete(payload.requestId);
+  pending.resolve(payload.ok === true);
+}
+function selectedChatText() {
+  const active = document.activeElement;
+  // Preserve native input copying (including its selectionStart/selectionEnd).
+  if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return '';
+  const selection = window.getSelection();
+  return selection && !selection.isCollapsed ? selection.toString() : '';
+}
+function copyChatSelection(ev) {
+  const text = selectedChatText();
+  if (!text) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  void copyText(text);
+}
+document.addEventListener('copy', copyChatSelection);
+
 function bindCodeCopy(root) {
   root.querySelectorAll('pre .copy').forEach((btn) => {
     if (btn.dataset.bound === '1') return;
     btn.dataset.bound = '1';
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const codeEl = btn.closest('pre').querySelector('code');
       const txt = codeEl ? codeEl.textContent : '';
-      try {
-        navigator.clipboard.writeText(txt);
-        const old = btn.textContent;
-        btn.textContent = '✓';
-        setTimeout(() => { btn.textContent = old; }, 1200);
-      } catch (e) { /* ignore */ }
+      const ok = await copyText(txt);
+      const old = btn.textContent;
+      btn.textContent = ok ? '✓' : 'Failed';
+      setTimeout(() => { btn.textContent = old; }, 1200);
     });
   });
 }
@@ -5919,11 +5968,7 @@ function addUserMsg(text, messageIndex, checkpointRef, checkpointError, imageCou
     ev.stopPropagation();
     const txt = text || '';
     if (!txt) return;
-    const done = () => flashCopied(copyBtn, ICON_COPY_TEXT, 'Copy');
-    try {
-      const p = navigator.clipboard && navigator.clipboard.writeText(txt);
-      if (p && typeof p.then === 'function') p.then(done, done); else done();
-    } catch (_) { done(); }
+    void copyText(txt).then((ok) => flashCopied(copyBtn, ICON_COPY_TEXT, 'Copy', ok));
   });
   actions.appendChild(copyBtn);
 
@@ -5986,9 +6031,9 @@ const ICON_CHECK =
   + '<path d="M3 8.5L6.5 12 13 4.5"/>'
   + '</svg>';
 
-function flashCopied(btn, originalIconHtml, originalLabel) {
-  btn.classList.add('copied');
-  btn.innerHTML = ICON_CHECK + '<span>Copied</span>';
+function flashCopied(btn, originalIconHtml, originalLabel, ok = true) {
+  btn.classList.toggle('copied', ok);
+  btn.innerHTML = ok ? ICON_CHECK + '<span>Copied</span>' : originalIconHtml + '<span>Failed</span>';
   if (btn._copyResetTimer) clearTimeout(btn._copyResetTimer);
   btn._copyResetTimer = setTimeout(() => {
     btn.classList.remove('copied');
@@ -6012,11 +6057,7 @@ function buildAssistantActions(messageEl) {
       ev.preventDefault();
       const txt = getText() || '';
       if (!txt) return;
-      const done = () => flashCopied(b, iconHtml, label);
-      try {
-        const p = navigator.clipboard && navigator.clipboard.writeText(txt);
-        if (p && typeof p.then === 'function') p.then(done, done); else done();
-      } catch (_) { done(); }
+      void copyText(txt).then((ok) => flashCopied(b, iconHtml, label, ok));
     });
     return b;
   };
@@ -6104,6 +6145,9 @@ function updateQueueButton() {
   queueBtn.classList.toggle('show', busy && input.value.trim().length > 0);
 }
 window.addEventListener('keydown', (ev) => {
+  if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && !ev.shiftKey && ev.key.toLowerCase() === 'c') {
+    copyChatSelection(ev);
+  }
   if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'f') {
     ev.preventDefault(); ev.stopPropagation(); openFindBar();
   }
@@ -6118,6 +6162,7 @@ function setBusy(v) {
 
 window.addEventListener('message', (e) => {
   const msg = e.data;
+  if (msg.type === 'copy-text-result') { handleCopyTextResult(msg.payload); return; }
   switch (msg.type) {
 	    case 'start-user-activity-listener':
 	      startTaskDoneUserActivityListener(
@@ -7184,8 +7229,8 @@ window.addEventListener('message', (e) => {
 	    }
 	  } catch (_) { /* fall back to copying the data URL */ }
 	  try {
-	    await navigator.clipboard.writeText(src);
-	    flashImagePreviewButton(imagePreviewCopy, 'Copied URL');
+	    const ok = await copyText(src);
+	    flashImagePreviewButton(imagePreviewCopy, ok ? 'Copied URL' : 'Failed');
 	  } catch (_) {
 	    flashImagePreviewButton(imagePreviewCopy, 'Failed');
 	  }
