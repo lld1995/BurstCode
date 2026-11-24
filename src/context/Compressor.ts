@@ -644,7 +644,7 @@ export function sanitizeToolPairing(messages: ChatMessage[]): ChatMessage[] {
  * are intentionally excluded: those carry decision history that the model
  * may still need even if no file path appears downstream.
  */
-const PRUNABLE_TOOLS = new Set([
+export const PRUNABLE_TOOLS = new Set([
   'read_file',
   'collect_context',
   'grep_search',
@@ -672,7 +672,7 @@ const PRUNABLE_TOOLS = new Set([
  *
  * Returns an empty set when no paths can be reliably extracted (→ no prune).
  */
-function extractPathsFromToolResult(toolName: string, content: string): Set<string> {
+export function extractPathsFromToolResult(toolName: string, content: string): Set<string> {
   const paths = new Set<string>();
 
   if (toolName === 'read_file') {
@@ -751,27 +751,114 @@ function extractPathsFromToolResult(toolName: string, content: string): Set<stri
 }
 
 /**
- * Build a single string containing all downstream message content
- * (from index `fromIdx` to end) for fast path-presence checks.
+ * Normalize path separators so Windows absolute paths (`e:\\project\\src\\foo.ts`
+ * in JSON-encoded args, or `e:\project\src\foo.ts` in raw content) still match
+ * relative forward-slash paths extracted from tool result headers (`src/foo.ts`).
+ * Two-pass: first collapse JSON-escaped double backslashes, then remaining singles.
  */
-function buildDownstreamText(messages: ChatMessage[], fromIdx: number): string {
-  const parts: string[] = [];
-  for (let i = fromIdx; i < messages.length; i++) {
-    const m = messages[i];
-    parts.push(stringifyContent(m.content));
-    // Also scan tool_call arguments on assistant messages (propose_edit path/oldText).
-    const calls = (m as { tool_calls?: Array<{ function: { arguments: string } }> }).tool_calls;
-    if (calls) {
-      for (const c of calls) parts.push(c.function.arguments ?? '');
+function normalizeSeparators(text: string): string {
+  return text.replace(/\\\\/g, '/').replace(/\\/g, '/');
+}
+
+/**
+ * Locates a set of needles in a corpus in a single pass (Aho–Corasick) and
+ * reports, per needle, the highest segment it occurs in. The orphan-prune pass
+ * needs "does this path occur anywhere downstream?" for thousands of paths;
+ * asking it one path or one message at a time re-serializes and re-searches the
+ * whole transcript per candidate, which is quadratic and froze the host for
+ * seconds on long sessions.
+ */
+class NeedleIndex {
+  private readonly edges: Map<string, number>[] = [new Map()];
+  private readonly fail: number[] = [0];
+  private readonly hits: number[][] = [[]];
+  /** Nearest proper-suffix state that ends a needle, or -1. */
+  private readonly suffixLink: number[] = [-1];
+  private readonly lastSegment: number[];
+  private pending: number;
+
+  constructor(needles: string[]) {
+    this.lastSegment = needles.map(() => -1);
+    this.pending = needles.length;
+    needles.forEach((needle, id) => {
+      let node = 0;
+      for (const ch of needle) {
+        let next = this.edges[node].get(ch);
+        if (next === undefined) {
+          next = this.edges.length;
+          this.edges[node].set(ch, next);
+          this.edges.push(new Map());
+          this.fail.push(0);
+          this.hits.push([]);
+          this.suffixLink.push(-1);
+        }
+        node = next;
+      }
+      this.hits[node].push(id);
+    });
+    const queue = [...this.edges[0].values()];
+    for (let head = 0; head < queue.length; head++) {
+      const node = queue[head];
+      for (const [ch, child] of this.edges[node]) {
+        queue.push(child);
+        let back = this.fail[node];
+        while (back !== 0 && !this.edges[back].has(ch)) back = this.fail[back];
+        const via = this.edges[back].get(ch);
+        const failure = via !== undefined && via !== child ? via : 0;
+        this.fail[child] = failure;
+        this.suffixLink[child] = this.hits[failure].length > 0 ? failure : this.suffixLink[failure];
+      }
     }
   }
-  // Normalize path separators so Windows absolute paths (`e:\\project\\src\\foo.ts`
-  // in JSON-encoded args, or `e:\project\src\foo.ts` in raw content) still match
-  // relative forward-slash paths extracted from tool result headers (`src/foo.ts`).
-  // Two-pass: first collapse JSON-escaped double backslashes, then remaining singles.
-  const joined = parts.join('\n');
-  return joined.replace(/\\\\/g, '/').replace(/\\/g, '/');
+
+  /** Record every needle found in `text`, which is segment `segment` of the corpus. */
+  scan(text: string, segment: number): void {
+    let node = 0;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      let next = this.edges[node].get(ch);
+      while (next === undefined && node !== 0) {
+        node = this.fail[node];
+        next = this.edges[node].get(ch);
+      }
+      node = next ?? 0;
+      // Segments are scanned from the end, so the first sighting of a needle
+      // is already its highest segment.
+      this.record(this.hits[node], segment);
+      // Needles ending at a proper suffix of the current match.
+      for (let state = this.suffixLink[node]; state > 0; state = this.suffixLink[state]) {
+        this.record(this.hits[state], segment);
+      }
+    }
+  }
+
+  private record(ids: number[], segment: number): void {
+    for (const id of ids) {
+      if (this.lastSegment[id] >= 0) continue;
+      this.lastSegment[id] = segment;
+      this.pending--;
+    }
+  }
+
+  /** Needles not located in any segment scanned so far. */
+  get unresolved(): number {
+    return this.pending;
+  }
+
+  /** Highest segment containing needle `id`, or -1. */
+  lastSeenAt(id: number): number {
+    return this.lastSegment[id];
+  }
 }
+
+/**
+ * What the orphan-prune pass found out about a tool result, kept for as long
+ * as the message object lives. Rewritten results (pruned or zone-truncated) are
+ * new objects and get a fresh entry.
+ */
+const pruneFacts = new WeakMap<ChatMessage, { paths: Set<string>; referenced: boolean }>();
+const MAX_PRUNE_PATHS = 20_000;
+const MAX_PRUNE_PATH_CHARS = 2_000_000;
 
 /**
  * Walk the messages array and collapse tool results that are safe to prune.
@@ -845,12 +932,13 @@ export function pruneOrphanedToolResults(
     }
   }
 
-  let pruned = 0;
+  // Collect the candidates first: whether a result is still referenced is
+  // judged on the transcript as it stands at the start of the pass, and nothing
+  // pruned in this pass lies downstream of a later result.
+  const candidates: Array<{ index: number; toolName: string; paths: Set<string> }> = [];
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
-    if (m.role !== 'tool') continue;
-    if (i >= protectedFrom) continue; // in protected zone — never touch
-    if (i >= graceFrom) continue; // recently read — grace window, never touch yet
+    if (m.role !== 'tool' || i >= protectedFrom || i >= graceFrom) continue; // protected zone or grace window
 
     const toolCallId = (m as ChatMessage & { tool_call_id?: string }).tool_call_id ?? '';
     const toolName = callIdToName.get(toolCallId) ?? '';
@@ -861,35 +949,72 @@ export function pruneOrphanedToolResults(
     // Already pruned in a previous pass.
     if (content.startsWith('[pruned:')) continue;
 
-    // Extract file paths referenced by this result.
-    const paths = extractPathsFromToolResult(toolName, content);
-
-    // If we can't extract any paths, be conservative: don't prune.
-    // (Unknown content shape → might be something we'd regret deleting.)
-    if (paths.size === 0) continue;
-
-    // Build downstream text ONCE per candidate (lazily, covers i+1…end).
-    const downstream = buildDownstreamText(messages, i + 1);
-
-    // If ANY of the paths still appear downstream, keep the result intact.
-    // Normalize each path's separators to forward slashes to match
-    // buildDownstreamText (which collapses all backslashes to `/`), otherwise
-    // Windows backslash paths extracted here would never match downstream text.
-    let stillReferenced = false;
-    for (const p of paths) {
-      const norm = p.replace(/\\/g, '/');
-      if (downstream.includes(norm)) {
-        stillReferenced = true;
-        break;
-      }
+    let fact = pruneFacts.get(m);
+    if (!fact) {
+      // Extract file paths referenced by this result. If we can't extract any,
+      // be conservative: don't prune. (Unknown content shape → might be
+      // something we'd regret deleting.)
+      fact = { paths: extractPathsFromToolResult(toolName, content), referenced: false };
+      pruneFacts.set(m, fact);
     }
-    if (stillReferenced) continue;
+    if (fact.paths.size > 0 && !fact.referenced) candidates.push({ index: i, toolName, paths: fact.paths });
+  }
+  if (candidates.length === 0) return 0;
+
+  // Locate every candidate path with ONE pass over the transcript. Asking per
+  // candidate used to re-serialize and re-search all downstream messages each
+  // time, which is quadratic in the transcript size.
+  const needleIds = new Map<string, number>();
+  const needles: string[] = [];
+  let needleChars = 0;
+  for (const candidate of candidates) {
+    for (const p of candidate.paths) {
+      // Normalize each path's separators to forward slashes to match the
+      // normalized haystack, otherwise Windows backslash paths extracted here
+      // would never match downstream text.
+      const norm = p.replace(/\\/g, '/');
+      if (needleIds.has(norm)) continue;
+      needleIds.set(norm, needles.length);
+      needles.push(norm);
+      needleChars += norm.length;
+    }
+  }
+  // A batch of results listing a prohibitive number of distinct paths (a huge
+  // grep or tree) is left alone: pruning is an optimization, never a must.
+  if (needles.length > MAX_PRUNE_PATHS || needleChars > MAX_PRUNE_PATH_CHARS) return 0;
+  const locator = new NeedleIndex(needles);
+  // Scan from the end: the first sighting of a path is its highest segment.
+  // Nothing below the earliest candidate can lie downstream of any of them.
+  for (let i = messages.length - 1; i > candidates[0].index && locator.unresolved > 0; i--) {
+    const m = messages[i];
+    locator.scan(normalizeSeparators(stringifyContent(m.content)), i);
+    // Tool-call arguments on assistant messages count too (propose_edit path/oldText).
+    const calls = (m as { tool_calls?: Array<{ function: { arguments?: string } }> }).tool_calls;
+    if (calls) {
+      for (const c of calls) locator.scan(normalizeSeparators(c.function.arguments ?? ''), i);
+    }
+  }
+
+  let pruned = 0;
+  for (const candidate of candidates) {
+    // If ANY of the paths still appears downstream, keep the result intact
+    // because the model may still need it for propose_edit or a follow-up read.
+    const stillReferenced = [...candidate.paths].some(
+      (p) => locator.lastSeenAt(needleIds.get(p.replace(/\\/g, '/')) ?? -1) > candidate.index
+    );
+    const fact = pruneFacts.get(messages[candidate.index]);
+    if (stillReferenced) {
+      // Later turns can only add references, so do not search for it again on
+      // every iteration.
+      if (fact) fact.referenced = true;
+      continue;
+    }
 
     // Safe to prune. Build a one-line sentinel so the model knows it once
     // had this context (useful for self-awareness) without storing the bulk.
-    const primary = [...paths][0];
-    const sentinel = `[pruned: ${toolName} ${primary}${paths.size > 1 ? ` (+${paths.size - 1} more)` : ''} — content removed, no longer needed]`;
-    messages[i] = { ...m, content: sentinel } as ChatMessage;
+    const primary = [...candidate.paths][0];
+    const sentinel = `[pruned: ${candidate.toolName} ${primary}${candidate.paths.size > 1 ? ` (+${candidate.paths.size - 1} more)` : ''} — content removed, no longer needed]`;
+    messages[candidate.index] = { ...messages[candidate.index], content: sentinel } as ChatMessage;
     pruned++;
   }
 

@@ -21,6 +21,12 @@ export interface LLMConfig {
   reasoningEffort?: string;
   /** Skip TLS cert verification for the configured baseURL (self-signed corporate endpoints). */
   allowSelfSignedCerts?: boolean;
+  /**
+   * Called after a provider refused a request that carried images and the
+   * request then went through with them removed. Lets the host remember that
+   * the model takes no image input, whatever its advertised capabilities say.
+   */
+  onImagesRejected?: () => void;
 }
 
 /**
@@ -920,6 +926,45 @@ export async function writeCachedFetchedModels(
   await memento.update(FETCHED_MODELS_CACHE_KEY, cache);
 }
 
+const VISION_REJECTED_KEY = 'burstcode.llm.visionRejected.v1';
+
+function visionRejectionKey(baseURL: string, model: string): string {
+  return `${(baseURL || '').trim()}|${model.trim()}`;
+}
+
+function readVisionRejections(memento: vscode.Memento): Record<string, number> {
+  const raw = memento.get<Record<string, number>>(VISION_REJECTED_KEY);
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+}
+
+/**
+ * A chat keeps the images of earlier turns, so after switching to a model that
+ * takes no image input every later request would be rejected again. Once a
+ * model has demonstrably refused images, stop sending them to it up front.
+ */
+export function hasVisionRejectedModel(memento: vscode.Memento, baseURL: string, model: string): boolean {
+  const key = visionRejectionKey(baseURL, model);
+  return readVisionRejections(memento)[key] !== undefined;
+}
+
+/** Record that `model` at `baseURL` refused a request because of its images. */
+export async function noteVisionRejectedModel(memento: vscode.Memento, baseURL: string, model: string): Promise<void> {
+  const key = visionRejectionKey(baseURL, model);
+  const rejections = readVisionRejections(memento);
+  if (!key || rejections[key] !== undefined) return;
+  rejections[key] = Date.now();
+  await memento.update(VISION_REJECTED_KEY, rejections);
+}
+
+/** Forget the recorded image rejections of `baseURL` (its model list was refreshed). */
+export async function clearVisionRejectedModels(memento: vscode.Memento, baseURL: string): Promise<void> {
+  const url = (baseURL || '').trim();
+  const rejections = readVisionRejections(memento);
+  const kept = Object.fromEntries(Object.entries(rejections).filter(([key]) => !key.startsWith(`${url}|`)));
+  if (Object.keys(kept).length === Object.keys(rejections).length) return;
+  await memento.update(VISION_REJECTED_KEY, kept);
+}
+
 export type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 export type ToolDef = OpenAI.Chat.Completions.ChatCompletionTool;
 
@@ -1172,6 +1217,9 @@ function stripImageContent(messages: ChatMessage[]): ChatMessage[] {
  *        取值范围 ['text']
  *      The only non-text content.type BurstCode ever sends is image_url, so
  *      this shape is safe to treat as an image rejection.
+ *   3. Gateways that route on capability and answer before reaching a model:
+ *        400 No enabled route target supports model 'x' with multimodal input
+ *      or that state the model does not take image / vision / multimodal input.
  */
 export function isImageContentRejectedError(error: unknown): boolean {
   const text = error instanceof Error ? error.message : String(error ?? '');
@@ -1184,7 +1232,38 @@ export function isImageContentRejectedError(error: unknown): boolean {
   const allowsOnlyText =
     /\[\s*['"`]text['"`]\s*\]/i.test(text) ||
     /取值范围[\s\S]{0,30}?['"`\[]text/i.test(text);
-  return mentionsContentType && allowsOnlyText;
+  if (mentionsContentType && allowsOnlyText) return true;
+  // Variant 3: an image capability the request needs is declared unavailable.
+  return /(?:image|vision|multimodal|多模态|图片|图像|视觉)/i.test(text) &&
+    /(?:route|target|capabilit|not support|unsupported|unavailable|not available|not allowed|rejected|不支持|不允许|非法)/i.test(text);
+}
+
+/** HTTP status of a provider error, for SDK errors (`status`) and hand-built ones (`HTTP 400`). */
+export function errorStatus(error: unknown): number | undefined {
+  const status = (error as { status?: unknown } | null)?.status;
+  if (typeof status === 'number') return status;
+  const match = /\bHTTP[ /](\d{3})\b/.exec(error instanceof Error ? error.message : String(error ?? ''));
+  return match ? Number(match[1]) : undefined;
+}
+
+/** True when any message still carries an `image_url` part. */
+export function messagesHaveImages(messages: ChatMessage[]): boolean {
+  return messages.some((message) => Array.isArray(message.content)
+    && message.content.some((part) => (part as { type?: unknown } | null)?.type === 'image_url'));
+}
+
+/**
+ * Whether a failed request that carried images is worth one retry without
+ * them. Providers word image rejections in countless ways, so besides the
+ * recognised texts any 4xx about the request body qualifies (the retry costs
+ * one request and fails identically when the images were not the cause).
+ * Statuses that cannot be about images — unknown model, missing auth, rate
+ * limits — are left alone.
+ */
+export function shouldRetryWithoutImages(error: unknown): boolean {
+  if (isImageContentRejectedError(error)) return true;
+  const status = errorStatus(error);
+  return status === 400 || status === 406 || status === 413 || status === 415 || status === 422;
 }
 
 export function prepareMessagesForModel(
@@ -1462,6 +1541,9 @@ export class OpenAIClient {
       this.config.model,
       this.config.supportsVision
     );
+    // Whether any image survived normalisation; `safeMessages` already has
+    // them stripped unless vision support was established for this model.
+    const hadImages = messagesHaveImages(safeMessages);
 
     // Some models (e.g. claude-* via OpenAI-compatible endpoints, or the same
     // models accessed via OpenRouter as "anthropic/claude-*") reject the
@@ -1843,20 +1925,28 @@ export class OpenAIClient {
           for await (const c of streamOnce(buildRequest())) yield c;
           return;
         }
-        // Last-resort compatibility at the actual HTTP boundary. Capability
-        // metadata can be stale or simply wrong; if a provider explicitly says
-        // its message schema does not accept image_url, retry the untouched turn
-        // once with image blocks removed. Only retry before any stream output so
-        // content/tool-call deltas can never be duplicated.
-        const textOnlyMessages = stripImageContent(safeMessages);
-        const hadImages = JSON.stringify(textOnlyMessages) !== JSON.stringify(safeMessages);
-        if (emitted || !hadImages || !isImageContentRejectedError(error)) throw error;
+        // Images are the part of a request most often refused: a chat keeps the
+        // images of earlier turns, so switching to a model that takes none
+        // makes every later request fail the same way. Capability metadata
+        // can be stale or simply wrong, so whenever the provider rejects the
+        // request before any stream output and images were on the wire, retry
+        // the untouched turn once with them removed. Only retry before any
+        // output so content/tool-call deltas can never be duplicated.
+        if (emitted || !hadImages || !shouldRetryWithoutImages(error)) throw error;
         this.logger.warn(
-          `Provider rejected image_url for model ${this.config.model}; retrying once with text-only history.`
+          `Provider rejected a request with images for model ${this.config.model} `
+          + `(HTTP ${errorStatus(error) ?? 'n/a'}); retrying once with text-only history.`
         );
-        for await (const c of streamOnce(buildRequest(textOnlyMessages))) {
-          yield c;
+        try {
+          for await (const c of streamOnce(buildRequest(stripImageContent(safeMessages)))) {
+            yield c;
+          }
+        } catch (retryError) {
+          // The images were not the cause. Surface the original rejection.
+          this.logger.warn(`Text-only retry for model ${this.config.model} failed as well: ${String(retryError)}`);
+          throw error;
         }
+        this.config.onImagesRejected?.();
       }
     } finally {
       sub.dispose();

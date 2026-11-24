@@ -18,6 +18,9 @@ import {
   fetchProfileModels,
   getCachedFetchedModels,
   writeCachedFetchedModels,
+  clearVisionRejectedModels,
+  hasVisionRejectedModel,
+  noteVisionRejectedModel,
   ChatMessage
 } from '../llm/OpenAIClient';
 import { LspBridge } from '../lsp/LspBridge';
@@ -45,12 +48,15 @@ import { CheckpointInfo, GitCheckpoint } from '../git/GitCheckpoint';
 import {
   Session,
   SessionCheckpoint,
+  SessionPendingTurn,
   SessionStatus,
   SessionStore,
   buildTranscript,
   buildTranscriptRange,
   createSessionId,
   deriveTitle,
+  detectSessionOwner,
+  finalizeInterruptedTurn,
   rebaseCheckpointsAfterMessageCompaction
 } from './SessionStore';
 import type { ExplorerStatus } from '../background/BackgroundExplorer';
@@ -427,6 +433,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private rollbackSnapshots?: Map<string, string>;
   private rollbackSnapshotSub?: vscode.Disposable;
   private readonly sessions: SessionStore;
+  /** Debounced persistence timers of running sessions, by session id (see `scheduleRunPersist`). */
+  private readonly runPersistTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Chats whose user was already told that the active model refused their images. */
+  private readonly visionRejectionNotified = new Set<string>();
   private readonly lessons: LessonStore;
   private static readonly TRANSCRIPT_PAGE_SIZE = 80;
   private readonly foregroundActivityEmitter = new vscode.EventEmitter<string>();
@@ -445,7 +455,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   ) {
     const workspaceId = vscode.workspace.workspaceFile?.toString()
       ?? vscode.workspace.workspaceFolders?.map(f => f.uri.toString()).sort().join('|') ?? '';
-    this.sessions = new SessionStore(context.workspaceState, context.globalState, workspaceId, vscode.workspace.name ?? 'Empty window');
+    // Histories are stored as files on this extension host's machine (the
+    // remote disk in a Remote-SSH window), never in the memento: VS Code
+    // re-sends a memento whole on every save and every host start, which for
+    // large histories froze the host and crashed the local renderer.
+    this.sessions = new SessionStore(
+      context.workspaceState,
+      context.globalState,
+      path.join(context.globalStorageUri.fsPath, 'sessions'),
+      workspaceId,
+      vscode.workspace.name ?? 'Empty window',
+      detectSessionOwner(context.globalStorageUri.fsPath),
+      (message, err) => this.logger.warn(message, String(err))
+    );
     this.lessons = new LessonStore(context.workspaceState);
     // VS Code can be killed/reloaded while a run is persisted as "running".
     // In-memory CancellationTokenSources do not survive that restart, so those
@@ -499,6 +521,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     this.context.subscriptions.push({
       dispose: () => {
+        for (const timer of this.runPersistTimers.values()) clearTimeout(timer);
+        this.runPersistTimers.clear();
         this.stopTaskDoneAlert();
         this.stopAskUserAlert();
         this.configSub?.dispose();
@@ -533,8 +557,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (stale.length === 0) return;
     void (async () => {
       for (const meta of stale) {
-        const session = this.sessions.get(meta.id);
+        const session = await this.sessions.load(meta.id);
         if (!session || session.status !== 'running') continue;
+        // The user may have sent a new message in this chat while it was loading.
+        if (this.runs.has(meta.id)) continue;
+        // The run died with the previous extension host. Keep whatever it had
+        // produced so far instead of silently dropping the whole turn.
+        finalizeInterruptedTurn(session);
         session.status = 'stopped';
         session.updatedAt = Date.now();
         await this.sessions.save(session);
@@ -543,6 +572,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     })().catch((err) => {
       this.logger.warn('Failed to recover abandoned running sessions', String(err));
     });
+  }
+
+  /**
+   * Debounced persistence for a running session. Without it nothing of a run
+   * reached disk until it finished, so a crash, window reload or lost remote
+   * connection threw away the whole answer that was being generated. Larger
+   * histories serialize slower, so the interval grows with the session.
+   */
+  private scheduleRunPersist(session: Session): void {
+    if (this.runPersistTimers.has(session.id)) return;
+    // Serializing a very large history blocks this host for a moment, so the
+    // larger the session the rarer the snapshot.
+    const megabytes = this.sessions.sizeOf(session.id) / (1024 * 1024);
+    const delay = megabytes < 2 ? 1000 : megabytes < 8 ? 2000 : megabytes < 32 ? 4000 : 10000;
+    const timer = setTimeout(() => {
+      this.runPersistTimers.delete(session.id);
+      void this.persistRunningSession(session);
+    }, delay);
+    this.runPersistTimers.set(session.id, timer);
+  }
+
+  private async persistRunningSession(session: Session): Promise<void> {
+    const ctx = this.runs.get(session.id);
+    if (!ctx || ctx.session !== session) return;
+    // The messages array only holds completed steps; the text streaming right
+    // now lives in the live snapshot and is persisted alongside the session.
+    session.pending = {
+      assistantText: ctx.live.assistantText,
+      reasoningText: ctx.live.reasoningText,
+      savedAt: Date.now()
+    };
+    await this.persistSession(session, true);
+  }
+
+  /** Stop the periodic persistence of `session` and drop its in-flight snapshot. */
+  private endRunPersist(session: Session): void {
+    const timer = this.runPersistTimers.get(session.id);
+    if (timer) clearTimeout(timer);
+    this.runPersistTimers.delete(session.id);
+    delete session.pending;
   }
 
   /** Mark a session as "open" in the foreground tab strip. Idempotent. */
@@ -802,6 +871,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.broadcastContextUsage();
   }
 
+  /**
+   * The provider refused a request because of its images and it only went
+   * through without them. Remember the model so later turns do not pay for the
+   * same rejected request, and tell the user once per chat.
+   */
+  private noteVisionRejection(session: Session, baseURL: string, model: string): void {
+    noteVisionRejectedModel(this.context.globalState, baseURL, model).catch((err) => {
+      this.logger.warn('Failed to record the image rejection', String(err));
+    });
+    if (this.visionRejectionNotified.has(session.id)) return;
+    this.visionRejectionNotified.add(session.id);
+    vscode.window.showInformationMessage(
+      `BurstCode: model "${model}" rejected the images of this chat. They were left out of the request and will not be sent to this model again. Refresh the model list to probe again.`
+    );
+    this.broadcastModels();
+  }
+
   private broadcastModels(): void {
     if (!this.view) return;
     const chat = readChatProfile();
@@ -815,7 +901,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // entirely (returning supportsVision=false meaning "unknown", not "no"),
     // so the heuristic must still get a vote.
     const cachedEntry = cached?.models.find((m) => m.id === activeModel);
-    const supportsVision = !!cachedEntry?.supportsVision || modelSupportsVision(activeModel);
+    const rejectedImages = hasVisionRejectedModel(this.context.globalState, chat.baseURL, activeModel);
+    const supportsVision = !rejectedImages && (!!cachedEntry?.supportsVision || modelSupportsVision(activeModel));
     const video = readVideoConfig();
     this.post({
       type: 'models',
@@ -859,10 +946,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async loadSession(id: string): Promise<void> {
     // Prefer the live session held by an active run (its messages array is
-    // the one the AgentLoop is currently mutating). Falls back to disk for
-    // idle sessions.
+    // the one the AgentLoop is currently mutating). Falls back to storage for
+    // idle sessions, reading their file off the event loop.
     const live = this.runs.get(id)?.session;
-    const s = live ?? this.sessions.get(id);
+    const s = live ?? await this.sessions.load(id);
     if (!s) {
       vscode.window.showWarningMessage('BurstCode: session not found.');
       this.broadcastSessions();
@@ -950,6 +1037,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (choice !== 'Delete') return;
     await this.sessions.delete(id);
     this.videoFrameImagesBySession.delete(id);
+    this.visionRejectionNotified.delete(id);
     // Also evict from the tab working set so we don't leave an orphan tab
     // pointing at a now-deleted session.
     if (this.openTabIds.delete(id)) {
@@ -1284,9 +1372,14 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
         const scope = ['current', 'workspace', 'global'].includes(payload.scope ?? '') ? payload.scope! : 'all';
         const requestedId = String(payload.sessionId ?? '').trim();
         const currentId = requestedId || this.currentSession?.id || '';
-        const candidates = scope === 'current'
-          ? (currentId ? [this.runs.get(currentId)?.session ?? this.sessions.get(currentId)] : [])
-          : this.sessions.list().filter(meta => scope === 'all' || (meta.scope ?? 'workspace') === scope).map((meta) => this.runs.get(meta.id)?.session ?? this.sessions.get(meta.id));
+        // Idle sessions are read from their files. Load them off the event loop
+        // before scanning so a history spanning many large sessions does not
+        // block the host.
+        const metas = this.sessions.list().filter((meta) => scope !== 'current'
+          ? scope === 'all' || (meta.scope ?? 'workspace') === scope
+          : meta.id === currentId);
+        await Promise.all(metas.filter((meta) => !this.runs.has(meta.id)).map((meta) => this.sessions.load(meta.id)));
+        const candidates = metas.map((meta) => this.runs.get(meta.id)?.session ?? this.sessions.get(meta.id));
         const results: Array<{ sessionId: string; title: string; kind: string; text: string; index: number; matchCount: number }> = [];
         for (const session of candidates) {
           if (!session) continue;
@@ -1371,6 +1464,8 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
           // Persist so the picker shows these immediately on next reopen
           // without re-hitting the network.
           await writeCachedFetchedModels(this.context.globalState, chat.baseURL, models);
+          // A refreshed capability list gets the benefit of the doubt again.
+          await clearVisionRejectedModels(this.context.globalState, chat.baseURL);
           this.post({
             type: 'models-fetched',
             payload: { models, fetchedAt: Date.now() }
@@ -1970,8 +2065,11 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
     const cached = getCachedFetchedModels(this.context.globalState, llmProfile.baseURL);
     const cachedEntry = cached?.models.find((m) => m.id === activeModel);
     // OR the gateway flag with the local heuristic: gateways often omit
-    // capability metadata, so a cached false may just mean "unknown".
-    const activeModelSupportsVision = !!cachedEntry?.supportsVision || modelSupportsVision(activeModel);
+    // capability metadata, so a cached false may just mean "unknown". A model
+    // that already refused images here stays text-only: a chat keeps the images
+    // of earlier turns, so every later request would be rejected again.
+    const visionRejected = hasVisionRejectedModel(this.context.globalState, llmProfile.baseURL, activeModel);
+    const activeModelSupportsVision = !visionRejected && (!!cachedEntry?.supportsVision || modelSupportsVision(activeModel));
     const requestedEffort = opts.reasoningEnabled === true ? String(opts.reasoningEffort ?? '').trim() : '';
     const reasoningEfforts = cachedEntry?.reasoningEffortValues ?? [];
     const reasoningEffort = requestedEffort && reasoningEfforts.includes(requestedEffort) ? requestedEffort : undefined;
@@ -2116,7 +2214,8 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
       supportsVision: activeModelSupportsVision,
       reasoningEnabled: opts.reasoningEnabled === true,
       reasoningEffort,
-      webSearchEnabled: opts.useWebSearch !== false && vscode.workspace.getConfiguration('burstcode.web').get<boolean>('enabled') !== false
+      webSearchEnabled: opts.useWebSearch !== false && vscode.workspace.getConfiguration('burstcode.web').get<boolean>('enabled') !== false,
+      onImagesRejected: () => this.noteVisionRejection(session, llmProfile.baseURL, activeModel)
     };
     const client = new OpenAIClient(llmCfg, this.logger);
     const bridge = new LspBridge(
@@ -2269,6 +2368,8 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
         // Update the per-session live snapshot FIRST so it stays consistent
         // whether or not the webview is currently showing this session.
         this.applyEventToLive(ctx, event);
+        // Every event may have grown the transcript or the streaming text.
+        this.scheduleRunPersist(session);
         switch (event.type) {
           case 'assistant-delta':
             postLive({ type: 'assistant-delta', payload: { text: event.payload as string } });
@@ -2328,6 +2429,9 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
       postLive({ type: 'error', payload: String(err) });
     } finally {
       this.runs.delete(session.id);
+      // The final save below carries the complete turn, so the in-flight
+      // snapshot used for crash recovery is no longer needed.
+      this.endRunPersist(session);
       cts.dispose();
       // Decide final status: error > cancelled > completed.
       const cancelled = cts.token.isCancellationRequested || doneReason === 'cancelled';
@@ -2451,15 +2555,19 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
     }
   }
 
-  /** Persist a specific session (not necessarily the currently-visible one). */
-  private async persistSession(session: Session): Promise<void> {
+  /**
+   * Persist a specific session (not necessarily the currently-visible one).
+   * `quiet` skips the history broadcast for the periodic saves of a running
+   * session, whose metadata does not change between them.
+   */
+  private async persistSession(session: Session, quiet = false): Promise<void> {
     session.updatedAt = Date.now();
     try {
       await this.sessions.save(session);
     } catch (err) {
       this.logger.error('Failed to persist session', String(err));
     }
-    this.broadcastSessions();
+    if (!quiet) this.broadcastSessions();
   }
 
   private renderHtml(webview: vscode.Webview): string {

@@ -115,30 +115,52 @@ function estimateImageTokens(dataUrl: string): number {
   return tiles * 170 + 85;
 }
 
-export function estimateMessagesTokens(messages: Array<{ role: string; content: unknown; tool_calls?: unknown }>): number {
-  let total = 0;
-  for (const m of messages) {
-    total += 4; // per-message overhead
-    if (typeof m.content === 'string') {
-      total += estimateTokens(m.content);
-    } else if (Array.isArray(m.content)) {
-      // Handle multimodal content: text parts are tokenized normally, while
-      // image_url parts must NOT be tokenized as base64 text — that would
-      // inflate the estimate by 100-500×. Instead we use the OpenAI vision
-      // tile formula based on pixel dimensions.
-      for (const part of m.content) {
-        if (!part || typeof part !== 'object') continue;
-        const p = part as { type?: string; text?: string; image_url?: { url?: string } };
-        if (p.type === 'text' && typeof p.text === 'string') {
-          total += estimateTokens(p.text);
-        } else if (p.type === 'image_url' && p.image_url?.url) {
-          total += estimateImageTokens(p.image_url.url);
-        } else {
-          total += estimateTokens(JSON.stringify(p));
-        }
+type TokenCountedMessage = { role: string; content: unknown; tool_calls?: unknown };
+
+/**
+ * Token count per message object. Messages are never edited in place — the
+ * agent appends new ones and the compressor swaps a rewritten message for a
+ * new object — so a count stays valid for as long as its message is alive.
+ * Without it the same transcript was tokenized several times per iteration
+ * (prune threshold, compression checks, context gauge), which on long sessions
+ * was one of the largest costs in the extension host.
+ */
+const messageTokens = new WeakMap<object, number>();
+
+function countMessageTokens(m: TokenCountedMessage): number {
+  let total = 4; // per-message overhead
+  if (typeof m.content === 'string') {
+    total += estimateTokens(m.content);
+  } else if (Array.isArray(m.content)) {
+    // Handle multimodal content: text parts are tokenized normally, while
+    // image_url parts must NOT be tokenized as base64 text — that would
+    // inflate the estimate by 100-500×. Instead we use the OpenAI vision
+    // tile formula based on pixel dimensions.
+    for (const part of m.content) {
+      if (!part || typeof part !== 'object') continue;
+      const p = part as { type?: string; text?: string; image_url?: { url?: string } };
+      if (p.type === 'text' && typeof p.text === 'string') {
+        total += estimateTokens(p.text);
+      } else if (p.type === 'image_url' && p.image_url?.url) {
+        total += estimateImageTokens(p.image_url.url);
+      } else {
+        total += estimateTokens(JSON.stringify(p));
       }
     }
-    if (m.tool_calls) total += estimateTokens(JSON.stringify(m.tool_calls));
+  }
+  if (m.tool_calls) total += estimateTokens(JSON.stringify(m.tool_calls));
+  return total;
+}
+
+export function estimateMessagesTokens(messages: TokenCountedMessage[]): number {
+  let total = 0;
+  for (const m of messages) {
+    let count = messageTokens.get(m);
+    if (count === undefined) {
+      count = countMessageTokens(m);
+      messageTokens.set(m, count);
+    }
+    total += count;
   }
   return total + 2;
 }

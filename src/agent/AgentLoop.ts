@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ChatMessage, OpenAIClient, ToolDef } from '../llm/OpenAIClient';
+import { ChatMessage, OpenAIClient, ToolDef, errorStatus } from '../llm/OpenAIClient';
 import { Tool, ToolResult } from './tools/types';
 import { FALLBACK_SYSTEM_PROMPT } from './prompts';
 import { compressMessages, defaultCompressorConfig, prepareToolResultForStorage, pruneOrphanedToolResults } from '../context/Compressor';
@@ -341,6 +341,22 @@ function isTruncatedRequestError(err: unknown): boolean {
   if (msg.includes('request body incomplete')) return true;
   if (msg.includes('connection reset') && msg.includes('400')) return true;
   return false;
+}
+
+const NON_RETRYABLE_STATUSES = new Set([400, 401, 403, 404, 405, 406, 410, 413, 415, 422]);
+
+/**
+ * Request rejections that no retry can fix: the provider turned the request
+ * itself away (invalid parameter, unknown model, missing auth). Every retry
+ * sends the same bytes and is rejected the same way, so with unlimited
+ * auto-resume the run would spin until the user presses Stop. Context-length
+ * and truncated-body 400s are exempt: retrying after compression, or through a
+ * flaky proxy, does help there.
+ */
+export function isNonRetryableRequestError(err: unknown): boolean {
+  if (isContextLengthError(err) || isTruncatedRequestError(err)) return false;
+  const status = errorStatus(err);
+  return status !== undefined && NON_RETRYABLE_STATUSES.has(status);
 }
 
 const CANCELLED_PROGRESS_TEXT_LIMIT = 18_000;
@@ -1343,6 +1359,13 @@ export class AgentLoop {
             resumeAssistantPrefix = '';
             resumeReasoningPrefix = '';
             resumeToolCallPrefixes = [];
+          }
+          // The provider refused the request itself. A retry sends the very same
+          // bytes, so resuming would only repeat the rejection.
+          if (isNonRetryableRequestError(err)) {
+            this.logger.error('LLM request rejected', String(err));
+            yield { type: 'error', payload: `Request rejected: ${String(err)}` };
+            return;
           }
           // Context-length errors cannot be fixed by retrying the same request.
           // Force-compress the persistent message array and retry via the outer
