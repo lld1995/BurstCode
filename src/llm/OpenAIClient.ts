@@ -22,9 +22,10 @@ export interface LLMConfig {
   /** Skip TLS cert verification for the configured baseURL (self-signed corporate endpoints). */
   allowSelfSignedCerts?: boolean;
   /**
-   * Called after a provider refused a request that carried images and the
-   * request then went through with them removed. Lets the host remember that
-   * the model takes no image input, whatever its advertised capabilities say.
+   * Called after a provider refused a request that carried images for a reason
+   * other than its size, and the request then went through with them removed.
+   * Lets the host remember the refusal for a while, whatever the model's
+   * advertised capabilities say.
    */
   onImagesRejected?: () => void;
 }
@@ -927,6 +928,12 @@ export async function writeCachedFetchedModels(
 }
 
 const VISION_REJECTED_KEY = 'burstcode.llm.visionRejected.v1';
+/**
+ * How long a recorded image rejection counts. The record comes from ONE failed
+ * request, which may have been transient, so it is a short-lived hint and never
+ * a statement about the model.
+ */
+const VISION_REJECTED_TTL_MS = 10 * 60 * 1000;
 
 function visionRejectionKey(baseURL: string, model: string): string {
   return `${(baseURL || '').trim()}|${model.trim()}`;
@@ -938,22 +945,36 @@ function readVisionRejections(memento: vscode.Memento): Record<string, number> {
 }
 
 /**
- * A chat keeps the images of earlier turns, so after switching to a model that
- * takes no image input every later request would be rejected again. Once a
- * model has demonstrably refused images, stop sending them to it up front.
+ * Whether `model` at `baseURL` refused a request because of its images
+ * recently. A chat keeps the images of earlier turns, so the record spares the
+ * model one rejected request per turn. It expires, and it never overrides what
+ * the gateway declares for the model (see `allowsImageInput`).
  */
 export function hasVisionRejectedModel(memento: vscode.Memento, baseURL: string, model: string): boolean {
-  const key = visionRejectionKey(baseURL, model);
-  return readVisionRejections(memento)[key] !== undefined;
+  const recordedAt = readVisionRejections(memento)[visionRejectionKey(baseURL, model)];
+  return typeof recordedAt === 'number' && Date.now() - recordedAt < VISION_REJECTED_TTL_MS;
 }
 
 /** Record that `model` at `baseURL` refused a request because of its images. */
 export async function noteVisionRejectedModel(memento: vscode.Memento, baseURL: string, model: string): Promise<void> {
-  const key = visionRejectionKey(baseURL, model);
-  const rejections = readVisionRejections(memento);
-  if (!key || rejections[key] !== undefined) return;
-  rejections[key] = Date.now();
+  const now = Date.now();
+  const rejections: Record<string, number> = {};
+  for (const [key, recordedAt] of Object.entries(readVisionRejections(memento))) {
+    if (typeof recordedAt === 'number' && now - recordedAt < VISION_REJECTED_TTL_MS) rejections[key] = recordedAt;
+  }
+  rejections[visionRejectionKey(baseURL, model)] = now;
   await memento.update(VISION_REJECTED_KEY, rejections);
+}
+
+/**
+ * Whether requests to a model may carry images. What the gateway declares for
+ * it in `/v1/models` has the last word. The name heuristic only applies when
+ * the gateway does not declare vision support, and a recorded rejection only
+ * vetoes the heuristic: one request that failed while it carried images says
+ * nothing about a model whose gateway declares that it takes them.
+ */
+export function allowsImageInput(declaredVision: boolean, recentlyRejected: boolean, nameSuggestsVision: boolean): boolean {
+  return declaredVision || (!recentlyRejected && nameSuggestsVision);
 }
 
 /** Forget the recorded image rejections of `baseURL` (its model list was refreshed). */
@@ -1264,6 +1285,12 @@ export function shouldRetryWithoutImages(error: unknown): boolean {
   if (isImageContentRejectedError(error)) return true;
   const status = errorStatus(error);
   return status === 400 || status === 406 || status === 413 || status === 415 || status === 422;
+}
+
+/** A rejection about the request's size or media type, not about the model's capabilities. */
+function isPayloadRejection(error: unknown): boolean {
+  const status = errorStatus(error);
+  return status === 413 || status === 415;
 }
 
 export function prepareMessagesForModel(
@@ -1946,7 +1973,8 @@ export class OpenAIClient {
           this.logger.warn(`Text-only retry for model ${this.config.model} failed as well: ${String(retryError)}`);
           throw error;
         }
-        this.config.onImagesRejected?.();
+        // A request that was merely too large says nothing about the model.
+        if (!isPayloadRejection(error)) this.config.onImagesRejected?.();
       }
     } finally {
       sub.dispose();

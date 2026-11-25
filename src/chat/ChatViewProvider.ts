@@ -18,6 +18,7 @@ import {
   fetchProfileModels,
   getCachedFetchedModels,
   writeCachedFetchedModels,
+  allowsImageInput,
   clearVisionRejectedModels,
   hasVisionRejectedModel,
   noteVisionRejectedModel,
@@ -873,8 +874,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /**
    * The provider refused a request because of its images and it only went
-   * through without them. Remember the model so later turns do not pay for the
-   * same rejected request, and tell the user once per chat.
+   * through without them. Remember the model for a while so later turns do not
+   * pay for the same rejected request, and tell the user once per chat.
    */
   private noteVisionRejection(session: Session, baseURL: string, model: string): void {
     noteVisionRejectedModel(this.context.globalState, baseURL, model).catch((err) => {
@@ -883,7 +884,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this.visionRejectionNotified.has(session.id)) return;
     this.visionRejectionNotified.add(session.id);
     vscode.window.showInformationMessage(
-      `BurstCode: model "${model}" rejected the images of this chat. They were left out of the request and will not be sent to this model again. Refresh the model list to probe again.`
+      `BurstCode: model "${model}" rejected a request that carried the images of this chat; it was retried without them. Video generation can still use pasted images as first/last frames.`
     );
     this.broadcastModels();
   }
@@ -902,7 +903,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // so the heuristic must still get a vote.
     const cachedEntry = cached?.models.find((m) => m.id === activeModel);
     const rejectedImages = hasVisionRejectedModel(this.context.globalState, chat.baseURL, activeModel);
-    const supportsVision = !rejectedImages && (!!cachedEntry?.supportsVision || modelSupportsVision(activeModel));
+    const supportsVision = allowsImageInput(cachedEntry?.supportsVision === true, rejectedImages, modelSupportsVision(activeModel));
     const video = readVideoConfig();
     this.post({
       type: 'models',
@@ -2065,11 +2066,11 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
     const cached = getCachedFetchedModels(this.context.globalState, llmProfile.baseURL);
     const cachedEntry = cached?.models.find((m) => m.id === activeModel);
     // OR the gateway flag with the local heuristic: gateways often omit
-    // capability metadata, so a cached false may just mean "unknown". A model
-    // that already refused images here stays text-only: a chat keeps the images
-    // of earlier turns, so every later request would be rejected again.
+    // capability metadata, so a cached false may just mean "unknown". A recent
+    // image refusal only vetoes that guess: a chat keeps the images of earlier
+    // turns, so a model that just refused them would reject every later request.
     const visionRejected = hasVisionRejectedModel(this.context.globalState, llmProfile.baseURL, activeModel);
-    const activeModelSupportsVision = !visionRejected && (!!cachedEntry?.supportsVision || modelSupportsVision(activeModel));
+    const activeModelSupportsVision = allowsImageInput(cachedEntry?.supportsVision === true, visionRejected, modelSupportsVision(activeModel));
     const requestedEffort = opts.reasoningEnabled === true ? String(opts.reasoningEffort ?? '').trim() : '';
     const reasoningEfforts = cachedEntry?.reasoningEffortValues ?? [];
     const reasoningEffort = requestedEffort && reasoningEfforts.includes(requestedEffort) ? requestedEffort : undefined;

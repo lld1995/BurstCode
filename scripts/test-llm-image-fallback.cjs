@@ -2,6 +2,7 @@
 // against a local OpenAI-compatible mock server.
 // Run: node scripts/test-llm-image-fallback.cjs
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const http = require('node:http');
 const { loadTs, anything } = require('./testkit.cjs');
 
@@ -75,7 +76,7 @@ test('a chat whose history carries images survives a model that refuses them', a
     assert.equal(provider.requests.length, 2, 'exactly one retry');
     assert.equal(carriesImages(provider.requests[0].body), true);
     assert.equal(carriesImages(provider.requests[1].body), false, 'the retry leaves every image out');
-    assert.equal(remembered, 1, 'the host is told the model takes no images');
+    assert.equal(remembered, 1, 'the host is told about the refusal');
   } finally { await provider.close(); }
 });
 
@@ -104,6 +105,42 @@ test('rate limiting and requests without images are not retried', async () => {
     await assert.rejects(collect(makeClient(plain.baseURL, { supportsVision: true }), [{ role: 'user', content: 'plain' }]), /invalid tool schema/);
     assert.equal(plain.requests.length, 1, 'nothing to strip, nothing to retry');
   } finally { await plain.close(); }
+});
+
+test('a request that was merely too large does not brand the model', async () => {
+  for (const status of [413, 415]) {
+    let remembered = 0;
+    const provider = await mockProvider(({ body, res }) => (carriesImages(body) ? refuse(res, status, 'payload too large') : answer(res, 'ok')));
+    try {
+      const chunks = await collect(makeClient(provider.baseURL, { supportsVision: true, onImagesRejected: () => remembered++ }), HISTORY_WITH_IMAGE);
+      assert.equal(chunks.map((c) => c.contentDelta || '').join(''), 'ok', 'the chat still continues without the images');
+      assert.equal(remembered, 0, `HTTP ${status} is about the request, not about the model`);
+    } finally { await provider.close(); }
+  }
+});
+
+test('a recorded refusal expires and never overrides what the gateway declares', async () => {
+  const { allowsImageInput, hasVisionRejectedModel, noteVisionRejectedModel } = pure;
+  const state = { map: new Map(), get(key) { return this.map.get(key); }, async update(key, value) { this.map.set(key, JSON.parse(JSON.stringify(value))); } };
+  await noteVisionRejectedModel(state, 'http://gw/v1', 'model-a');
+  const realNow = Date.now;
+  let soon, later;
+  try {
+    Date.now = () => realNow() + 9 * 60 * 1000;
+    soon = hasVisionRejectedModel(state, 'http://gw/v1', 'model-a');
+    Date.now = () => realNow() + 11 * 60 * 1000;
+    later = hasVisionRejectedModel(state, 'http://gw/v1', 'model-a');
+  } finally { Date.now = realNow; }
+  assert.equal(soon, true, 'for a while later turns skip the request that would be refused');
+  assert.equal(later, false, 'then images are tried again');
+  assert.equal(allowsImageInput(true, true, true), true, 'a gateway that declares vision support has the last word');
+  assert.equal(allowsImageInput(true, true, false), true);
+  assert.equal(allowsImageInput(false, true, true), false, 'a recent refusal vetoes the guess made from the model name');
+  assert.equal(allowsImageInput(false, false, true), true);
+  assert.equal(allowsImageInput(false, false, false), false);
+  // Both gates of the chat panel go through it.
+  const provider = fs.readFileSync('src/chat/ChatViewProvider.ts', 'utf8');
+  assert.equal(provider.split('allowsImageInput(cachedEntry?.supportsVision === true, ').length - 1, 2);
 });
 
 test('images are left out up front once the model is not trusted with them', async () => {
