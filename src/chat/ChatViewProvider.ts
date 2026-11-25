@@ -204,6 +204,9 @@ interface RunContext {
 /** Workspace-state key for the persisted browser-style open-tab working set. */
 const KEY_OPEN_TABS = 'burstcode.chat.openTabs';
 
+/** Longest title a chat may be given through "Rename". */
+const MAX_SESSION_TITLE_LENGTH = 200;
+
 /** Virtual scheme backing the LEFT side of a rollback-preview diff (pre-prompt snapshot). */
 const ROLLBACK_SNAPSHOT_SCHEME = 'burstcode-rollback';
 
@@ -604,7 +607,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       reasoningText: ctx.live.reasoningText,
       savedAt: Date.now()
     };
-    await this.persistSession(session, true);
+    // The index entry does not change between two snapshots of one run, and
+    // every index write makes VS Code re-send the whole extension state.
+    await this.persistSession(session, true, false);
   }
 
   /** Stop the periodic persistence of `session` and drop its in-flight snapshot. */
@@ -1051,6 +1056,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.broadcastSessions();
   }
 
+  /** Ask for a new title for a chat. Its tab and its history entry both show it. */
+  private async promptRenameSession(id: string): Promise<void> {
+    const meta = this.sessions.list().find((s) => s.id === id);
+    if (!meta) return;
+    const title = await vscode.window.showInputBox({
+      title: 'BurstCode: Rename chat',
+      prompt: 'Enter a new title for this chat.',
+      value: meta.title,
+      valueSelection: [0, meta.title.length],
+      ignoreFocusOut: true,
+      validateInput: (value) => {
+        const trimmed = (value ?? '').trim();
+        if (!trimmed) return 'The title cannot be empty.';
+        return trimmed.length > MAX_SESSION_TITLE_LENGTH
+          ? `The title cannot be longer than ${MAX_SESSION_TITLE_LENGTH} characters.`
+          : undefined;
+      }
+    });
+    // Dismissing the box yields undefined; accepting it yields the typed value.
+    if (title === undefined) return;
+    await this.renameSession(id, title.trim());
+  }
+
+  private async renameSession(id: string, title: string): Promise<void> {
+    try {
+      await this.sessions.rename(id, title);
+    } catch (err) {
+      this.logger.error('Failed to rename session', String(err));
+      vscode.window.showErrorMessage(`BurstCode: could not rename the chat — ${String((err as Error).message ?? err)}`);
+      return;
+    }
+    this.broadcastSessions();
+  }
+
   /** Cancel the run for a specific session (e.g. from history's stop button). */
   private cancelSession(id: string): void {
     const ctx = this.runs.get(id);
@@ -1358,6 +1397,9 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
       }
       case 'delete-session':
         await this.deleteSession(String((msg.payload as { id: string })?.id ?? ''));
+        break;
+      case 'rename-session':
+        await this.promptRenameSession(String((msg.payload as { id: string })?.id ?? ''));
         break;
       case 'request-sessions':
         this.broadcastSessions();
@@ -2559,12 +2601,13 @@ payload: { id, transcript: page.entries, transcriptOffset: start, transcriptTota
   /**
    * Persist a specific session (not necessarily the currently-visible one).
    * `quiet` skips the history broadcast for the periodic saves of a running
-   * session, whose metadata does not change between them.
+   * session, whose metadata does not change between them; `index` is passed
+   * through to the store for the same reason.
    */
-  private async persistSession(session: Session, quiet = false): Promise<void> {
+  private async persistSession(session: Session, quiet = false, index = true): Promise<void> {
     session.updatedAt = Date.now();
     try {
-      await this.sessions.save(session);
+      await this.sessions.save(session, { index });
     } catch (err) {
       this.logger.error('Failed to persist session', String(err));
     }
@@ -4485,8 +4528,10 @@ function renderPendingFileList(fileList) {
   });
 }
 
-// Floating right-click menu for tabs. Only one is alive at a time; the
+// Floating right-click menu for a chat. Only one is alive at a time; the
 // closure tracks the current node and we wire global listeners ONCE.
+// Shown for a tab and for an entry of the history overlay; the tab-only
+// actions are left out for the latter.
 let tabMenuEl = null;
 function closeTabMenu() {
   if (tabMenuEl && tabMenuEl.parentNode) tabMenuEl.parentNode.removeChild(tabMenuEl);
@@ -4505,7 +4550,7 @@ document.addEventListener('keydown', (ev) => {
 window.addEventListener('scroll', closeTabMenu, true);
 window.addEventListener('resize', closeTabMenu);
 
-function showTabMenu(ev, s) {
+function showTabMenu(ev, s, isTab) {
   closeTabMenu();
   const openCount = (sessionsCache.openIds || []).length;
   // Build the item list dynamically so we can inject status-specific actions
@@ -4515,14 +4560,20 @@ function showTabMenu(ev, s) {
     items.push({ label: 'Stop run', action: () => vscode.postMessage({ type: 'cancel-session', payload: { id: s.id } }) });
     items.push({ kind: 'sep' });
   }
-  items.push({ label: 'Close', action: () => vscode.postMessage({ type: 'close-tab', payload: { id: s.id } }) });
-  items.push({
-    label: 'Close Others',
-    disabled: openCount <= 1,
-    action: () => vscode.postMessage({ type: 'close-other-tabs', payload: { id: s.id } })
-  });
-  items.push({ label: 'Close All', danger: true, action: () => vscode.postMessage({ type: 'close-all-tabs' }) });
+  // The host asks for the new title; the tab and the history entry re-render
+  // from the session list it broadcasts afterwards.
+  items.push({ label: 'Rename', action: () => vscode.postMessage({ type: 'rename-session', payload: { id: s.id } }) });
   items.push({ kind: 'sep' });
+  if (isTab !== false) {
+    items.push({ label: 'Close', action: () => vscode.postMessage({ type: 'close-tab', payload: { id: s.id } }) });
+    items.push({
+      label: 'Close Others',
+      disabled: openCount <= 1,
+      action: () => vscode.postMessage({ type: 'close-other-tabs', payload: { id: s.id } })
+    });
+    items.push({ label: 'Close All', danger: true, action: () => vscode.postMessage({ type: 'close-all-tabs' }) });
+    items.push({ kind: 'sep' });
+  }
   items.push({
     label: 'Delete from history',
     danger: true,
@@ -4800,6 +4851,12 @@ function renderHistory() {
     actions.append(stop, move, del);
     item.append(title, meta, actions);
     item.onclick = () => { vscode.postMessage({ type: 'load-session', payload: { id: s.id } }); historyEl.classList.remove('open'); };
+    // Right-click → the chat's menu (Rename, Delete from history, …). The
+    // overlay stays open so a renamed title is seen in place.
+    item.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      showTabMenu(ev, s, false);
+    });
     historyEl.appendChild(item);
   });
 }

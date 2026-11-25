@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { Logger } from '../util/Logger';
 import {
+  OUTLINE_VISIBLE_HIDDEN_DIRS,
   OutlineOptions,
   OutlineResult,
   buildWorkspaceOutline,
@@ -101,10 +102,22 @@ export class WorkspaceIndex implements vscode.Disposable {
     this.emitter.fire();
   }
 
-  /** Suppress events whose path lives entirely inside an excluded directory. */
+  /**
+   * Suppress events that cannot change the outline: anything under an excluded
+   * directory, and anything living inside a hidden directory — the outline
+   * lists none but a few at the workspace root.
+   *
+   * This matters for BurstCode's own output. Every prompt writes a checkpoint
+   * into the hidden `.burstcode/` directory of the workspace, and letting those
+   * writes invalidate the outline made every following prompt wait for a full
+   * re-walk of the workspace before its request could go out.
+   */
   private maybeInvalidate(fsPath: string): void {
     const segments = fsPath.split(/[\\/]/);
     if (segments.some((s) => this.excludeDirs.has(s))) return;
+    // The last segment is what changed; the ones before it are where it lives.
+    const parents = segments.slice(0, -1);
+    if (parents.some((s) => s.startsWith('.') && !OUTLINE_VISIBLE_HIDDEN_DIRS.has(s))) return;
     this.invalidate(`fs change: ${fsPath}`);
   }
 

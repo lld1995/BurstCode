@@ -297,6 +297,69 @@ test('a session persisted mid-run comes back as a stopped chat that keeps what w
   assert.match(persisted.messages[1].content, /The answer so far/);
 }));
 
+test('a chat can be renamed without changing its place in the history', () => withDir(async (dir) => {
+  const global = memento();
+  const store = new SessionStore(memento(), global, dir, 'ws', 'ws');
+  await store.save({ ...body('s_old', { title: 'old', createdAt: 1, updatedAt: 1 }) });
+  await store.save({ ...body('s_new', { title: 'new', createdAt: 2, updatedAt: 2 }) });
+  assert.equal(await store.rename('s_old', '  Renamed chat  '), true, 'the chat is renamed');
+  assert.deepEqual(plain(store.list().map((s) => s.id)), ['s_new', 's_old'], 'still ordered by update time');
+  assert.equal(global.get(INDEX).find((s) => s.id === 's_old').title, 'Renamed chat', 'leading and trailing blanks are dropped');
+  assert.equal(global.get(INDEX).find((s) => s.id === 's_old').updatedAt, 1);
+  assert.equal(JSON.parse(fs.readFileSync(fileOf(dir, 's_old'), 'utf8')).title, 'Renamed chat', 'the session itself is rewritten too');
+  assert.equal((await store.load('s_old')).title, 'Renamed chat');
+  // A chat that was open keeps the same object, so a rename is seen at once.
+  const open = await store.load('s_new');
+  await store.rename('s_new', 'Also renamed');
+  assert.equal(open.title, 'Also renamed');
+  assert.equal(await store.rename('s_missing', 'x'), false);
+}));
+
+test('snapshots of a running session do not rewrite the index unless its entry changed', () => withDir(async (dir) => {
+  const global = memento();
+  const store = new SessionStore(memento(), global, dir, 'ws', 'ws');
+  const session = { ...body('s_snap'), status: 'running' };
+  await store.save(session);
+  const published = { ...global.get(INDEX)[0] };
+  assert.equal(published.status, 'running');
+  global.updates.length = 0;
+  // Periodic snapshots: the body advances, the index entry does not.
+  for (const part of [1, 2, 3]) {
+    session.messages.push({ role: 'assistant', content: `part ${part}` });
+    session.updatedAt = published.updatedAt + part;
+    await store.save(session, { index: false });
+  }
+  assert.equal(global.updates.length, 0, 'a snapshot that changed nothing but the update time is not a storage write');
+  assert.equal(global.get(INDEX)[0].updatedAt, published.updatedAt);
+  assert.equal(JSON.parse(fs.readFileSync(fileOf(dir, 's_snap'), 'utf8')).messages.at(-1).content, 'part 3', 'the file still gets every snapshot');
+  // The end of the run changes the entry, so even a snapshot publishes it.
+  session.status = 'completed';
+  await store.save(session, { index: false });
+  assert.equal(global.get(INDEX)[0].status, 'completed');
+  // An explicit save always refreshes the entry.
+  global.updates.length = 0;
+  session.updatedAt += 1000;
+  await store.save(session);
+  assert.equal(global.updates.length, 1);
+  assert.equal(global.get(INDEX)[0].updatedAt, session.updatedAt);
+}));
+
+test('an explicit save arriving while a snapshot is being written still publishes the index', () => withDir(async (dir) => {
+  const realWrite = fs.promises.writeFile;
+  fs.promises.writeFile = async (...args) => { await new Promise((resolve) => setTimeout(resolve, 25)); return realWrite(...args); };
+  try {
+    const global = memento();
+    const store = new SessionStore(memento(), global, dir, 'ws', 'ws');
+    const session = body('s_mix');
+    await store.save(session);
+    const snapshot = store.save(session, { index: false });
+    session.updatedAt += 5;
+    const explicit = store.save(session);
+    await Promise.all([snapshot, explicit]);
+    assert.equal(global.get(INDEX)[0].updatedAt, session.updatedAt);
+  } finally { fs.promises.writeFile = realWrite; }
+}));
+
 test('a memento flush that never completes does not hold back activation or saving to disk', () => withDir(async (dir) => {
   // VS Code applies an update to the host's value at once and resolves the
   // promise only once the renderer has flushed it. A renderer that is

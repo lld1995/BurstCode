@@ -77,6 +77,9 @@ export const defaultOutlineOptions: OutlineOptions = {
   honorRootGitignore: true
 };
 
+/** Hidden directories the outline lists, and only at the workspace root. Every other hidden directory is left out. */
+export const OUTLINE_VISIBLE_HIDDEN_DIRS = new Set(['.github', '.vscode', '.windsurf', '.husky']);
+
 export interface OutlineResult {
   /** Rendered tree text, ready to embed in the system prompt. */
   text: string;
@@ -226,9 +229,8 @@ function keepEntry(
     // Hidden dirs: keep `.github`, `.vscode`, `.windsurf` at the root only;
     // suppress all other hidden dirs to avoid noise.
     if (d.name.startsWith('.')) {
-      const allowedHidden = new Set(['.github', '.vscode', '.windsurf', '.husky']);
       if (depth > 0) return false;
-      if (!allowedHidden.has(d.name)) return false;
+      if (!OUTLINE_VISIBLE_HIDDEN_DIRS.has(d.name)) return false;
     }
     return true;
   }

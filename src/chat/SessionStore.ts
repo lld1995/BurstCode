@@ -162,6 +162,18 @@ function isErrno(err: unknown, code: string): boolean {
   return (err as NodeJS.ErrnoException | null)?.code === code;
 }
 
+/** Whether two index entries differ in anything but their update time. */
+function differsApartFromUpdate(listed: SessionMeta | undefined, next: SessionMeta): boolean {
+  if (!listed) return true;
+  return listed.title !== next.title
+    || listed.createdAt !== next.createdAt
+    || listed.status !== next.status
+    || listed.scope !== next.scope
+    || listed.workspaceId !== next.workspaceId
+    || listed.originWorkspace !== next.originWorkspace
+    || listed.owner !== next.owner;
+}
+
 /**
  * Rename `from` over `to`. On Windows the replace fails while another process
  * (antivirus, search indexer) briefly holds the target open, so those errors are
@@ -229,6 +241,8 @@ export class SessionStore {
   private readonly writes = new Map<string, Promise<void>>();
   /** Sessions whose in-flight write has to be followed by one more pass. */
   private readonly dirty = new Set<string>();
+  /** Sessions whose pending write has to publish their index entry. */
+  private readonly indexRequested = new Set<string>();
   /** Legacy entries whose bodies this activation moved to disk, awaiting their release from the memento. */
   private legacyMoved: SessionMeta[] = [];
   /** Workspaces of legacy entries already probed for / being probed for living on this machine. */
@@ -362,6 +376,19 @@ export class SessionStore {
   }
 
   /**
+   * Give a session another title. The title is part of the index entry and of
+   * the session itself, so both are rewritten; when the chat is still being
+   * updated its update time is not, and it keeps its place in the history.
+   */
+  async rename(id: string, title: string): Promise<boolean> {
+    const session = await this.load(id);
+    if (!session) return false;
+    session.title = title.replace(/\s+/g, ' ').trim();
+    await this.save(session);
+    return true;
+  }
+
+  /**
    * Sessions this window may open. Besides the workspace/global visibility rule
    * an entry must have its body on this machine: disk-backed entries by owner,
    * and not-yet-migrated ones by the workspace they were held in.
@@ -419,13 +446,19 @@ export class SessionStore {
     return this.sizes.get(id) ?? 0;
   }
 
-  async save(session: Session): Promise<void> {
+  /**
+   * Persist a session. `index: false` keeps its index entry as it is unless the
+   * entry is missing or changed in more than its update time; it is for the
+   * repeated snapshots of a running session, between which the entry does not
+   * change.
+   */
+  async save(session: Session, options: { index?: boolean } = {}): Promise<void> {
     session.scope ??= 'workspace';
     session.workspaceId ??= this.workspaceId;
     session.originWorkspace ??= this.workspaceName;
     session.owner ??= this.owner.id;
     this.remember(session);
-    await this.queueWrite(session);
+    await this.queueWrite(session, options.index !== false);
   }
 
   async delete(id: string): Promise<void> {
@@ -554,8 +587,13 @@ export class SessionStore {
    * Write the body, then publish its index entry. Content always precedes its
    * index entry so a crash between the two leaves an unindexed file (which
    * `reconcileWithDisk` adopts) rather than an index entry without a body.
+   *
+   * Every index write makes VS Code re-send the whole extension state through
+   * the renderer, so a save that asked not to publish (`index: false`, the
+   * periodic snapshots of a running session) only does so when the entry is
+   * missing or changed in more than its update time.
    */
-  private async writeSession(id: string, fallback: Session): Promise<void> {
+  private async writeSession(id: string, fallback: Session, index: boolean): Promise<void> {
     await this.ready;
     try {
       await this.writeBodyFile(id, fallback);
@@ -563,7 +601,9 @@ export class SessionStore {
       this.onError?.(`Failed to persist session ${id}`, err);
       throw err;
     }
-    this.upsertMetas([this.metaOf(this.live.get(id)?.deref() ?? fallback)]);
+    const meta = this.metaOf(this.live.get(id)?.deref() ?? fallback);
+    const listed = (this.storage.get<SessionMeta[]>(this.indexKey) ?? []).find((m) => m.id === id);
+    if (index || differsApartFromUpdate(listed, meta)) this.upsertMetas([meta]);
     this.dropLegacyCopy(id);
   }
 
@@ -589,10 +629,12 @@ export class SessionStore {
   /**
    * Queue one write for a session. While a write is in flight further saves
    * only mark the session dirty, so a fast stream of saves costs one follow-up
-   * serialization of the newest state instead of one snapshot per save.
+   * serialization of the newest state instead of one snapshot per save. The
+   * follow-up publishes the index entry if any of those saves asked for it.
    */
-  private queueWrite(session: Session): Promise<void> {
+  private queueWrite(session: Session, index: boolean): Promise<void> {
     const id = session.id;
+    if (index) this.indexRequested.add(id);
     const running = this.writes.get(id);
     if (running) {
       this.dirty.add(id);
@@ -601,7 +643,7 @@ export class SessionStore {
     const write = (async () => {
       do {
         this.dirty.delete(id);
-        await this.writeSession(id, session);
+        await this.writeSession(id, session, this.indexRequested.delete(id));
       } while (this.dirty.has(id));
     })();
     const tracked = write.finally(() => {

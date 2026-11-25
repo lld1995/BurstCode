@@ -1081,8 +1081,10 @@ function renderPendingFileList(fileList) {
   });
 }
 
-// Floating right-click menu for tabs. Only one is alive at a time; the
+// Floating right-click menu for a chat. Only one is alive at a time; the
 // closure tracks the current node and we wire global listeners ONCE.
+// Shown for a tab and for an entry of the history overlay; the tab-only
+// actions are left out for the latter.
 let tabMenuEl = null;
 function closeTabMenu() {
   if (tabMenuEl && tabMenuEl.parentNode) tabMenuEl.parentNode.removeChild(tabMenuEl);
@@ -1101,7 +1103,7 @@ document.addEventListener('keydown', (ev) => {
 window.addEventListener('scroll', closeTabMenu, true);
 window.addEventListener('resize', closeTabMenu);
 
-function showTabMenu(ev, s) {
+function showTabMenu(ev, s, isTab) {
   closeTabMenu();
   const openCount = (sessionsCache.openIds || []).length;
   // Build the item list dynamically so we can inject status-specific actions
@@ -1111,14 +1113,20 @@ function showTabMenu(ev, s) {
     items.push({ label: 'Stop run', action: () => vscode.postMessage({ type: 'cancel-session', payload: { id: s.id } }) });
     items.push({ kind: 'sep' });
   }
-  items.push({ label: 'Close', action: () => vscode.postMessage({ type: 'close-tab', payload: { id: s.id } }) });
-  items.push({
-    label: 'Close Others',
-    disabled: openCount <= 1,
-    action: () => vscode.postMessage({ type: 'close-other-tabs', payload: { id: s.id } })
-  });
-  items.push({ label: 'Close All', danger: true, action: () => vscode.postMessage({ type: 'close-all-tabs' }) });
+  // The host asks for the new title; the tab and the history entry re-render
+  // from the session list it broadcasts afterwards.
+  items.push({ label: 'Rename', action: () => vscode.postMessage({ type: 'rename-session', payload: { id: s.id } }) });
   items.push({ kind: 'sep' });
+  if (isTab !== false) {
+    items.push({ label: 'Close', action: () => vscode.postMessage({ type: 'close-tab', payload: { id: s.id } }) });
+    items.push({
+      label: 'Close Others',
+      disabled: openCount <= 1,
+      action: () => vscode.postMessage({ type: 'close-other-tabs', payload: { id: s.id } })
+    });
+    items.push({ label: 'Close All', danger: true, action: () => vscode.postMessage({ type: 'close-all-tabs' }) });
+    items.push({ kind: 'sep' });
+  }
   items.push({
     label: 'Delete from history',
     danger: true,
@@ -1396,6 +1404,12 @@ function renderHistory() {
     actions.append(stop, move, del);
     item.append(title, meta, actions);
     item.onclick = () => { vscode.postMessage({ type: 'load-session', payload: { id: s.id } }); historyEl.classList.remove('open'); };
+    // Right-click → the chat's menu (Rename, Delete from history, …). The
+    // overlay stays open so a renamed title is seen in place.
+    item.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      showTabMenu(ev, s, false);
+    });
     historyEl.appendChild(item);
   });
 }
